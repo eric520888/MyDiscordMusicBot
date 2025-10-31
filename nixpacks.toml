@@ -1,0 +1,9 @@
+# nixpacks.toml
+
+[phases.setup]
+# 在這裡明確地列出所有需要用 apt-get 安裝的系統套件
+aptPkgs = ["libopus0", "ffmpeg"]
+
+[start]
+# 在這裡明確地指定你的啟動指令
+command = "python main.py"
