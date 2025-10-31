@@ -1,9 +1,6 @@
 import discord
 if not discord.opus.is_loaded():
-    try:
-        discord.opus.load_opus('libopus.so.0')
-    except discord.opus.OpusError:
-        print("Opus library could not be loaded...")
+    discord.opus.load_opus()
 from discord.ext import commands
 import yt_dlp
 import asyncio
