@@ -1,6 +1,6 @@
 import discord
 if not discord.opus.is_loaded():
-    discord.opus.load_opus()
+    discord.opus.load_opus('libopus')
 from discord.ext import commands
 import yt_dlp
 import asyncio
