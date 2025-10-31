@@ -3,7 +3,7 @@ if not discord.opus.is_loaded():
     try:
         # 在標準 Linux 環境中，這通常是函式庫的名稱
         discord.opus.load_opus('libopus.so.0')
-    except discord.OpusError:
+    except discord.opus.OpusError:
         print("Opus library could not be loaded. This is a fatal error on Linux.")
         # 在更複雜的應用中，這裡可能需要退出程式
 from discord.ext import commands
