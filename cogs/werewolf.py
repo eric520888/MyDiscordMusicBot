@@ -35,7 +35,7 @@ class WerewolfGame:
         self.board_id = "auto"
         
         # 玩家狀態確認
-        self.confirmed_players = set() # 記錄已查看身分的玩家
+        self.confirmed_players = set()
         
         # 道具與技能狀態
         self.witch_potions = {"antidote": True, "poison": True}
@@ -70,8 +70,10 @@ class BoardSelect(Select):
         super().__init__(placeholder="📜 請選擇遊戲板子...", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.game.host.id:
-            return await interaction.response.send_message("❌ 只有主持人可以更改板子。", ephemeral=True)
+        # 權限檢查：主持人 OR 開發者
+        is_dev = await self.view.cog.bot.is_owner(interaction.user)
+        if interaction.user.id != self.game.host.id and not is_dev:
+            return await interaction.response.send_message("❌ 只有主持人或開發者可以更改板子。", ephemeral=True)
         
         self.game.board_id = self.values[0]
         board_name = {
@@ -79,7 +81,9 @@ class BoardSelect(Select):
             "wolf_king": "👑 狼王板", "merchant": "💰 奇跡板"
         }.get(self.values[0], "未知")
         
-        await interaction.response.send_message(f"✅ 板子已更新為：**{board_name}**", ephemeral=True)
+        user_title = "開發者" if is_dev and interaction.user.id != self.game.host.id else "主持人"
+        await interaction.response.send_message(f"✅ {user_title} 將板子更新為：**{board_name}**", ephemeral=True)
+        
         view: LobbyView = self.view
         await interaction.message.edit(embed=view.update_embed())
 
@@ -133,21 +137,40 @@ class LobbyView(View):
 
     @discord.ui.button(label="開始遊戲", style=discord.ButtonStyle.blurple, emoji="🚀", row=1)
     async def start_button(self, interaction: discord.Interaction, button: Button):
-        if interaction.user.id != self.game.host.id: return await interaction.response.send_message("只有主持人可開始", ephemeral=True)
+        # 權限檢查：主持人 OR 開發者
+        is_dev = await self.cog.bot.is_owner(interaction.user)
+        if interaction.user.id != self.game.host.id and not is_dev:
+            return await interaction.response.send_message("只有主持人或開發者可開始", ephemeral=True)
+        
         if len(self.game.players) < 3: return await interaction.response.send_message("人數不足 (最少 3)", ephemeral=True)
-        if interaction.user.voice and not self.ctx.guild.voice_client: await interaction.user.voice.channel.connect()
+        
+        # 嘗試連語音
+        if interaction.user.voice and not self.ctx.guild.voice_client: 
+            await interaction.user.voice.channel.connect()
         
         success = await self.cog.start_game_logic(self.ctx)
         if success:
             self.stop()
-            await interaction.response.send_message("遊戲開始！分配身分中...", ephemeral=False)
+            user_title = "開發者" if is_dev and interaction.user.id != self.game.host.id else "主持人"
+            await interaction.response.send_message(f"🚀 {user_title} 強制開始遊戲！分配身分中...", ephemeral=False)
 
     @discord.ui.button(label="關閉大廳", style=discord.ButtonStyle.grey, emoji="✖️", row=1)
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
-        if interaction.user.id != self.game.host.id and not interaction.user.guild_permissions.administrator: return
+        # 權限檢查：主持人 OR 管理員 OR 開發者
+        is_dev = await self.cog.bot.is_owner(interaction.user)
+        is_admin = interaction.user.guild_permissions.administrator
+        
+        if interaction.user.id != self.game.host.id and not is_admin and not is_dev:
+            return await interaction.response.send_message("權限不足。", ephemeral=True)
+        
         if self.ctx.guild.id in self.cog.games: del self.cog.games[self.ctx.guild.id]
         self.stop()
-        await interaction.response.edit_message(embed=discord.Embed(title="🛑 已關閉", color=discord.Color.light_grey()), view=None)
+        
+        closer = "主持人"
+        if is_dev and interaction.user.id != self.game.host.id: closer = "開發者"
+        elif is_admin and interaction.user.id != self.game.host.id: closer = "管理員"
+            
+        await interaction.response.edit_message(embed=discord.Embed(title="🛑 已關閉", description=f"{closer} 關閉了大廳。", color=discord.Color.light_grey()), view=None)
 
 # --- 2. 身分查看 (IdentityView) ---
 class IdentityView(View):
@@ -199,15 +222,19 @@ class IdentityView(View):
             await self.ctx.send("🌕 **全員已確認身分，天黑請閉眼...**")
             await self.cog.start_night(self.ctx, self.game)
 
-    @discord.ui.button(label="強制入夜 (主持人)", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="強制入夜", style=discord.ButtonStyle.danger)
     async def force_start(self, interaction: discord.Interaction, button: Button):
-        if interaction.user.id != self.game.host.id:
-            return await interaction.response.send_message("只有主持人可按", ephemeral=True)
+        # 權限檢查：主持人 OR 開發者
+        is_dev = await self.cog.bot.is_owner(interaction.user)
+        if interaction.user.id != self.game.host.id and not is_dev:
+            return await interaction.response.send_message("權限不足", ephemeral=True)
         
         if not self.started:
             self.started = True
             self.stop()
-            await interaction.response.send_message("🚨 主持人強制進入夜晚！", ephemeral=False)
+            
+            user_title = "開發者" if is_dev and interaction.user.id != self.game.host.id else "主持人"
+            await interaction.response.send_message(f"🚨 {user_title} 強制進入夜晚！", ephemeral=False)
             await self.cog.start_night(self.ctx, self.game)
 
 # --- 3. 夜間選單 (Phase 1) ---
