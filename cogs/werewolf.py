@@ -4,7 +4,7 @@ from discord.ui import Button, View, Select
 import random
 import asyncio
 import os
-import traceback # 用於印出詳細錯誤
+import traceback 
 from collections import Counter
 
 # --- 設定 ---
@@ -513,7 +513,7 @@ class Werewolf(commands.Cog):
         return self.games.get(ctx.guild.id)
 
     async def mute_all(self, ctx, game, mute=True):
-        """安全靜音 (重新抓取 member 避免 cache 問題)"""
+        """安全靜音"""
         for p in game.players:
             try:
                 member = ctx.guild.get_member(p.id)
@@ -578,7 +578,7 @@ class Werewolf(commands.Cog):
         w, k, s, wi, h, m = wolves_count, 0, 0, 0, 0, 0
         
         if game.board_id == "auto":
-            if n < 6: w, k, s, wi, h, m = 1, 0, 1, 0, 0, 0 # [人性化修正] 3-5人: 1狼 1預 (無女巫)
+            if n < 6: w, k, s, wi, h, m = 1, 0, 1, 0, 0, 0 
             elif n < 9: w, k, s, wi, h, m = 1, 1, 1, 1, 1, 0
             elif n < 10: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 0
             else: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 1
@@ -618,10 +618,8 @@ class Werewolf(commands.Cog):
             game.lucky_data = {"user_id": None, "skill": None, "target": None}
             game.confirmed_players.clear()
             
-            # [重要修正] 先送出按鈕，確保介面不被音效卡住
             await game.channel.send("🌃 **上半夜：狼人、預言家、奇跡商人**", view=NightViewPhase1(game, self, ctx))
             
-            # 使用 create_task 並包裹 try-except 防止背景任務炸裂
             asyncio.create_task(self.safe_play_audio(ctx))
             asyncio.create_task(self.mute_all(ctx, game, True))
             
@@ -629,7 +627,6 @@ class Werewolf(commands.Cog):
             print(traceback.format_exc())
             await ctx.send(f"⚠️ 入夜發生錯誤: {e}")
 
-    # 新增安全播放函式
     async def safe_play_audio(self, ctx):
         try:
             await self.play_mixed_audio(ctx, "night.mp3", "voice_night_start.mp3")
@@ -651,26 +648,60 @@ class Werewolf(commands.Cog):
 
         if wolves_done and seer_done and merchant_done:
             if game.wolf_votes:
+                # 狼人多數決 (平票隨機)
                 valid_votes = [t for u, t in game.wolf_votes.items() if u in [w.id for w in alive_wolves]]
                 if valid_votes:
                     most = Counter(valid_votes).most_common()
-                    candidates = [t for t, c in most if c == most[0][1]]
+                    max_v = most[0][1]
+                    candidates = [t for t, c in most if c == max_v]
                     game.wolf_target = random.choice(candidates)
                 else: game.wolf_target = -1
             else: game.wolf_target = -1
-                
-            await self.start_night_phase_2(ctx, game)
+            
+            # --- [智慧跳夜判斷] ---
+            # 檢查是否有任何「角色」存在於板子上 (不是檢查活人，是檢查板子)
+            has_witch_role = "女巫" in game.roles.values()
+            has_merchant_role = "奇跡商人" in game.roles.values()
+            
+            # 如果板子上有女巫 或 有奇跡商人(可能有幸運兒)，就必須進下半夜 (哪怕他們死了也要進，這是為了隱藏資訊)
+            # 但如果板子上根本沒這兩個角色 (例如3人局)，直接跳天亮
+            if not has_witch_role and not has_merchant_role:
+                await self.start_day(ctx, game)
+            else:
+                await self.start_night_phase_2(ctx, game)
 
     async def start_night_phase_2(self, ctx, game):
         game.phase = PHASE_NIGHT_2
         game.night_actions.clear()
         if game.lucky_data["skill"]: game.lucky_data["target"] = None 
+        
+        # 發送下半夜面板 (即使沒人活著也要發，假裝有事發生)
         await game.channel.send("🧙‍♀️ **下半夜：女巫與幸運兒**", view=NightViewPhase2(game, self, ctx))
+        
+        # 檢查是否有活著的行動者
+        alive_witches = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "女巫"]
+        lucky_id = game.lucky_data["user_id"]
+        has_alive_lucky = lucky_id and game.is_alive(lucky_id)
+        
+        # 如果沒有任何人可以行動 (全死光 或 沒技能)，模擬延遲後自動天亮
+        if not alive_witches and not has_alive_lucky:
+            await asyncio.sleep(random.randint(5, 10)) # 隨機等待 5-10 秒
+            await self.start_day(ctx, game)
 
     async def check_night_phase_2_end(self, ctx, game):
+        # 1. 檢查女巫
         alive_witch = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "女巫"]
         witch_done = not alive_witch or alive_witch[0].id in game.night_actions
-        if witch_done: await self.start_day(ctx, game)
+        
+        # 2. 檢查幸運兒
+        lucky_done = True
+        lid = game.lucky_data["user_id"]
+        # 如果幸運兒活著且有技能，但他還沒選目標 -> 未完成
+        if lid and game.is_alive(lid) and game.lucky_data["target"] is None:
+             lucky_done = False
+        
+        if witch_done and lucky_done: 
+            await self.start_day(ctx, game)
 
     async def start_day(self, ctx, game):
         game.phase = PHASE_DAY
