@@ -11,10 +11,10 @@ SOUND_FOLDER = "./sounds"
 
 # 定義遊戲狀態
 PHASE_WAITING = "waiting"
-PHASE_NIGHT_1 = "night_wolves_seer" # 上半夜：狼人/預言家
-PHASE_NIGHT_2 = "night_witch"       # 下半夜：女巫
+PHASE_NIGHT_1 = "night_wolves_seer_merchant"
+PHASE_NIGHT_2 = "night_witch_lucky"
 PHASE_DAY = "day"
-PHASE_HUNTER = "hunter_shoot"       # 獵人開槍階段
+PHASE_SHOOT = "role_shoot" # 獵人或狼王開槍階段
 
 class WerewolfGame:
     def __init__(self, channel, host):
@@ -26,15 +26,17 @@ class WerewolfGame:
         self.phase = PHASE_WAITING
         self.votes = {}         
         self.wolf_votes = {}    
-        self.wolf_target = None # 狼人殺目標
-        self.witch_poison_target = None # 女巫毒殺目標
-        self.night_actions = set() 
+        self.wolf_target = None 
+        self.witch_poison_target = None 
+        self.night_actions = set()
         self.stop_votes = set()
         
-        # 道具狀態
-        self.witch_potions = {"antidote": True, "poison": True} # 解藥, 毒藥
-        self.hunter_status = {"can_shoot": True} 
-        self.deaths_tonight = [] # 記錄今晚死亡名單 (用於判定獵人是否被毒)
+        # 道具與技能狀態
+        self.witch_potions = {"antidote": True, "poison": True}
+        self.merchant_status = {"used": False} 
+        self.lucky_data = {"user_id": None, "skill": None, "target": None} 
+        self.guard_target = None
+        self.deaths_tonight = [] 
 
     def get_role(self, user_id):
         return self.roles.get(user_id, "未知")
@@ -44,6 +46,11 @@ class WerewolfGame:
 
     def get_alive_players(self):
         return [p for p in self.players if self.is_alive(p.id)]
+    
+    # 輔助：判斷是否為狼人陣營 (普通狼人 + 狼王)
+    def is_wolf_team(self, user_id):
+        role = self.roles.get(user_id)
+        return role in ["狼人", "狼王"]
 
 # --- 1. 大廳介面 ---
 class LobbyView(View):
@@ -71,7 +78,7 @@ class LobbyView(View):
             description=f"主持人: {self.game.host.display_name}\n\n**已加入玩家 ({len(self.game.players)}):**\n{player_list}",
             color=discord.Color.dark_red()
         )
-        embed.set_footer(text="滿 6 人建議配置: 2狼 1預 1女 1獵")
+        embed.set_footer(text="配置: 狼王/狼/預/女/獵 (10人+商人)")
         return embed
 
     @discord.ui.button(label="加入遊戲", style=discord.ButtonStyle.green, emoji="✋")
@@ -98,7 +105,7 @@ class LobbyView(View):
 
     @discord.ui.button(label="關閉大廳", style=discord.ButtonStyle.grey, emoji="✖️")
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
-        if interaction.user.id != self.game.host.id: return
+        if interaction.user.id != self.game.host.id and not interaction.user.guild_permissions.administrator: return
         if self.ctx.guild.id in self.cog.games: del self.cog.games[self.ctx.guild.id]
         self.stop()
         await interaction.response.edit_message(embed=discord.Embed(title="🛑 已關閉", color=discord.Color.light_grey()), view=None)
@@ -115,18 +122,20 @@ class IdentityView(View):
         role = self.game.roles.get(interaction.user.id)
         msg = f"你的身分是：**{role}**"
         
-        if role == "狼人":
-            teammates = [p.display_name for p in self.game.players if self.game.roles.get(p.id) == "狼人" and p.id != interaction.user.id]
+        if role in ["狼人", "狼王"]:
+            teammates = [p.display_name for p in self.game.players if self.game.is_wolf_team(p.id) and p.id != interaction.user.id]
             msg += f"\n🐺 隊友：{', '.join(teammates) if teammates else '無 (孤狼)'}"
             msg += "\n🔪 目標：與隊友投票殺死村民。"
+            if role == "狼王": msg += "\n👑 特殊能力：死後可以開槍帶走一人 (被毒死除外)。"
         elif role == "預言家": msg += "\n🔮 技能：每晚查驗一名玩家是好人還是狼人。"
-        elif role == "女巫": msg += "\n🧪 技能：擁有一瓶解藥(救人)和一瓶毒藥(殺人)，每晚只能用一瓶。"
-        elif role == "獵人": msg += "\n🔫 技能：死後可以開槍帶走一人 (被毒死除外)。"
+        elif role == "女巫": msg += "\n🧪 技能：解藥(救人)與毒藥(殺人)，每晚限用一瓶。"
+        elif role == "獵人": msg += "\n🔫 技能：死後可開槍帶走一人 (被毒死除外)。"
+        elif role == "奇跡商人": msg += "\n💰 技能：限一次，賜予一名玩家(幸運兒) 查驗/毒藥/守衛 技能。\n⚠️ **風險：若選中狼人，你將死亡！**"
         else: msg += "\n🏡 技能：無。努力推理並活下去。"
         
         await interaction.response.send_message(msg, ephemeral=True)
 
-# --- 3. 夜間選單 (上半夜: 狼/預) ---
+# --- 3. 夜間選單 (Phase 1) ---
 class WolfSelect(Select):
     def __init__(self, game, cog, ctx):
         self.game = game
@@ -134,7 +143,7 @@ class WolfSelect(Select):
         self.ctx = ctx
         options = [discord.SelectOption(label="不殺 (空刀)", value="-1", emoji="☮️")]
         options += [discord.SelectOption(label=p.display_name, value=str(p.id), emoji="👤") for p in game.players if game.is_alive(p.id)]
-        super().__init__(placeholder="🔪 狼人投票...", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="🔪 狼隊投票...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         target_id = int(self.values[0])
@@ -142,23 +151,7 @@ class WolfSelect(Select):
         self.game.night_actions.add(interaction.user.id)
         target_name = "空刀" if target_id == -1 else interaction.guild.get_member(target_id).display_name
         await interaction.response.send_message(f"🩸 你投給了：**{target_name}**", ephemeral=True)
-        
-        # 檢查是否所有活狼都投了
-        alive_wolves = [p for p in self.game.players if self.game.is_alive(p.id) and self.game.roles[p.id] == "狼人"]
-        valid_votes = [uid for uid in self.game.wolf_votes if uid in [w.id for w in alive_wolves]]
-        
-        if len(valid_votes) >= len(alive_wolves):
-            # 結算狼人目標
-            targets = [t for u, t in self.game.wolf_votes.items() if u in [w.id for w in alive_wolves]]
-            if targets:
-                most_common = Counter(targets).most_common()
-                max_v = most_common[0][1]
-                candidates = [t for t, c in most_common if c == max_v]
-                self.game.wolf_target = random.choice(candidates)
-            else:
-                self.game.wolf_target = -1
-            
-            await self.cog.check_night_phase_1_end(self.ctx, self.game)
+        await self.cog.check_night_phase_1_end(self.ctx, self.game)
 
 class SeerSelect(Select):
     def __init__(self, game, cog, ctx):
@@ -178,10 +171,49 @@ class SeerSelect(Select):
             await interaction.response.send_message("🔮 你選擇不查驗。", ephemeral=True)
         else:
             role = self.game.roles.get(target_id)
-            res = "🐺 狼人 (壞人)" if role == "狼人" else "好人"
+            res = "🐺 狼人 (壞人)" if role in ["狼人", "狼王"] else "好人"
             await interaction.response.send_message(f"🔮 查驗結果：{res}", ephemeral=True)
         
         await self.cog.check_night_phase_1_end(self.ctx, self.game)
+
+# --- 奇跡商人選單 ---
+class MerchantSkillSelect(Select):
+    def __init__(self, game, cog, ctx, target_id):
+        self.game = game
+        self.cog = cog
+        self.ctx = ctx
+        self.target_id = target_id
+        options = [
+            discord.SelectOption(label="給予 查驗 技能", value="check", emoji="🔮"),
+            discord.SelectOption(label="給予 毒藥 技能", value="poison", emoji="☠️"),
+            discord.SelectOption(label="給予 守衛 技能", value="guard", emoji="🛡️")
+        ]
+        super().__init__(placeholder="💰 請選擇要給予的技能...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        skill = self.values[0]
+        self.game.lucky_data = {"user_id": self.target_id, "skill": skill, "target": None}
+        self.game.merchant_status["used"] = True
+        self.game.night_actions.add(interaction.user.id)
+        
+        target_user = interaction.guild.get_member(self.target_id)
+        await interaction.response.send_message(f"💰 你給予了 **{target_user.display_name}** **{skill}** 技能。", ephemeral=True)
+        await self.cog.check_night_phase_1_end(self.ctx, self.game)
+
+class MerchantTargetSelect(Select):
+    def __init__(self, game, cog, ctx):
+        self.game = game
+        self.cog = cog
+        self.ctx = ctx
+        options = [discord.SelectOption(label=p.display_name, value=str(p.id), emoji="👤") 
+                   for p in game.players if game.is_alive(p.id) and p.id != interaction.user.id] 
+        super().__init__(placeholder="💰 請選擇一名幸運兒...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        target_id = int(self.values[0])
+        view = View()
+        view.add_item(MerchantSkillSelect(self.game, self.cog, self.ctx, target_id))
+        await interaction.response.send_message("請選擇要給予的技能：", view=view, ephemeral=True)
 
 class NightViewPhase1(View):
     def __init__(self, game, cog, ctx):
@@ -196,15 +228,32 @@ class NightViewPhase1(View):
         if not self.game.is_alive(uid): return await interaction.response.send_message("你已死亡", ephemeral=True)
         role = self.game.roles.get(uid)
         
-        if role == "狼人":
+        if role in ["狼人", "狼王"]:
             await interaction.response.send_message("🐺 **狼人行動**", view=View().add_item(WolfSelect(self.game, self.cog, self.ctx)), ephemeral=True)
         elif role == "預言家":
             if uid in self.game.night_actions: return await interaction.response.send_message("已行動", ephemeral=True)
             await interaction.response.send_message("🔮 **預言家行動**", view=View().add_item(SeerSelect(self.game, self.cog, self.ctx)), ephemeral=True)
+        elif role == "奇跡商人":
+            if self.game.merchant_status["used"]: return await interaction.response.send_message("技能已使用。", ephemeral=True)
+            if uid in self.game.night_actions: return await interaction.response.send_message("今晚已行動。", ephemeral=True)
+            
+            view = View()
+            view.add_item(MerchantTargetSelect(self.game, self.cog, self.ctx))
+            
+            async def skip_callback(inter):
+                self.game.night_actions.add(inter.user.id)
+                await inter.response.send_message("💤 選擇不發動。", ephemeral=True)
+                await self.cog.check_night_phase_1_end(self.ctx, self.game)
+            
+            skip_btn = Button(label="今晚不發動", style=discord.ButtonStyle.grey)
+            skip_btn.callback = skip_callback
+            view.add_item(skip_btn)
+            
+            await interaction.response.send_message("💰 **奇跡商人**，是否給予技能？", view=view, ephemeral=True)
         else:
-            await interaction.response.send_message("💤 你現在無需行動，請等待。", ephemeral=True)
+            await interaction.response.send_message("💤 無需行動。", ephemeral=True)
 
-# --- 4. 夜間選單 (下半夜: 女巫) ---
+# --- 4. 夜間選單 (Phase 2) ---
 class WitchActionView(View):
     def __init__(self, game, cog, ctx):
         super().__init__(timeout=None)
@@ -215,39 +264,28 @@ class WitchActionView(View):
     
     @discord.ui.button(label="使用解藥 (救)", style=discord.ButtonStyle.green, emoji="💊")
     async def save_btn(self, interaction: discord.Interaction, button: Button):
-        if not self.game.witch_potions["antidote"]:
-            return await interaction.response.send_message("❌ 解藥已用完。", ephemeral=True)
-        if self.target_id == -1:
-            return await interaction.response.send_message("❌ 今晚沒人被殺，無需使用解藥。", ephemeral=True)
+        if not self.game.witch_potions["antidote"]: return await interaction.response.send_message("❌ 解藥已用完。", ephemeral=True)
+        if self.target_id == -1: return await interaction.response.send_message("❌ 無人被殺。", ephemeral=True)
         
-        # 使用解藥
         self.game.witch_potions["antidote"] = False
-        self.game.wolf_target = -1 # 救活
-        self.game.night_actions.add(interaction.user.id) # 標記女巫已動
-        await interaction.response.send_message("💊 你使用了解藥，今晚平安夜。", ephemeral=True)
-        self.stop()
-        await self.cog.start_day(self.ctx, self.game)
+        self.game.wolf_target = -1 
+        self.game.night_actions.add(interaction.user.id)
+        await interaction.response.send_message("💊 使用了解藥。", ephemeral=True)
+        await self.cog.check_night_phase_2_end(self.ctx, self.game)
 
     @discord.ui.button(label="使用毒藥 (毒)", style=discord.ButtonStyle.danger, emoji="☠️")
     async def poison_btn(self, interaction: discord.Interaction, button: Button):
-        if not self.game.witch_potions["poison"]:
-            return await interaction.response.send_message("❌ 毒藥已用完。", ephemeral=True)
+        if not self.game.witch_potions["poison"]: return await interaction.response.send_message("❌ 毒藥已用完。", ephemeral=True)
         
-        # 顯示毒藥選單
         view = View()
-        select = Select(placeholder="☠️ 選擇要毒殺的玩家...", options=[
-            discord.SelectOption(label=p.display_name, value=str(p.id)) 
-            for p in self.game.players if self.game.is_alive(p.id)
-        ])
+        select = Select(placeholder="☠️ 選擇毒殺...", options=[discord.SelectOption(label=p.display_name, value=str(p.id)) for p in self.game.players if self.game.is_alive(p.id)])
         
         async def poison_callback(ctx_inter):
-            target = int(select.values[0])
-            self.game.witch_poison_target = target
+            self.game.witch_poison_target = int(select.values[0])
             self.game.witch_potions["poison"] = False
             self.game.night_actions.add(interaction.user.id)
-            await ctx_inter.response.send_message(f"☠️ 你毒殺了目標。", ephemeral=True)
-            self.stop() # 停止女巫面板
-            await self.cog.start_day(self.ctx, self.game)
+            await ctx_inter.response.send_message(f"☠️ 已下毒。", ephemeral=True)
+            await self.cog.check_night_phase_2_end(self.ctx, self.game)
 
         select.callback = poison_callback
         view.add_item(select)
@@ -256,9 +294,49 @@ class WitchActionView(View):
     @discord.ui.button(label="什麼都不做", style=discord.ButtonStyle.grey)
     async def skip_btn(self, interaction: discord.Interaction, button: Button):
         self.game.night_actions.add(interaction.user.id)
-        await interaction.response.send_message("💤 你選擇什麼都不做。", ephemeral=True)
-        self.stop()
-        await self.cog.start_day(self.ctx, self.game)
+        await interaction.response.send_message("💤 什麼都不做。", ephemeral=True)
+        await self.cog.check_night_phase_2_end(self.ctx, self.game)
+
+class LuckyOneView(View):
+    def __init__(self, game, cog, ctx, skill):
+        super().__init__(timeout=None)
+        self.game = game
+        self.cog = cog
+        self.ctx = ctx
+        self.skill = skill
+        options = [discord.SelectOption(label=p.display_name, value=str(p.id)) for p in game.players if game.is_alive(p.id)]
+        
+        if skill == "check":
+            select = Select(placeholder="🔮 [幸運兒] 請查驗...", options=options)
+            select.callback = self.check_callback
+        elif skill == "poison":
+            select = Select(placeholder="☠️ [幸運兒] 請下毒...", options=options)
+            select.callback = self.poison_callback
+        elif skill == "guard":
+            select = Select(placeholder="🛡️ [幸運兒] 請守護...", options=options)
+            select.callback = self.guard_callback
+        self.add_item(select)
+
+    async def check_callback(self, interaction: discord.Interaction):
+        target = int(interaction.data['values'][0])
+        role = self.game.roles.get(target)
+        res = "🐺 狼人" if role in ["狼人", "狼王"] else "好人"
+        self.game.lucky_data["target"] = target 
+        await interaction.response.send_message(f"🔮 查驗結果：{res}", ephemeral=True)
+        await self.cog.check_night_phase_2_end(self.ctx, self.game)
+
+    async def poison_callback(self, interaction: discord.Interaction):
+        target = int(interaction.data['values'][0])
+        self.game.lucky_data["target"] = target 
+        await interaction.response.send_message("☠️ 發動毒藥。", ephemeral=True)
+        await self.cog.check_night_phase_2_end(self.ctx, self.game)
+
+    async def guard_callback(self, interaction: discord.Interaction):
+        target = int(interaction.data['values'][0])
+        self.game.guard_target = target
+        self.game.lucky_data["target"] = target
+        await interaction.response.send_message("🛡️ 發動守護。", ephemeral=True)
+        await self.cog.check_night_phase_2_end(self.ctx, self.game)
 
 class NightViewPhase2(View):
     def __init__(self, game, cog, ctx):
@@ -267,62 +345,57 @@ class NightViewPhase2(View):
         self.cog = cog
         self.ctx = ctx
 
-    @discord.ui.button(label="女巫請睜眼", style=discord.ButtonStyle.primary, emoji="🧙‍♀️")
-    async def witch_wake(self, interaction: discord.Interaction, button: Button):
+    @discord.ui.button(label="下半夜行動", style=discord.ButtonStyle.primary, emoji="✨")
+    async def action(self, interaction: discord.Interaction, button: Button):
         uid = interaction.user.id
-        if self.game.roles.get(uid) != "女巫":
-            return await interaction.response.send_message("你不是女巫。", ephemeral=True)
-        if not self.game.is_alive(uid):
-            return await interaction.response.send_message("你已死亡，無法使用技能。", ephemeral=True)
-        if uid in self.game.night_actions:
-            return await interaction.response.send_message("你已行動過。", ephemeral=True)
-
-        # 告知女巫昨晚情況
-        dead_name = "無人"
-        if self.game.wolf_target != -1:
-            obj = self.ctx.guild.get_member(self.game.wolf_target)
-            if obj: dead_name = obj.display_name
+        role = self.game.roles.get(uid)
         
-        msg = f"🧙‍♀️ 今晚 **{dead_name}** 被狼人殺害了。\n你有 **{int(self.game.witch_potions['antidote'])}** 瓶解藥，**{int(self.game.witch_potions['poison'])}** 瓶毒藥。"
-        
-        await interaction.response.send_message(msg, view=WitchActionView(self.game, self.cog, self.ctx), ephemeral=True)
+        if role == "女巫":
+            if not self.game.is_alive(uid): return await interaction.response.send_message("已死", ephemeral=True)
+            if uid in self.game.night_actions: return await interaction.response.send_message("已行動", ephemeral=True)
+            dead_name = "無人"
+            if self.game.wolf_target != -1:
+                obj = self.ctx.guild.get_member(self.game.wolf_target)
+                if obj: dead_name = obj.display_name
+            msg = f"🧙‍♀️ 今晚 **{dead_name}** 被狼人殺害了。"
+            await interaction.response.send_message(msg, view=WitchActionView(self.game, self.cog, self.ctx), ephemeral=True)
+            return
 
-# --- 5. 獵人開槍介面 ---
-class HunterShootSelect(Select):
-    def __init__(self, game, cog, ctx):
+        if self.game.lucky_data["user_id"] == uid and self.game.lucky_data["target"] is None:
+            if not self.game.is_alive(uid): return await interaction.response.send_message("已死", ephemeral=True)
+            skill = self.game.lucky_data["skill"]
+            await interaction.response.send_message(f"✨ 你是幸運兒！獲得 **{skill}** 技能！", view=LuckyOneView(self.game, self.cog, self.ctx, skill), ephemeral=True)
+            return
+
+        await interaction.response.send_message("💤 繼續睡覺。", ephemeral=True)
+
+# --- 5. 開槍介面 (獵人/狼王通用) ---
+class ShooterSelect(Select):
+    def __init__(self, game, cog, ctx, role_name):
         self.game = game
         self.cog = cog
         self.ctx = ctx
-        options = [discord.SelectOption(label=p.display_name, value=str(p.id), emoji="🔫") 
-                   for p in game.players if game.is_alive(p.id)]
-        super().__init__(placeholder="🔫 獵人請選擇帶走一人...", min_values=1, max_values=1, options=options)
+        self.role_name = role_name
+        options = [discord.SelectOption(label=p.display_name, value=str(p.id), emoji="🔫") for p in game.players if game.is_alive(p.id)]
+        super().__init__(placeholder=f"🔫 {role_name}開槍...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         target_id = int(self.values[0])
-        target_user = interaction.guild.get_member(target_id)
-        
         self.game.status[target_id] = "dead"
         role = self.game.roles.get(target_id)
-        
-        await interaction.response.send_message(f"💥 砰！獵人開槍帶走了 **{target_user.display_name}** (身分: {role})")
-        
-        # 檢查勝負
+        target_user = interaction.guild.get_member(target_id)
+        if target_user: await target_user.edit(mute=True)
+        await interaction.response.send_message(f"💥 {self.role_name} 帶走了 **{target_user.display_name}** ({role})")
         winner = self.cog.check_winner(self.game)
-        if winner:
-            await self.cog.end_game(self.ctx, self.game, winner)
-        else:
-            # 獵人開完槍後，繼續原本的流程 (天亮 -> 投票)
-            # 因為獵人可能是在投票後死的，這裡簡單處理：如果是白天死，進入天黑；如果是晚上死，進入白天
-            # 簡化：獵人結算完，總是檢查是否還在白天，如果是就繼續投票(或直接進夜晚)
-            # 這裡簡單導向：開槍完直接進夜晚 (如果是在投票階段死)
-            await self.cog.start_night(self.ctx, self.game)
+        if winner: await self.cog.end_game(self.ctx, self.game, winner)
+        else: await self.cog.start_night(self.ctx, self.game)
 
-class HunterView(View):
-    def __init__(self, game, cog, ctx):
+class ShooterView(View):
+    def __init__(self, game, cog, ctx, role_name):
         super().__init__(timeout=None)
-        self.add_item(HunterShootSelect(game, cog, ctx))
+        self.add_item(ShooterSelect(game, cog, ctx, role_name))
 
-# --- 6. 白天投票 ---
+# --- 6. 投票介面 ---
 class CandidateButton(Button):
     def __init__(self, player, game, cog, ctx, view):
         super().__init__(label=player.display_name, style=discord.ButtonStyle.secondary)
@@ -360,7 +433,7 @@ class VotingView(View):
             self.stop()
             await self.cog.stop_game(self.ctx, "玩家投票強制結束")
 
-# --- 7. 主程式 Cog ---
+# --- 7. 主程式 ---
 class Werewolf(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -381,31 +454,27 @@ class Werewolf(commands.Cog):
         bgm_p = os.path.join(SOUND_FOLDER, bgm)
         if not os.path.exists(bgm_p): return
         if vc.is_playing(): vc.stop()
-        
         opts = '-vn'
         if voice:
             vp = os.path.join(SOUND_FOLDER, voice)
             if os.path.exists(vp):
-                # 混音
                 complex_filter = f'[0:a]volume=0.4[bg];[1:a]volume=1.5[vc];[bg][vc]amix=inputs=2:duration=first:dropout_transition=2'
                 before = f'-stream_loop -1 -i "{bgm_p}" -filter_complex "{complex_filter}"'
                 vc.play(discord.FFmpegPCMAudio(vp, before_options=before, options=opts))
                 return
-        
         vc.play(discord.FFmpegPCMAudio(bgm_p, before_options="-stream_loop -1", options=opts))
 
     async def stop_bgm(self, ctx):
         vc = ctx.guild.voice_client
         if vc and vc.is_playing(): vc.stop()
 
-    # --- 流程 ---
     @commands.hybrid_command(name='ww_create')
     async def create_game(self, ctx):
         if ctx.guild.id in self.games: return await ctx.send("已有遊戲", ephemeral=True)
         game = WerewolfGame(ctx.channel, ctx.author)
         self.games[ctx.guild.id] = game
         msg = await ctx.send(embed=LobbyView(self, game, ctx).update_embed(), view=LobbyView(self, game, ctx))
-        view = LobbyView(self, game, ctx) # Re-instantiate to keep ref if needed, or better use the one above
+        view = LobbyView(self, game, ctx) 
         view.message = msg
 
     @commands.hybrid_command(name='ww_force_stop')
@@ -430,20 +499,17 @@ class Werewolf(commands.Cog):
     async def start_game_logic(self, ctx):
         game = self.get_game(ctx)
         if not game: return
-        
-        # 身分分配邏輯
         n = len(game.players)
-        if n < 6: # 測試局
-            wolves, seers, witches, hunters = 1, 1, 1, 0
-        elif n < 9: # 6-8人
-            wolves, seers, witches, hunters = 2, 1, 1, 1
-        else: # 9人+
-            wolves, seers, witches, hunters = 3, 1, 1, 1
+        
+        # 板子配置 (狼/王/預/女/獵/商)
+        if n < 6: w, k, s, wi, h, m = 1, 0, 1, 1, 0, 0
+        elif n < 9: w, k, s, wi, h, m = 1, 1, 1, 1, 1, 0 # 6-8人: 1狼+1王
+        elif n < 10: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 0 # 9人: 2狼+1王
+        else: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 1 # 10人+: 2狼+1王+商
             
-        roles = ["狼人"]*wolves + ["預言家"]*seers + ["女巫"]*witches + ["獵人"]*hunters
+        roles = ["狼人"]*w + ["狼王"]*k + ["預言家"]*s + ["女巫"]*wi + ["獵人"]*h + ["奇跡商人"]*m
         while len(roles) < n: roles.append("村民")
         random.shuffle(roles)
-        
         game.roles = {p.id: roles[i] for i, p in enumerate(game.players)}
         game.status = {p.id: "alive" for p in game.players}
 
@@ -458,96 +524,111 @@ class Werewolf(commands.Cog):
         game.night_actions.clear()
         game.witch_poison_target = None
         game.deaths_tonight = []
+        game.guard_target = None
+        game.lucky_data = {"user_id": None, "skill": None, "target": None}
         
         await self.play_mixed_audio(ctx, "night.mp3", "voice_night_start.mp3")
         await self.mute_all(ctx, game, True)
-        
-        await game.channel.send("🌃 **上半夜：狼人與預言家** (請點擊行動)", view=NightViewPhase1(game, self, ctx))
+        await game.channel.send("🌃 **上半夜：狼人、預言家、奇跡商人**", view=NightViewPhase1(game, self, ctx))
 
     async def check_night_phase_1_end(self, ctx, game):
-        # 檢查狼人與預言家是否都動了
-        alive_wolves = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "狼人"]
+        alive_wolves = [p for p in game.players if game.is_alive(p.id) and game.is_wolf_team(p.id)]
         alive_seer = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "預言家"]
+        alive_merchant = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "奇跡商人"]
         
         wolves_done = len([v for v in game.wolf_votes.keys() if v in [w.id for w in alive_wolves]]) >= len(alive_wolves)
-        seer_done = True
-        if alive_seer and alive_seer[0].id not in game.night_actions: seer_done = False
-        
-        if wolves_done and seer_done:
+        seer_done = not alive_seer or alive_seer[0].id in game.night_actions
+        merchant_done = True
+        if alive_merchant:
+            m_id = alive_merchant[0].id
+            if not game.merchant_status["used"] and m_id not in game.night_actions:
+                merchant_done = False
+
+        if wolves_done and seer_done and merchant_done:
+            if game.wolf_votes:
+                valid_votes = [t for u, t in game.wolf_votes.items() if u in [w.id for w in alive_wolves]]
+                if valid_votes:
+                    most = Counter(valid_votes).most_common()
+                    candidates = [t for t, c in most if c == most[0][1]]
+                    game.wolf_target = random.choice(candidates)
+                else: game.wolf_target = -1
+            else: game.wolf_target = -1
+                
             await self.start_night_phase_2(ctx, game)
 
     async def start_night_phase_2(self, ctx, game):
-        # 女巫階段
         game.phase = PHASE_NIGHT_2
-        # 清除上一階段的 action 記錄 (讓女巫可以被標記)
-        # 注意：不要清掉狼人的 vote，但 night_actions 可以清給女巫用
-        # 但為了簡單，我們只檢查女巫 ID 是否在 night_actions
-        
+        game.night_actions.clear()
+        if game.lucky_data["skill"]: game.lucky_data["target"] = None 
+        await game.channel.send("🧙‍♀️ **下半夜：女巫與幸運兒**", view=NightViewPhase2(game, self, ctx))
+
+    async def check_night_phase_2_end(self, ctx, game):
         alive_witch = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "女巫"]
-        
-        if not alive_witch:
-            # 女巫已死，直接天亮
-            await self.start_day(ctx, game)
-        else:
-            # 只有女巫還活著才叫醒
-            # 清除預言家的行動標記，讓 night_actions 專門追蹤女巫是否行動 (如果想嚴謹可以用不同變數)
-            # 這裡我們不動 night_actions，只要檢查女巫 ID 有沒有加進去即可
-            await game.channel.send("🧙‍♀️ **下半夜：女巫請睜眼**", view=NightViewPhase2(game, self, ctx))
+        witch_done = not alive_witch or alive_witch[0].id in game.night_actions
+        if witch_done: await self.start_day(ctx, game)
 
     async def start_day(self, ctx, game):
         game.phase = PHASE_DAY
         game.votes = {}
         game.stop_votes.clear()
-        
         await self.stop_bgm(ctx)
         await self.mute_all(ctx, game, False)
         
-        # 結算死亡
         deaths = []
-        if game.wolf_target != -1: deaths.append(game.wolf_target)
+        if game.wolf_target != -1 and game.wolf_target != game.guard_target: deaths.append(game.wolf_target)
         if game.witch_poison_target: deaths.append(game.witch_poison_target)
-        
-        game.deaths_tonight = list(set(deaths)) # 去重
+        if game.lucky_data["skill"] == "poison" and game.lucky_data["target"]: deaths.append(game.lucky_data["target"])
+
+        # 商人反噬
+        if game.lucky_data["user_id"]:
+            lucky_id = game.lucky_data["user_id"]
+            if game.is_wolf_team(lucky_id): # 選中狼人(含狼王)
+                for pid, role in game.roles.items():
+                    if role == "奇跡商人" and game.is_alive(pid):
+                        deaths.append(pid)
+                        break
+
+        game.deaths_tonight = list(set(deaths))
         
         msg = "🌅 **天亮了！**\n"
-        if not game.deaths_tonight:
-            msg += "昨晚是個平安夜，無人死亡。"
+        if not game.deaths_tonight: msg += "昨晚是個平安夜。"
         else:
             msg += "昨晚死亡名單：\n"
             for uid in game.deaths_tonight:
                 user = ctx.guild.get_member(uid)
                 game.status[uid] = "dead"
                 msg += f"💀 **{user.display_name if user else '未知'}**\n"
-                if user: await user.edit(mute=True) # 死人靜音
+                if user: await user.edit(mute=True)
 
         winner = self.check_winner(game)
         if winner: return await self.end_game(ctx, game, winner)
-        
         await game.channel.send(msg)
 
-        # 處理獵人開槍 (檢查死亡名單中有沒有獵人)
-        # 規則：獵人被毒死不能開槍
-        hunter_died = False
+        # 處理開槍 (獵人 或 狼王)
+        shooter_died = False
+        shooter_role = ""
         for uid in game.deaths_tonight:
-            if game.roles.get(uid) == "獵人":
-                # 如果是被女巫毒死 (poison target)，不能開槍
-                if uid == game.witch_poison_target:
-                    await game.channel.send("🚫 獵人被毒殺，無法開槍！")
+            role = game.roles.get(uid)
+            if role in ["獵人", "狼王"]:
+                # 被毒死不能開槍
+                is_poisoned = (uid == game.witch_poison_target) or (game.lucky_data["skill"] == "poison" and uid == game.lucky_data["target"])
+                if is_poisoned:
+                    await game.channel.send(f"🚫 {role} 被毒殺，無法開槍！")
                 else:
-                    hunter_died = True
-                    hunter_uid = uid
+                    shooter_died = True
+                    shooter_role = role
+                    # 注意：如果同時死兩個能開槍的，這裡簡化只觸發最後一個，進階需佇列處理
         
-        if hunter_died:
-            game.phase = PHASE_HUNTER
-            await game.channel.send(f"🔫 **獵人發動技能！請開槍帶走一人！**", view=HunterView(game, self, ctx))
-            return # 暫停進入投票，等待獵人開槍回調
+        if shooter_died:
+            game.phase = PHASE_SHOOT
+            await game.channel.send(f"🔫 **{shooter_role} 發動技能！請開槍帶走一人！**", view=ShooterView(game, self, ctx, shooter_role))
+            return
 
-        # 正常進入投票
         await game.channel.send("現在開始討論，並點擊下方按鈕投票。", view=VotingView(game, self, ctx))
 
     def check_winner(self, game):
-        wolves = sum(1 for pid, s in game.status.items() if s=="alive" and game.roles[pid]=="狼人")
-        villagers = sum(1 for pid, s in game.status.items() if s=="alive" and game.roles[pid]!="狼人") # 簡化判定：狼人殺光好人就算贏
+        wolves = sum(1 for pid, s in game.status.items() if s=="alive" and game.is_wolf_team(pid))
+        villagers = sum(1 for pid, s in game.status.items() if s=="alive" and not game.is_wolf_team(pid))
         if wolves == 0: return "好人陣營"
         if wolves >= villagers: return "狼人陣營"
         return None
@@ -577,10 +658,10 @@ class Werewolf(commands.Cog):
             winner = self.check_winner(game)
             if winner: return await self.end_game(ctx, game, winner)
 
-            # 檢查獵人是否被票死 (被票死可以開槍)
-            if role == "獵人":
-                game.phase = PHASE_HUNTER
-                await game.channel.send(f"🔫 **獵人發動技能！請開槍帶走一人！**", view=HunterView(game, self, ctx))
+            # 被票死開槍判定
+            if role in ["獵人", "狼王"]:
+                game.phase = PHASE_SHOOT
+                await game.channel.send(f"🔫 **{role} 發動技能！請開槍帶走一人！**", view=ShooterView(game, self, ctx, role))
             else:
                 await self.start_night(ctx, game)
 
