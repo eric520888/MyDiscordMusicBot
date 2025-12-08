@@ -14,7 +14,7 @@ PHASE_WAITING = "waiting"
 PHASE_NIGHT_1 = "night_wolves_seer_merchant"
 PHASE_NIGHT_2 = "night_witch_lucky"
 PHASE_DAY = "day"
-PHASE_SHOOT = "role_shoot" # 獵人或狼王開槍階段
+PHASE_SHOOT = "role_shoot" 
 
 class WerewolfGame:
     def __init__(self, channel, host):
@@ -30,6 +30,9 @@ class WerewolfGame:
         self.witch_poison_target = None 
         self.night_actions = set()
         self.stop_votes = set()
+        
+        # 遊戲設定
+        self.board_id = "auto" # auto, standard, wolf_king, merchant
         
         # 道具與技能狀態
         self.witch_potions = {"antidote": True, "poison": True}
@@ -47,19 +50,52 @@ class WerewolfGame:
     def get_alive_players(self):
         return [p for p in self.players if self.is_alive(p.id)]
     
-    # 輔助：判斷是否為狼人陣營 (普通狼人 + 狼王)
     def is_wolf_team(self, user_id):
         role = self.roles.get(user_id)
         return role in ["狼人", "狼王"]
 
 # --- 1. 大廳介面 ---
+
+# 新增：板子選擇下拉選單
+class BoardSelect(Select):
+    def __init__(self, game):
+        self.game = game
+        options = [
+            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡 (新手推薦)"),
+            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="無狼王、無商人"),
+            discord.SelectOption(label="👑 狼王板 (預女獵+狼王)", value="wolf_king", description="狼隊有一名狼王"),
+            discord.SelectOption(label="💰 奇跡板 (狼王+商人)", value="merchant", description="加入奇跡商人與狼王 (高難度)")
+        ]
+        super().__init__(placeholder="📜 請選擇遊戲板子...", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        # 只有主持人能改板子
+        if interaction.user.id != self.game.host.id:
+            return await interaction.response.send_message("❌ 只有主持人可以更改板子。", ephemeral=True)
+        
+        self.game.board_id = self.values[0]
+        
+        board_name = "🎲 自動配置"
+        if self.game.board_id == "standard": board_name = "🔮 標準板 (預女獵)"
+        elif self.game.board_id == "wolf_king": board_name = "👑 狼王板 (預女獵+狼王)"
+        elif self.game.board_id == "merchant": board_name = "💰 奇跡板 (狼王+商人)"
+        
+        await interaction.response.send_message(f"✅ 板子已更新為：**{board_name}**", ephemeral=True)
+        
+        # 更新 Embed 顯示目前的板子
+        view: LobbyView = self.view
+        await interaction.message.edit(embed=view.update_embed())
+
 class LobbyView(View):
     def __init__(self, cog, game, ctx):
-        super().__init__(timeout=120)
+        super().__init__(timeout=180) # 延長到 180 秒
         self.cog = cog
         self.game = game
         self.ctx = ctx
         self.message = None
+        
+        # 加入板子選擇
+        self.add_item(BoardSelect(game))
 
     async def on_timeout(self):
         if self.game.phase == PHASE_WAITING:
@@ -73,37 +109,56 @@ class LobbyView(View):
 
     def update_embed(self):
         player_list = "\n".join([f"- {p.display_name}" for p in self.game.players]) if self.game.players else "目前無人加入"
+        
+        # 顯示目前板子資訊
+        board_map = {
+            "auto": "🎲 自動配置 (依人數)",
+            "standard": "🔮 標準板 (預女獵)",
+            "wolf_king": "👑 狼王板 (預女獵+狼王)",
+            "merchant": "💰 奇跡板 (狼王+商人)"
+        }
+        current_board = board_map.get(self.game.board_id, "未知")
+
         embed = discord.Embed(
             title="🐺 狼人殺遊戲大廳",
-            description=f"主持人: {self.game.host.display_name}\n\n**已加入玩家 ({len(self.game.players)}):**\n{player_list}",
+            description=f"主持人: {self.game.host.display_name}\n\n**目前板子**: {current_board}\n\n**已加入玩家 ({len(self.game.players)}):**\n{player_list}",
             color=discord.Color.dark_red()
         )
-        embed.set_footer(text="配置: 狼王/狼/預/女/獵 (10人+商人)")
+        embed.set_footer(text="主持人可從選單切換板子，滿員後按開始")
         return embed
 
-    @discord.ui.button(label="加入遊戲", style=discord.ButtonStyle.green, emoji="✋")
+    @discord.ui.button(label="加入遊戲", style=discord.ButtonStyle.green, emoji="✋", row=1)
     async def join_button(self, interaction: discord.Interaction, button: Button):
         if self.game.phase != PHASE_WAITING: return await interaction.response.send_message("已開始", ephemeral=True)
         if interaction.user in self.game.players: return await interaction.response.send_message("已加入", ephemeral=True)
         self.game.players.append(interaction.user)
         await interaction.response.edit_message(embed=self.update_embed(), view=self)
 
-    @discord.ui.button(label="退出", style=discord.ButtonStyle.red, emoji="🚪")
+    @discord.ui.button(label="退出", style=discord.ButtonStyle.red, emoji="🚪", row=1)
     async def leave_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user not in self.game.players: return
         self.game.players.remove(interaction.user)
         await interaction.response.edit_message(embed=self.update_embed(), view=self)
 
-    @discord.ui.button(label="開始遊戲", style=discord.ButtonStyle.blurple, emoji="🚀")
+    @discord.ui.button(label="開始遊戲", style=discord.ButtonStyle.blurple, emoji="🚀", row=1)
     async def start_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.game.host.id: return await interaction.response.send_message("只有主持人可開始", ephemeral=True)
         if len(self.game.players) < 3: return await interaction.response.send_message("人數不足 (最少 3)", ephemeral=True)
-        if interaction.user.voice and not self.ctx.guild.voice_client: await interaction.user.voice.channel.connect()
-        self.stop()
-        await interaction.response.send_message("遊戲開始！分配身分中...", ephemeral=False)
-        await self.cog.start_game_logic(self.ctx)
+        
+        # 連線語音
+        if interaction.user.voice and not self.ctx.guild.voice_client: 
+            await interaction.user.voice.channel.connect()
+        
+        # 呼叫開始邏輯 (注意：如果板子人數不符，start_game_logic 會回傳 False)
+        success = await self.cog.start_game_logic(self.ctx)
+        if success:
+            self.stop() # 只有成功開始才停止 View
+            await interaction.response.send_message("遊戲開始！分配身分中...", ephemeral=False)
+        else:
+            # 失敗的話不停止 View，讓他們繼續加人或換板子
+            pass
 
-    @discord.ui.button(label="關閉大廳", style=discord.ButtonStyle.grey, emoji="✖️")
+    @discord.ui.button(label="關閉大廳", style=discord.ButtonStyle.grey, emoji="✖️", row=1)
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.game.host.id and not interaction.user.guild_permissions.administrator: return
         if self.ctx.guild.id in self.cog.games: del self.cog.games[self.ctx.guild.id]
@@ -369,7 +424,7 @@ class NightViewPhase2(View):
 
         await interaction.response.send_message("💤 繼續睡覺。", ephemeral=True)
 
-# --- 5. 開槍介面 (獵人/狼王通用) ---
+# --- 5. 開槍介面 ---
 class ShooterSelect(Select):
     def __init__(self, game, cog, ctx, role_name):
         self.game = game
@@ -501,12 +556,37 @@ class Werewolf(commands.Cog):
         if not game: return
         n = len(game.players)
         
-        # 板子配置 (狼/王/預/女/獵/商)
-        if n < 6: w, k, s, wi, h, m = 1, 0, 1, 1, 0, 0
-        elif n < 9: w, k, s, wi, h, m = 1, 1, 1, 1, 1, 0 # 6-8人: 1狼+1王
-        elif n < 10: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 0 # 9人: 2狼+1王
-        else: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 1 # 10人+: 2狼+1王+商
+        # 預設人數與角色
+        wolves_count = max(1, n // 3)
+        w, k, s, wi, h, m = wolves_count, 0, 0, 0, 0, 0
+        
+        # 板子邏輯
+        if game.board_id == "auto":
+            if n < 6: w, k, s, wi, h, m = 1, 0, 1, 1, 0, 0
+            elif n < 9: w, k, s, wi, h, m = 1, 1, 1, 1, 1, 0
+            elif n < 10: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 0
+            else: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 1
+        
+        elif game.board_id == "standard":
+            s, wi, h = 1, 1, 1
+            w = max(1, wolves_count) # 狼人維持比例
             
+        elif game.board_id == "wolf_king":
+            s, wi, h = 1, 1, 1
+            k = 1
+            w = max(0, wolves_count - 1)
+            
+        elif game.board_id == "merchant":
+            s, wi, h, m = 1, 1, 1, 1
+            k = 1
+            w = max(0, wolves_count - 1)
+
+        # 檢查人數是否足夠
+        total_needed = w + k + s + wi + h + m
+        if n < total_needed:
+            await ctx.send(f"❌ 人數不足！此板子至少需要 {total_needed} 人。\n請重新選擇板子或等待更多人加入。")
+            return False
+
         roles = ["狼人"]*w + ["狼王"]*k + ["預言家"]*s + ["女巫"]*wi + ["獵人"]*h + ["奇跡商人"]*m
         while len(roles) < n: roles.append("村民")
         random.shuffle(roles)
@@ -516,6 +596,7 @@ class Werewolf(commands.Cog):
         await game.channel.send("🎲 **身分已分配！**", view=IdentityView(game))
         await asyncio.sleep(5)
         await self.start_night(ctx, game)
+        return True # 代表成功開始
 
     async def start_night(self, ctx, game):
         game.phase = PHASE_NIGHT_1
@@ -610,14 +691,12 @@ class Werewolf(commands.Cog):
         for uid in game.deaths_tonight:
             role = game.roles.get(uid)
             if role in ["獵人", "狼王"]:
-                # 被毒死不能開槍
                 is_poisoned = (uid == game.witch_poison_target) or (game.lucky_data["skill"] == "poison" and uid == game.lucky_data["target"])
                 if is_poisoned:
                     await game.channel.send(f"🚫 {role} 被毒殺，無法開槍！")
                 else:
                     shooter_died = True
                     shooter_role = role
-                    # 注意：如果同時死兩個能開槍的，這裡簡化只觸發最後一個，進階需佇列處理
         
         if shooter_died:
             game.phase = PHASE_SHOOT
@@ -658,7 +737,6 @@ class Werewolf(commands.Cog):
             winner = self.check_winner(game)
             if winner: return await self.end_game(ctx, game, winner)
 
-            # 被票死開槍判定
             if role in ["獵人", "狼王"]:
                 game.phase = PHASE_SHOOT
                 await game.channel.send(f"🔫 **{role} 發動技能！請開槍帶走一人！**", view=ShooterView(game, self, ctx, role))
