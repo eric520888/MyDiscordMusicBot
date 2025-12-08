@@ -40,7 +40,16 @@ FFMPEG_OPTIONS = {
     '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn',
 }
-
+def convert_to_seconds(time_str):
+    """將 mm:ss, hh:mm:ss 或純數字轉換為秒數"""
+    try:
+        parts = list(map(int, time_str.split(':')))
+        if len(parts) == 1: return parts[0] # 純秒數
+        if len(parts) == 2: return parts[0] * 60 + parts[1] # mm:ss
+        if len(parts) == 3: return parts[0] * 3600 + parts[1] * 60 + parts[2] # hh:mm:ss
+    except ValueError:
+        return 0
+    return 0
 # 儲存歌曲佇列
 song_queue = {}
 # 追蹤每個伺服器的循環狀態 (0: 無循環, 1: 單曲循環, 2: 佇列循環)
@@ -110,64 +119,81 @@ async def on_ready():
         song_queue[guild.id] = []
 
 
-@bot.command(name='play', help='播放YouTube上的音樂或將其加入佇列')
+@bot.command(name='play', help='播放YouTube音樂，可指定時間 (例如: !play 關鍵字 1:30)')
 async def play(ctx, *, search: str):
-    # 步驟 1: 檢查使用者是否在語音頻道
     if not ctx.author.voice:
         await ctx.send("你必須先加入一個語音頻道！")
         return
 
-    # 步驟 2: 立刻回覆使用者，告訴他你已經在工作了，這樣就不會感覺卡住
-    searching_message = await ctx.send(f'🔍 正在搜尋與準備歌曲: **{search}**')
+    # --- 新增邏輯：解析時間參數 ---
+    parts = search.split()
+    start_time = 0
+    real_search = search
 
-    # 步驟 3: 【先做最慢的事】執行 yt-dlp
+    # 檢查最後一個參數是否為時間格式 (簡單判斷是否包含冒號或純數字)
+    if len(parts) > 1:
+        potential_time = parts[-1]
+        # 嘗試轉換，如果大於 0 代表真的是時間參數
+        seconds = convert_to_seconds(potential_time)
+        if seconds > 0 or (potential_time.isdigit() and int(potential_time) == 0):
+            start_time = seconds
+            # 把時間從搜尋關鍵字中移除，剩下的才是歌名/網址
+            real_search = " ".join(parts[:-1])
+    
+    searching_message = await ctx.send(f'🔍 正在搜尋: **{real_search}** (從 {start_time} 秒開始)')
+
+    # --- 執行 yt-dlp ---
     info = None
     try:
-        # 使用 async with 來避免阻塞，讓機器人能處理其他事件
         loop = asyncio.get_event_loop()
-        # 在另一個執行緒中運行阻塞的 I/O 操作
         info = await loop.run_in_executor(
             None, lambda: yt_dlp.YoutubeDL(YDL_OPTIONS).extract_info(
-                f"ytsearch:{search}" if "http" not in search else search,
+                f"ytsearch:{real_search}" if "http" not in real_search else real_search,
                 download=False))
-        if "entries" in info:  # 如果是播放清單或搜尋結果，取第一個
+        if "entries" in info:
             info = info['entries'][0]
-
     except Exception as e:
-        await searching_message.edit(
-            content="❌ 無法找到歌曲，或歌曲格式有問題 (例如需要會員)。請試試別的關鍵字或網址。")
+        await searching_message.edit(content="❌ 搜尋失敗。")
         print(e)
         return
 
     url = info['url']
     title = info['title']
-    source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTIONS)
+
+    # --- 新增邏輯：設定 FFmpeg 的開始時間 ---
+    # 複製一份預設設定，避免汙染全域變數
+    current_ffmpeg_options = FFMPEG_OPTIONS.copy()
+    
+    if start_time > 0:
+        # 加入 -ss 參數，告訴 FFmpeg 從哪一秒開始串流
+        # 注意：必須加在 before_options 裡效果才好
+        current_ffmpeg_options['before_options'] += f' -ss {start_time}'
+
+    # 使用帶有時間參數的設定建立 source
+    source = discord.FFmpegPCMAudio(url, **current_ffmpeg_options)
     source.original_url = url
     source.title = title
 
-    # 步驟 4: 【再做最快的事】連線到語音頻道
+    # --- 連線與播放邏輯 (與原本相同) ---
     voice_channel = ctx.author.voice.channel
-    voice_client = ctx.guild.voice_client  # 使用 ctx.guild.voice_client 獲取最新狀態
+    voice_client = ctx.guild.voice_client
 
     if not voice_client:
         try:
             voice_client = await voice_channel.connect(timeout=30.0)
         except asyncio.TimeoutError:
-            await searching_message.edit(content="❌ 連接語音頻道超時，請再試一次。")
+            await searching_message.edit(content="❌ 連接超時。")
             return
     elif voice_client.channel != voice_channel:
         await voice_client.move_to(voice_channel)
 
-    # 步驟 5: 播放或加入佇列
     if voice_client.is_playing() or voice_client.is_paused():
         song_queue.setdefault(ctx.guild.id, []).append(source)
-        await searching_message.edit(content=f'✅ **{title}** 已加入播放佇列！')
+        await searching_message.edit(content=f'✅ **{title}** 已加入佇列 (從 {start_time} 秒開始)')
     else:
         currently_playing[ctx.guild.id] = source
-        voice_client.play(
-            source, after=lambda e: bot.loop.create_task(check_queue(ctx)))
-        # 編輯一開始發送的訊息，而不是發送新訊息，使用者體驗更好！
-        await searching_message.edit(content=f'▶️ 正在播放: **{title}**')
+        voice_client.play(source, after=lambda e: bot.loop.create_task(check_queue(ctx)))
+        await searching_message.edit(content=f'▶️ 正在播放: **{title}** (從 {start_time} 秒開始)')
 
 
 @play.error
