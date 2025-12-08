@@ -4,7 +4,7 @@ import google.generativeai as genai
 import os
 
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 class AIChat(commands.Cog):
     def __init__(self, bot):
