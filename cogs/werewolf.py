@@ -185,7 +185,6 @@ class WolfSelect(Select):
         if len([v for v in self.game.wolf_votes.keys() if v in alive_wolves]) >= len(alive_wolves):
             # 結算狼人目標 (多數決)
             from collections import Counter
-            # 過濾掉已死狼人的舊票 (保險起見)
             valid_votes = [target for uid, target in self.game.wolf_votes.items() if uid in alive_wolves]
             
             if valid_votes:
@@ -255,7 +254,6 @@ class NightActionView(View):
         role = self.game.roles.get(user_id)
         
         if role == "狼人":
-            # 狼人可以重複改票，所以不檢查是否行動過
             view = View()
             view.add_item(WolfSelect(self.game, self.cog, self.ctx))
             await interaction.response.send_message("🐺 **狼人請現身**，請與隊友投票選擇目標：", view=view, ephemeral=True)
@@ -324,9 +322,7 @@ class VotingView(View):
         
         if current_votes >= needed:
             self.stop()
-            del self.cog.games[self.ctx.guild.id]
-            await self.cog.stop_bgm(self.ctx)
-            await self.ctx.send("🛑 **超過半數玩家同意，遊戲強制結束！**")
+            await self.cog.stop_game(self.ctx) # 呼叫統一的結束處理
 
 # --- 5. 主程式 ---
 class Werewolf(commands.Cog):
@@ -337,7 +333,19 @@ class Werewolf(commands.Cog):
     def get_game(self, ctx):
         return self.games.get(ctx.guild.id)
 
-    # --- 混音播放 (維持不變) ---
+    # --- 靜音控制功能 ---
+    async def mute_all_players(self, ctx, game, mute=True):
+        """將所有遊戲玩家靜音或解除靜音"""
+        for player in game.players:
+            if player.voice: # 只處理在語音頻道的玩家
+                try:
+                    await player.edit(mute=mute)
+                except discord.Forbidden:
+                    print(f"❌ 無法更改 {player.display_name} 的靜音狀態 (權限不足)")
+                except Exception as e:
+                    print(f"⚠️ 靜音錯誤: {e}")
+
+    # --- 混音播放 ---
     async def play_mixed_audio(self, ctx, bgm_file, voice_file=None):
         voice_client = ctx.guild.voice_client
         if not voice_client: return
@@ -373,6 +381,16 @@ class Werewolf(commands.Cog):
         if voice_client and voice_client.is_playing(): 
             voice_client.stop()
 
+    async def stop_game(self, ctx):
+        """統一的遊戲結束清理"""
+        if ctx.guild.id in self.games:
+            game = self.games[ctx.guild.id]
+            # 遊戲結束，解除所有靜音
+            await self.mute_all_players(ctx, game, mute=False)
+            await self.stop_bgm(ctx)
+            del self.games[ctx.guild.id]
+            await ctx.send("🛑 **遊戲已結束。**")
+
     # --- Commands ---
     
     @commands.hybrid_command(name='ww_create', description='[狼人殺] 建立遊戲大廳')
@@ -381,22 +399,18 @@ class Werewolf(commands.Cog):
             await ctx.send("這裡已經有一場遊戲了！", ephemeral=True)
             return
         
-        # 傳入 ctx.author 作為主持人
         game = WerewolfGame(ctx.channel, ctx.author)
         self.games[ctx.guild.id] = game
         
-        # 賦予 View 引用，並發送訊息
         view = LobbyView(self, game, ctx)
         msg = await ctx.send(embed=view.update_embed(), view=view)
-        view.message = msg # 記錄訊息物件以便超時編輯
+        view.message = msg 
 
     @commands.hybrid_command(name='ww_force_stop', description='[管理員] 強制結束目前的狼人殺遊戲')
     @commands.has_permissions(administrator=True)
     async def force_stop_game(self, ctx):
         if ctx.guild.id in self.games:
-            del self.games[ctx.guild.id]
-            await self.stop_bgm(ctx)
-            await ctx.send("🛑 **管理員已強制結束遊戲。**")
+            await self.stop_game(ctx)
         else:
             await ctx.send("目前沒有進行中的遊戲。", ephemeral=True)
 
@@ -427,7 +441,6 @@ class Werewolf(commands.Cog):
 
     async def check_night_end(self, ctx, game):
         """檢查是否所有夜間角色都行動完畢"""
-        # 1. 找出所有活著的「狼人」和「預言家」ID
         alive_night_roles = []
         for pid in game.players:
             if game.is_alive(pid.id):
@@ -435,13 +448,7 @@ class Werewolf(commands.Cog):
                 if role in ["狼人", "預言家"]:
                     alive_night_roles.append(pid.id)
         
-        # 2. 檢查這些 ID 是否都在 night_actions 裡
-        # (狼人只要有投票就算行動，wolf_votes 的 key 就是狼人 ID)
-        
-        # 注意：night_actions 已經在 Select callback 中被添加了
-        # 我們檢查 alive_night_roles 是否是 night_actions 的子集
         if set(alive_night_roles).issubset(game.night_actions):
-            # 所有人都動了，天亮！
             await self.start_day(ctx, game, game.wolf_target)
 
     async def start_night(self, ctx, game):
@@ -450,26 +457,35 @@ class Werewolf(commands.Cog):
         game.wolf_votes.clear()
         game.night_actions.clear()
         
+        # 1. 播放音樂與語音
         await self.play_mixed_audio(ctx, "night.mp3", "voice_night_start.mp3")
         
+        # 2. 全體靜音
+        await self.mute_all_players(ctx, game, mute=True)
+        
         view = NightActionView(game, self, ctx)
-        await game.channel.send("🌃 **天黑請閉眼...** (背景音樂播放中)\n請點擊下方按鈕進行行動。", view=view)
+        await game.channel.send("🌃 **天黑請閉眼...** (全員已靜音)\n請點擊下方按鈕進行行動。", view=view)
 
     async def start_day(self, ctx, game, dead_player_id=None):
         game.phase = PHASE_DAY
         game.votes = {} 
-        game.stop_votes.clear() # 清空結束投票
+        game.stop_votes.clear() 
         
         await self.stop_bgm(ctx)
         
-        msg = "🌅 **天亮了！**\n"
+        # 1. 解除靜音
+        await self.mute_all_players(ctx, game, mute=False)
         
-        # 處理死亡邏輯
+        msg = "🌅 **天亮了！** (解除靜音)\n"
+        
         if dead_player_id and dead_player_id != -1:
             dead_user = ctx.guild.get_member(dead_player_id)
             if dead_user:
                 game.status[dead_player_id] = "dead"
                 msg += f"昨晚 **{dead_user.display_name}** 慘遭殺害...\n"
+                # 讓死者保持靜音 (選擇性)
+                try: await dead_user.edit(mute=True)
+                except: pass
             else:
                 msg += "昨晚有人死亡，但找不到玩家資料。\n"
         else:
@@ -480,6 +496,9 @@ class Werewolf(commands.Cog):
             await game.channel.send(f"{msg}\n🏆 **遊戲結束！獲勝者: {winner}**")
             role_reveal = "\n".join([f"{p.display_name}: {game.roles[p.id]}" for p in game.players])
             await game.channel.send(f"**身分揭曉：**\n{role_reveal}")
+            
+            # 遊戲結束解除靜音
+            await self.mute_all_players(ctx, game, mute=False)
             del self.games[ctx.guild.id]
             return
 
@@ -520,11 +539,18 @@ class Werewolf(commands.Cog):
             role = game.roles[eliminated_id]
             await game.channel.send(f"💀 **{eliminated_user.display_name}** 被處決了！\n他的身分是：**{role}**")
             
+            # 讓被處決者靜音
+            if eliminated_user and eliminated_user.voice:
+                try: await eliminated_user.edit(mute=True)
+                except: pass
+            
             winner = self.check_winner(game)
             if winner:
                 await game.channel.send(f"🏆 **遊戲結束！獲勝者: {winner}**")
                 role_reveal = "\n".join([f"{p.display_name}: {game.roles[p.id]}" for p in game.players])
                 await game.channel.send(f"**身分揭曉：**\n{role_reveal}")
+                # 解除所有靜音
+                await self.mute_all_players(ctx, game, mute=False)
                 del self.games[ctx.guild.id]
             else:
                 await self.start_night(ctx, game)
