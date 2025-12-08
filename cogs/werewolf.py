@@ -10,6 +10,23 @@ from collections import Counter
 # --- 設定 ---
 SOUND_FOLDER = "./sounds"
 
+# --- [架構升級] 角色與陣營定義 ---
+# 狼人陣營
+ROLE_WEREWOLF = "狼人"
+ROLE_WOLF_KING = "狼王"
+WOLF_CAMP = {ROLE_WEREWOLF, ROLE_WOLF_KING}
+
+# 神職陣營
+ROLE_SEER = "預言家"
+ROLE_WITCH = "女巫"
+ROLE_HUNTER = "獵人"
+ROLE_MERCHANT = "奇跡商人"
+GOD_CAMP = {ROLE_SEER, ROLE_WITCH, ROLE_HUNTER, ROLE_MERCHANT}
+
+# 村民陣營
+ROLE_VILLAGER = "村民"
+VILLAGER_CAMP = {ROLE_VILLAGER}
+
 # 定義遊戲狀態
 PHASE_WAITING = "waiting"
 PHASE_NIGHT_1 = "night_wolves_seer_merchant"
@@ -52,17 +69,23 @@ class WerewolfGame:
     def get_alive_players(self):
         return [p for p in self.players if self.is_alive(p.id)]
     
+    # --- [架構升級] 陣營判斷 helper ---
     def is_wolf_team(self, user_id):
-        role = self.roles.get(user_id)
-        return role in ["狼人", "狼王"]
+        return self.get_role(user_id) in WOLF_CAMP
+
+    def is_god(self, user_id):
+        return self.get_role(user_id) in GOD_CAMP
+
+    def is_villager(self, user_id):
+        return self.get_role(user_id) in VILLAGER_CAMP
 
 # --- 1. 大廳與設定 ---
 class BoardSelect(Select):
     def __init__(self, game):
         self.game = game
         options = [
-            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡 (3-5人無女巫)"),
-            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="強制開啟女巫/獵人"),
+            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡"),
+            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="無狼王、無商人"),
             discord.SelectOption(label="👑 狼王板 (預女獵+狼王)", value="wolf_king", description="加入狼王"),
             discord.SelectOption(label="💰 奇跡板 (狼王+商人)", value="merchant", description="加入奇跡商人")
         ]
@@ -167,17 +190,24 @@ class IdentityView(View):
         if interaction.user not in self.game.players: return
         
         role = self.game.roles.get(interaction.user.id)
-        msg = f"你的身分是：**{role}**"
         
-        if role in ["狼人", "狼王"]:
+        # --- [架構升級] 顯示陣營 ---
+        camp = "未知"
+        if role in WOLF_CAMP: camp = "🐺 狼人陣營"
+        elif role in GOD_CAMP: camp = "🔱 神職陣營"
+        elif role in VILLAGER_CAMP: camp = "👱 村民陣營"
+        
+        msg = f"你的身分是：**{role}** ({camp})"
+        
+        if role in WOLF_CAMP:
             teammates = [p.display_name for p in self.game.players if self.game.is_wolf_team(p.id) and p.id != interaction.user.id]
             msg += f"\n🐺 隊友：{', '.join(teammates) if teammates else '無 (孤狼)'}"
-            msg += "\n🔪 目標：與隊友投票殺死村民。"
-            if role == "狼王": msg += "\n👑 特殊能力：死後可以開槍帶走一人 (被毒死除外)。"
-        elif role == "預言家": msg += "\n🔮 技能：每晚查驗一名玩家是好人還是狼人。"
-        elif role == "女巫": msg += "\n🧪 技能：解藥(救人)與毒藥(殺人)，每晚限用一瓶。"
-        elif role == "獵人": msg += "\n🔫 技能：死後可開槍帶走一人 (被毒死除外)。"
-        elif role == "奇跡商人": msg += "\n💰 技能：限一次，賜予一名玩家(幸運兒) 查驗/毒藥/守衛 技能。\n⚠️ **風險：若選中狼人，你將死亡！**"
+            msg += "\n🔪 目標：**屠邊** (殺光神職 或 殺光村民)。"
+            if role == ROLE_WOLF_KING: msg += "\n👑 特殊能力：死後可以開槍帶走一人 (被毒死除外)。"
+        elif role == ROLE_SEER: msg += "\n🔮 技能：每晚查驗一名玩家是好人還是狼人。"
+        elif role == ROLE_WITCH: msg += "\n🧪 技能：解藥(救人)與毒藥(殺人)，每晚限用一瓶。"
+        elif role == ROLE_HUNTER: msg += "\n🔫 技能：死後可開槍帶走一人 (被毒死除外)。"
+        elif role == ROLE_MERCHANT: msg += "\n💰 技能：限一次，賜予一名玩家(幸運兒) 查驗/毒藥/守衛 技能。\n⚠️ **風險：若選中狼人，你將死亡！**"
         else: msg += "\n🏡 技能：無。努力推理並活下去。"
         
         self.game.confirmed_players.add(interaction.user.id)
@@ -248,7 +278,7 @@ class SeerSelect(Select):
             await interaction.response.send_message("🔮 你選擇不查驗。", ephemeral=True)
         else:
             role = self.game.roles.get(target_id)
-            res = "🐺 狼人 (壞人)" if role in ["狼人", "狼王"] else "好人"
+            res = "🐺 狼人 (壞人)" if role in WOLF_CAMP else "好人"
             await interaction.response.send_message(f"🔮 查驗結果：{res}", ephemeral=True)
         
         await self.cog.check_night_phase_1_end(self.ctx, self.game)
@@ -305,12 +335,12 @@ class NightViewPhase1(View):
         if not self.game.is_alive(uid): return await interaction.response.send_message("你已死亡", ephemeral=True)
         role = self.game.roles.get(uid)
         
-        if role in ["狼人", "狼王"]:
+        if role in WOLF_CAMP:
             await interaction.response.send_message("🐺 **狼人行動**", view=View().add_item(WolfSelect(self.game, self.cog, self.ctx)), ephemeral=True)
-        elif role == "預言家":
+        elif role == ROLE_SEER:
             if uid in self.game.night_actions: return await interaction.response.send_message("已行動", ephemeral=True)
             await interaction.response.send_message("🔮 **預言家行動**", view=View().add_item(SeerSelect(self.game, self.cog, self.ctx)), ephemeral=True)
-        elif role == "奇跡商人":
+        elif role == ROLE_MERCHANT:
             if self.game.merchant_status["used"] or uid in self.game.night_actions: 
                 return await interaction.response.send_message("已行動或技能已用。", ephemeral=True)
             view = View()
@@ -388,7 +418,7 @@ class LuckyOneView(View):
     async def check_callback(self, interaction: discord.Interaction):
         target = int(interaction.data['values'][0])
         role = self.game.roles.get(target)
-        res = "🐺 狼人" if role in ["狼人", "狼王"] else "好人"
+        res = "🐺 狼人" if role in WOLF_CAMP else "好人"
         self.game.lucky_data["target"] = target 
         await interaction.response.send_message(f"🔮 查驗結果：{res}", ephemeral=True)
         await self.cog.check_night_phase_2_end(self.ctx, self.game)
@@ -418,7 +448,7 @@ class NightViewPhase2(View):
         uid = interaction.user.id
         role = self.game.roles.get(uid)
         
-        if role == "女巫":
+        if role == ROLE_WITCH:
             if not self.game.is_alive(uid): return await interaction.response.send_message("已死", ephemeral=True)
             if uid in self.game.night_actions: return await interaction.response.send_message("已行動", ephemeral=True)
             dead_name = "無人"
@@ -597,8 +627,8 @@ class Werewolf(commands.Cog):
             await ctx.send(f"❌ 人數不足！此板子至少需要 {total_needed} 人。")
             return False
 
-        roles = ["狼人"]*w + ["狼王"]*k + ["預言家"]*s + ["女巫"]*wi + ["獵人"]*h + ["奇跡商人"]*m
-        while len(roles) < n: roles.append("村民")
+        roles = [ROLE_WEREWOLF]*w + [ROLE_WOLF_KING]*k + [ROLE_SEER]*s + [ROLE_WITCH]*wi + [ROLE_HUNTER]*h + [ROLE_MERCHANT]*m
+        while len(roles) < n: roles.append(ROLE_VILLAGER)
         random.shuffle(roles)
         game.roles = {p.id: roles[i] for i, p in enumerate(game.players)}
         game.status = {p.id: "alive" for p in game.players}
@@ -618,7 +648,20 @@ class Werewolf(commands.Cog):
             game.lucky_data = {"user_id": None, "skill": None, "target": None}
             game.confirmed_players.clear()
             
-            await game.channel.send("🌃 **上半夜：狼人、預言家、奇跡商人**", view=NightViewPhase1(game, self, ctx))
+            # --- [動態生成夜晚訊息] ---
+            has_witch_role = ROLE_WITCH in game.roles.values()
+            has_merchant_role = ROLE_MERCHANT in game.roles.values()
+            needs_phase_2 = has_witch_role or has_merchant_role
+
+            p1_roles = []
+            if any(r in game.roles.values() for r in WOLF_CAMP): p1_roles.append("狼人")
+            if ROLE_SEER in game.roles.values(): p1_roles.append("預言家")
+            if ROLE_MERCHANT in game.roles.values(): p1_roles.append("奇跡商人")
+            
+            title = "🌃 上半夜" if needs_phase_2 else "🌃 夜晚"
+            roles_str = "、".join(p1_roles) if p1_roles else "無人"
+            
+            await game.channel.send(f"{title}：{roles_str} (請點擊行動)", view=NightViewPhase1(game, self, ctx))
             
             asyncio.create_task(self.safe_play_audio(ctx))
             asyncio.create_task(self.mute_all(ctx, game, True))
@@ -635,8 +678,8 @@ class Werewolf(commands.Cog):
 
     async def check_night_phase_1_end(self, ctx, game):
         alive_wolves = [p for p in game.players if game.is_alive(p.id) and game.is_wolf_team(p.id)]
-        alive_seer = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "預言家"]
-        alive_merchant = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "奇跡商人"]
+        alive_seer = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == ROLE_SEER]
+        alive_merchant = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == ROLE_MERCHANT]
         
         wolves_done = len([v for v in game.wolf_votes.keys() if v in [w.id for w in alive_wolves]]) >= len(alive_wolves)
         seer_done = not alive_seer or alive_seer[0].id in game.night_actions
@@ -648,23 +691,18 @@ class Werewolf(commands.Cog):
 
         if wolves_done and seer_done and merchant_done:
             if game.wolf_votes:
-                # 狼人多數決 (平票隨機)
                 valid_votes = [t for u, t in game.wolf_votes.items() if u in [w.id for w in alive_wolves]]
                 if valid_votes:
                     most = Counter(valid_votes).most_common()
-                    max_v = most[0][1]
-                    candidates = [t for t, c in most if c == max_v]
+                    candidates = [t for t, c in most if c == most[0][1]]
                     game.wolf_target = random.choice(candidates)
                 else: game.wolf_target = -1
             else: game.wolf_target = -1
             
             # --- [智慧跳夜判斷] ---
-            # 檢查是否有任何「角色」存在於板子上 (不是檢查活人，是檢查板子)
-            has_witch_role = "女巫" in game.roles.values()
-            has_merchant_role = "奇跡商人" in game.roles.values()
+            has_witch_role = ROLE_WITCH in game.roles.values()
+            has_merchant_role = ROLE_MERCHANT in game.roles.values()
             
-            # 如果板子上有女巫 或 有奇跡商人(可能有幸運兒)，就必須進下半夜 (哪怕他們死了也要進，這是為了隱藏資訊)
-            # 但如果板子上根本沒這兩個角色 (例如3人局)，直接跳天亮
             if not has_witch_role and not has_merchant_role:
                 await self.start_day(ctx, game)
             else:
@@ -675,28 +713,27 @@ class Werewolf(commands.Cog):
         game.night_actions.clear()
         if game.lucky_data["skill"]: game.lucky_data["target"] = None 
         
-        # 發送下半夜面板 (即使沒人活著也要發，假裝有事發生)
-        await game.channel.send("🧙‍♀️ **下半夜：女巫與幸運兒**", view=NightViewPhase2(game, self, ctx))
+        p2_roles = []
+        if ROLE_WITCH in game.roles.values(): p2_roles.append("女巫")
+        if game.lucky_data["user_id"]: p2_roles.append("幸運兒")
+        roles_str = "、".join(p2_roles) if p2_roles else "無"
+
+        await game.channel.send(f"🧙‍♀️ **下半夜：{roles_str}**", view=NightViewPhase2(game, self, ctx))
         
-        # 檢查是否有活著的行動者
-        alive_witches = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "女巫"]
+        alive_witches = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == ROLE_WITCH]
         lucky_id = game.lucky_data["user_id"]
         has_alive_lucky = lucky_id and game.is_alive(lucky_id)
         
-        # 如果沒有任何人可以行動 (全死光 或 沒技能)，模擬延遲後自動天亮
         if not alive_witches and not has_alive_lucky:
-            await asyncio.sleep(random.randint(5, 10)) # 隨機等待 5-10 秒
+            await asyncio.sleep(random.randint(5, 10)) 
             await self.start_day(ctx, game)
 
     async def check_night_phase_2_end(self, ctx, game):
-        # 1. 檢查女巫
-        alive_witch = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "女巫"]
+        alive_witch = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == ROLE_WITCH]
         witch_done = not alive_witch or alive_witch[0].id in game.night_actions
         
-        # 2. 檢查幸運兒
         lucky_done = True
         lid = game.lucky_data["user_id"]
-        # 如果幸運兒活著且有技能，但他還沒選目標 -> 未完成
         if lid and game.is_alive(lid) and game.lucky_data["target"] is None:
              lucky_done = False
         
@@ -720,7 +757,7 @@ class Werewolf(commands.Cog):
             lucky_id = game.lucky_data["user_id"]
             if game.is_wolf_team(lucky_id): 
                 for pid, role in game.roles.items():
-                    if role == "奇跡商人" and game.is_alive(pid):
+                    if role == ROLE_MERCHANT and game.is_alive(pid):
                         deaths.append(pid)
                         break
 
@@ -746,7 +783,7 @@ class Werewolf(commands.Cog):
         shooter_role = ""
         for uid in game.deaths_tonight:
             role = game.roles.get(uid)
-            if role in ["獵人", "狼王"]:
+            if role in [ROLE_HUNTER, ROLE_WOLF_KING]:
                 is_poisoned = (uid == game.witch_poison_target) or (game.lucky_data["skill"] == "poison" and uid == game.lucky_data["target"])
                 if is_poisoned:
                     await game.channel.send(f"🚫 {role} 被毒殺，無法開槍！")
@@ -762,10 +799,24 @@ class Werewolf(commands.Cog):
         await game.channel.send("現在開始討論，並點擊下方按鈕投票。", view=VotingView(game, self, ctx))
 
     def check_winner(self, game):
-        wolves = sum(1 for pid, s in game.status.items() if s=="alive" and game.is_wolf_team(pid))
-        villagers = sum(1 for pid, s in game.status.items() if s=="alive" and not game.is_wolf_team(pid))
-        if wolves == 0: return "好人陣營"
-        if wolves >= villagers: return "狼人陣營"
+        # 屠邊規則：殺光所有神職 OR 殺光所有村民
+        alive_wolves = 0
+        alive_gods = 0
+        alive_villagers = 0
+        
+        for pid in game.players:
+            if not game.is_alive(pid.id): continue
+            
+            if game.is_wolf_team(pid.id): alive_wolves += 1
+            elif game.is_god(pid.id): alive_gods += 1
+            elif game.is_villager(pid.id): alive_villagers += 1
+            
+        if alive_wolves == 0: return "好人陣營"
+        if alive_gods == 0 or alive_villagers == 0: return "狼人陣營" # 屠邊成功
+        
+        # 防止卡死：狼人數量 >= 好人數量
+        if alive_wolves >= (alive_gods + alive_villagers): return "狼人陣營"
+        
         return None
 
     async def tally_votes(self, ctx, game):
@@ -795,7 +846,7 @@ class Werewolf(commands.Cog):
             winner = self.check_winner(game)
             if winner: return await self.end_game(ctx, game, winner)
 
-            if role in ["獵人", "狼王"]:
+            if role in [ROLE_HUNTER, ROLE_WOLF_KING]:
                 game.phase = PHASE_SHOOT
                 await game.channel.send(f"🔫 **{role} 發動技能！請開槍帶走一人！**", view=ShooterView(game, self, ctx, role))
             else:
