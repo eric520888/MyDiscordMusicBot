@@ -4,6 +4,7 @@ from discord.ui import Button, View, Select
 import random
 import asyncio
 import os
+import traceback # 用於印出詳細錯誤
 from collections import Counter
 
 # --- 設定 ---
@@ -33,11 +34,9 @@ class WerewolfGame:
         
         # 遊戲設定
         self.board_id = "auto"
-        
-        # 玩家狀態確認
         self.confirmed_players = set()
         
-        # 道具與技能狀態
+        # 道具與技能
         self.witch_potions = {"antidote": True, "poison": True}
         self.merchant_status = {"used": False} 
         self.lucky_data = {"user_id": None, "skill": None, "target": None} 
@@ -57,23 +56,22 @@ class WerewolfGame:
         role = self.roles.get(user_id)
         return role in ["狼人", "狼王"]
 
-# --- 1. 大廳介面 ---
+# --- 1. 大廳與設定 ---
 class BoardSelect(Select):
     def __init__(self, game):
         self.game = game
         options = [
-            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡"),
-            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="無狼王、無商人"),
-            discord.SelectOption(label="👑 狼王板 (預女獵+狼王)", value="wolf_king", description="狼隊有一名狼王"),
-            discord.SelectOption(label="💰 奇跡板 (狼王+商人)", value="merchant", description="加入奇跡商人與狼王")
+            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡 (3-5人無女巫)"),
+            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="強制開啟女巫/獵人"),
+            discord.SelectOption(label="👑 狼王板 (預女獵+狼王)", value="wolf_king", description="加入狼王"),
+            discord.SelectOption(label="💰 奇跡板 (狼王+商人)", value="merchant", description="加入奇跡商人")
         ]
         super().__init__(placeholder="📜 請選擇遊戲板子...", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
-        # 權限檢查：主持人 OR 開發者
         is_dev = await self.view.cog.bot.is_owner(interaction.user)
         if interaction.user.id != self.game.host.id and not is_dev:
-            return await interaction.response.send_message("❌ 只有主持人或開發者可以更改板子。", ephemeral=True)
+            return await interaction.response.send_message("❌ 權限不足。", ephemeral=True)
         
         self.game.board_id = self.values[0]
         board_name = {
@@ -81,15 +79,13 @@ class BoardSelect(Select):
             "wolf_king": "👑 狼王板", "merchant": "💰 奇跡板"
         }.get(self.values[0], "未知")
         
-        user_title = "開發者" if is_dev and interaction.user.id != self.game.host.id else "主持人"
-        await interaction.response.send_message(f"✅ {user_title} 將板子更新為：**{board_name}**", ephemeral=True)
-        
+        await interaction.response.send_message(f"✅ 板子更新為：**{board_name}**", ephemeral=True)
         view: LobbyView = self.view
         await interaction.message.edit(embed=view.update_embed())
 
 class LobbyView(View):
     def __init__(self, cog, game, ctx):
-        super().__init__(timeout=180)
+        super().__init__(timeout=300) 
         self.cog = cog
         self.game = game
         self.ctx = ctx
@@ -109,8 +105,8 @@ class LobbyView(View):
     def update_embed(self):
         player_list = "\n".join([f"- {p.display_name}" for p in self.game.players]) if self.game.players else "目前無人加入"
         board_map = {
-            "auto": "🎲 自動配置 (依人數)", "standard": "🔮 標準板 (預女獵)",
-            "wolf_king": "👑 狼王板 (預女獵+狼王)", "merchant": "💰 奇跡板 (狼王+商人)"
+            "auto": "🎲 自動配置", "standard": "🔮 標準板",
+            "wolf_king": "👑 狼王板", "merchant": "💰 奇跡板"
         }
         current_board = board_map.get(self.game.board_id, "未知")
 
@@ -119,7 +115,6 @@ class LobbyView(View):
             description=f"主持人: {self.game.host.display_name}\n\n**目前板子**: {current_board}\n\n**已加入玩家 ({len(self.game.players)}):**\n{player_list}",
             color=discord.Color.dark_red()
         )
-        embed.set_footer(text="主持人可切換板子，滿員後按開始")
         return embed
 
     @discord.ui.button(label="加入遊戲", style=discord.ButtonStyle.green, emoji="✋", row=1)
@@ -137,54 +132,39 @@ class LobbyView(View):
 
     @discord.ui.button(label="開始遊戲", style=discord.ButtonStyle.blurple, emoji="🚀", row=1)
     async def start_button(self, interaction: discord.Interaction, button: Button):
-        # 權限檢查：主持人 OR 開發者
         is_dev = await self.cog.bot.is_owner(interaction.user)
         if interaction.user.id != self.game.host.id and not is_dev:
-            return await interaction.response.send_message("只有主持人或開發者可開始", ephemeral=True)
+            return await interaction.response.send_message("權限不足", ephemeral=True)
         
         if len(self.game.players) < 3: return await interaction.response.send_message("人數不足 (最少 3)", ephemeral=True)
-        
-        # 嘗試連語音
-        if interaction.user.voice and not self.ctx.guild.voice_client: 
-            await interaction.user.voice.channel.connect()
+        if interaction.user.voice and not self.ctx.guild.voice_client: await interaction.user.voice.channel.connect()
         
         success = await self.cog.start_game_logic(self.ctx)
         if success:
             self.stop()
-            user_title = "開發者" if is_dev and interaction.user.id != self.game.host.id else "主持人"
-            await interaction.response.send_message(f"🚀 {user_title} 強制開始遊戲！分配身分中...", ephemeral=False)
+            await interaction.response.send_message("遊戲開始！分配身分中...", ephemeral=False)
 
     @discord.ui.button(label="關閉大廳", style=discord.ButtonStyle.grey, emoji="✖️", row=1)
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
-        # 權限檢查：主持人 OR 管理員 OR 開發者
         is_dev = await self.cog.bot.is_owner(interaction.user)
         is_admin = interaction.user.guild_permissions.administrator
-        
-        if interaction.user.id != self.game.host.id and not is_admin and not is_dev:
-            return await interaction.response.send_message("權限不足。", ephemeral=True)
-        
+        if interaction.user.id != self.game.host.id and not is_admin and not is_dev: return
         if self.ctx.guild.id in self.cog.games: del self.cog.games[self.ctx.guild.id]
         self.stop()
-        
-        closer = "主持人"
-        if is_dev and interaction.user.id != self.game.host.id: closer = "開發者"
-        elif is_admin and interaction.user.id != self.game.host.id: closer = "管理員"
-            
-        await interaction.response.edit_message(embed=discord.Embed(title="🛑 已關閉", description=f"{closer} 關閉了大廳。", color=discord.Color.light_grey()), view=None)
+        await interaction.response.edit_message(embed=discord.Embed(title="🛑 已關閉", color=discord.Color.light_grey()), view=None)
 
-# --- 2. 身分查看 (IdentityView) ---
+# --- 2. 身分確認 ---
 class IdentityView(View):
     def __init__(self, game, cog, ctx):
         super().__init__(timeout=None)
         self.game = game
         self.cog = cog
         self.ctx = ctx
-        self.started = False # 防止重複觸發
+        self.started = False 
 
     @discord.ui.button(label="🕵️ 查看身分 (並確認)", style=discord.ButtonStyle.primary)
     async def check_identity(self, interaction: discord.Interaction, button: Button):
-        if interaction.user not in self.game.players:
-            return await interaction.response.send_message("你沒有參與這場遊戲！", ephemeral=True)
+        if interaction.user not in self.game.players: return
         
         role = self.game.roles.get(interaction.user.id)
         msg = f"你的身分是：**{role}**"
@@ -200,22 +180,17 @@ class IdentityView(View):
         elif role == "奇跡商人": msg += "\n💰 技能：限一次，賜予一名玩家(幸運兒) 查驗/毒藥/守衛 技能。\n⚠️ **風險：若選中狼人，你將死亡！**"
         else: msg += "\n🏡 技能：無。努力推理並活下去。"
         
-        # 標記確認
         self.game.confirmed_players.add(interaction.user.id)
         checked = len(self.game.confirmed_players)
         total = len(self.game.players)
         
-        # 回應玩家身分 (隱藏)
         await interaction.response.send_message(msg, ephemeral=True)
 
-        # 更新公開訊息的進度條 (讓大家知道還差誰)
         try:
             content = f"🎲 **身分已分配！請確認身分以開始遊戲**\n(目前確認進度: **{checked}/{total}**)"
             await interaction.message.edit(content=content)
-        except:
-            pass
+        except: pass
 
-        # 自動開始判定
         if checked >= total and not self.started:
             self.started = True
             self.stop()
@@ -224,7 +199,6 @@ class IdentityView(View):
 
     @discord.ui.button(label="強制入夜", style=discord.ButtonStyle.danger)
     async def force_start(self, interaction: discord.Interaction, button: Button):
-        # 權限檢查：主持人 OR 開發者
         is_dev = await self.cog.bot.is_owner(interaction.user)
         if interaction.user.id != self.game.host.id and not is_dev:
             return await interaction.response.send_message("權限不足", ephemeral=True)
@@ -232,12 +206,10 @@ class IdentityView(View):
         if not self.started:
             self.started = True
             self.stop()
-            
-            user_title = "開發者" if is_dev and interaction.user.id != self.game.host.id else "主持人"
-            await interaction.response.send_message(f"🚨 {user_title} 強制進入夜晚！", ephemeral=False)
+            await interaction.response.send_message("🚨 強制進入夜晚！", ephemeral=False)
             await self.cog.start_night(self.ctx, self.game)
 
-# --- 3. 夜間選單 (Phase 1) ---
+# --- 3. 夜間選單 ---
 class WolfSelect(Select):
     def __init__(self, game, cog, ctx):
         self.game = game
@@ -251,7 +223,10 @@ class WolfSelect(Select):
         target_id = int(self.values[0])
         self.game.wolf_votes[interaction.user.id] = target_id
         self.game.night_actions.add(interaction.user.id)
-        target_name = "空刀" if target_id == -1 else interaction.guild.get_member(target_id).display_name
+        
+        target_obj = interaction.guild.get_member(target_id)
+        target_name = "空刀" if target_id == -1 else (target_obj.display_name if target_obj else "未知")
+        
         await interaction.response.send_message(f"🩸 你投給了：**{target_name}**", ephemeral=True)
         await self.cog.check_night_phase_1_end(self.ctx, self.game)
 
@@ -297,8 +272,9 @@ class MerchantSkillSelect(Select):
         self.game.merchant_status["used"] = True
         self.game.night_actions.add(interaction.user.id)
         
-        target_user = interaction.guild.get_member(self.target_id)
-        await interaction.response.send_message(f"💰 你給予了 **{target_user.display_name}** **{skill}** 技能。", ephemeral=True)
+        target_obj = interaction.guild.get_member(self.target_id)
+        t_name = target_obj.display_name if target_obj else "未知"
+        await interaction.response.send_message(f"💰 給予了 **{t_name}** **{skill}** 技能。", ephemeral=True)
         await self.cog.check_night_phase_1_end(self.ctx, self.game)
 
 class MerchantTargetSelect(Select):
@@ -335,8 +311,8 @@ class NightViewPhase1(View):
             if uid in self.game.night_actions: return await interaction.response.send_message("已行動", ephemeral=True)
             await interaction.response.send_message("🔮 **預言家行動**", view=View().add_item(SeerSelect(self.game, self.cog, self.ctx)), ephemeral=True)
         elif role == "奇跡商人":
-            if self.game.merchant_status["used"]: return await interaction.response.send_message("技能已使用。", ephemeral=True)
-            if uid in self.game.night_actions: return await interaction.response.send_message("今晚已行動。", ephemeral=True)
+            if self.game.merchant_status["used"] or uid in self.game.night_actions: 
+                return await interaction.response.send_message("已行動或技能已用。", ephemeral=True)
             view = View()
             view.add_item(MerchantTargetSelect(self.game, self.cog, self.ctx))
             async def skip_callback(inter):
@@ -350,7 +326,7 @@ class NightViewPhase1(View):
         else:
             await interaction.response.send_message("💤 無需行動。", ephemeral=True)
 
-# --- 4. 夜間選單 (Phase 2) ---
+# --- 4. 下半夜 (女巫/幸運兒) ---
 class WitchActionView(View):
     def __init__(self, game, cog, ctx):
         super().__init__(timeout=None)
@@ -359,7 +335,7 @@ class WitchActionView(View):
         self.ctx = ctx
         self.target_id = game.wolf_target
     
-    @discord.ui.button(label="使用解藥 (救)", style=discord.ButtonStyle.green, emoji="💊")
+    @discord.ui.button(label="解藥 (救)", style=discord.ButtonStyle.green, emoji="💊")
     async def save_btn(self, interaction: discord.Interaction, button: Button):
         if not self.game.witch_potions["antidote"]: return await interaction.response.send_message("❌ 解藥已用完。", ephemeral=True)
         if self.target_id == -1: return await interaction.response.send_message("❌ 無人被殺。", ephemeral=True)
@@ -369,7 +345,7 @@ class WitchActionView(View):
         await interaction.response.send_message("💊 使用了解藥。", ephemeral=True)
         await self.cog.check_night_phase_2_end(self.ctx, self.game)
 
-    @discord.ui.button(label="使用毒藥 (毒)", style=discord.ButtonStyle.danger, emoji="☠️")
+    @discord.ui.button(label="毒藥 (毒)", style=discord.ButtonStyle.danger, emoji="☠️")
     async def poison_btn(self, interaction: discord.Interaction, button: Button):
         if not self.game.witch_potions["poison"]: return await interaction.response.send_message("❌ 毒藥已用完。", ephemeral=True)
         view = View()
@@ -461,7 +437,7 @@ class NightViewPhase2(View):
 
         await interaction.response.send_message("💤 繼續睡覺。", ephemeral=True)
 
-# --- 5. 開槍介面 ---
+# --- 5. 獵人/狼王 ---
 class ShooterSelect(Select):
     def __init__(self, game, cog, ctx, role_name):
         self.game = game
@@ -476,7 +452,9 @@ class ShooterSelect(Select):
         self.game.status[target_id] = "dead"
         role = self.game.roles.get(target_id)
         target_user = interaction.guild.get_member(target_id)
-        if target_user: await target_user.edit(mute=True)
+        if target_user: 
+            try: await target_user.edit(mute=True)
+            except: pass
         await interaction.response.send_message(f"💥 {self.role_name} 帶走了 **{target_user.display_name}** ({role})")
         winner = self.cog.check_winner(self.game)
         if winner: await self.cog.end_game(self.ctx, self.game, winner)
@@ -487,7 +465,7 @@ class ShooterView(View):
         super().__init__(timeout=None)
         self.add_item(ShooterSelect(game, cog, ctx, role_name))
 
-# --- 6. 投票介面 ---
+# --- 6. 投票 ---
 class CandidateButton(Button):
     def __init__(self, player, game, cog, ctx, view):
         super().__init__(label=player.display_name, style=discord.ButtonStyle.secondary)
@@ -535,12 +513,15 @@ class Werewolf(commands.Cog):
         return self.games.get(ctx.guild.id)
 
     async def mute_all(self, ctx, game, mute=True):
+        """安全靜音 (重新抓取 member 避免 cache 問題)"""
         for p in game.players:
-            if p.voice: 
-                try: await p.edit(mute=mute)
-                except: pass
+            try:
+                member = ctx.guild.get_member(p.id)
+                if member and member.voice:
+                    await member.edit(mute=mute)
+            except: pass
 
-    async def play_bgm(self, ctx, bgm, voice=None):
+    async def play_mixed_audio(self, ctx, bgm, voice=None):
         vc = ctx.guild.voice_client
         if not vc: return
         bgm_p = os.path.join(SOUND_FOLDER, bgm)
@@ -577,8 +558,8 @@ class Werewolf(commands.Cog):
     async def stop_game(self, ctx, reason=""):
         if ctx.guild.id in self.games:
             game = self.games[ctx.guild.id]
-            await self.mute_all(ctx, game, False)
-            await self.stop_bgm(ctx)
+            asyncio.create_task(self.mute_all(ctx, game, False))
+            asyncio.create_task(self.stop_bgm(ctx))
             del self.games[ctx.guild.id]
             await ctx.send(f"🛑 **遊戲結束**: {reason}")
 
@@ -597,7 +578,7 @@ class Werewolf(commands.Cog):
         w, k, s, wi, h, m = wolves_count, 0, 0, 0, 0, 0
         
         if game.board_id == "auto":
-            if n < 6: w, k, s, wi, h, m = 1, 0, 1, 0, 0, 0 # [人性化修正] 1狼 1預 (無女巫)
+            if n < 6: w, k, s, wi, h, m = 1, 0, 1, 0, 0, 0 # [人性化修正] 3-5人: 1狼 1預 (無女巫)
             elif n < 9: w, k, s, wi, h, m = 1, 1, 1, 1, 1, 0
             elif n < 10: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 0
             else: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 1
@@ -626,19 +607,34 @@ class Werewolf(commands.Cog):
         return True
 
     async def start_night(self, ctx, game):
-        game.phase = PHASE_NIGHT_1
-        game.wolf_target = None
-        game.wolf_votes.clear()
-        game.night_actions.clear()
-        game.witch_poison_target = None
-        game.deaths_tonight = []
-        game.guard_target = None
-        game.lucky_data = {"user_id": None, "skill": None, "target": None}
-        game.confirmed_players.clear() # 清除確認狀態
-        
-        await self.play_mixed_audio(ctx, "night.mp3", "voice_night_start.mp3")
-        await self.mute_all(ctx, game, True)
-        await game.channel.send("🌃 **上半夜：狼人、預言家、奇跡商人**", view=NightViewPhase1(game, self, ctx))
+        try:
+            game.phase = PHASE_NIGHT_1
+            game.wolf_target = None
+            game.wolf_votes.clear()
+            game.night_actions.clear()
+            game.witch_poison_target = None
+            game.deaths_tonight = []
+            game.guard_target = None
+            game.lucky_data = {"user_id": None, "skill": None, "target": None}
+            game.confirmed_players.clear()
+            
+            # [重要修正] 先送出按鈕，確保介面不被音效卡住
+            await game.channel.send("🌃 **上半夜：狼人、預言家、奇跡商人**", view=NightViewPhase1(game, self, ctx))
+            
+            # 使用 create_task 並包裹 try-except 防止背景任務炸裂
+            asyncio.create_task(self.safe_play_audio(ctx))
+            asyncio.create_task(self.mute_all(ctx, game, True))
+            
+        except Exception as e:
+            print(traceback.format_exc())
+            await ctx.send(f"⚠️ 入夜發生錯誤: {e}")
+
+    # 新增安全播放函式
+    async def safe_play_audio(self, ctx):
+        try:
+            await self.play_mixed_audio(ctx, "night.mp3", "voice_night_start.mp3")
+        except Exception as e:
+            print(f"音效播放失敗: {e}")
 
     async def check_night_phase_1_end(self, ctx, game):
         alive_wolves = [p for p in game.players if game.is_alive(p.id) and game.is_wolf_team(p.id)]
@@ -680,8 +676,9 @@ class Werewolf(commands.Cog):
         game.phase = PHASE_DAY
         game.votes = {}
         game.stop_votes.clear()
-        await self.stop_bgm(ctx)
-        await self.mute_all(ctx, game, False)
+        
+        asyncio.create_task(self.stop_bgm(ctx))
+        asyncio.create_task(self.mute_all(ctx, game, False))
         
         deaths = []
         if game.wolf_target != -1 and game.wolf_target != game.guard_target: deaths.append(game.wolf_target)
@@ -706,7 +703,9 @@ class Werewolf(commands.Cog):
                 user = ctx.guild.get_member(uid)
                 game.status[uid] = "dead"
                 msg += f"💀 **{user.display_name if user else '未知'}**\n"
-                if user: await user.edit(mute=True)
+                if user: 
+                    try: await user.edit(mute=True)
+                    except: pass
 
         winner = self.check_winner(game)
         if winner: return await self.end_game(ctx, game, winner)
@@ -756,7 +755,9 @@ class Werewolf(commands.Cog):
             game.status[dead_id] = "dead"
             user = ctx.guild.get_member(dead_id)
             role = game.roles[dead_id]
-            if user: await user.edit(mute=True)
+            if user: 
+                try: await user.edit(mute=True)
+                except: pass
             
             await game.channel.send(f"💀 **{user.display_name}** 被處決了！身分：**{role}**")
             
