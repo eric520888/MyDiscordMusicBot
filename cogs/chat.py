@@ -156,10 +156,12 @@ class IdentityView(View):
         self.game = game
         self.cog = cog
         self.ctx = ctx
+        self.started = False # 防止重複觸發
 
     @discord.ui.button(label="🕵️ 查看身分 (並確認)", style=discord.ButtonStyle.primary)
     async def check_identity(self, interaction: discord.Interaction, button: Button):
-        if interaction.user not in self.game.players: return
+        if interaction.user not in self.game.players:
+            return await interaction.response.send_message("你沒有參與這場遊戲！", ephemeral=True)
         
         role = self.game.roles.get(interaction.user.id)
         msg = f"你的身分是：**{role}**"
@@ -175,16 +177,24 @@ class IdentityView(View):
         elif role == "奇跡商人": msg += "\n💰 技能：限一次，賜予一名玩家(幸運兒) 查驗/毒藥/守衛 技能。\n⚠️ **風險：若選中狼人，你將死亡！**"
         else: msg += "\n🏡 技能：無。努力推理並活下去。"
         
-        # 標記玩家已確認
+        # 標記確認
         self.game.confirmed_players.add(interaction.user.id)
         checked = len(self.game.confirmed_players)
         total = len(self.game.players)
         
-        msg += f"\n\n✅ **已確認身分 ({checked}/{total})**"
+        # 回應玩家身分 (隱藏)
         await interaction.response.send_message(msg, ephemeral=True)
 
-        # 檢查是否所有人都確認了
-        if checked >= total and self.game.phase == PHASE_WAITING:
+        # 更新公開訊息的進度條 (讓大家知道還差誰)
+        try:
+            content = f"🎲 **身分已分配！請確認身分以開始遊戲**\n(目前確認進度: **{checked}/{total}**)"
+            await interaction.message.edit(content=content)
+        except:
+            pass
+
+        # 自動開始判定
+        if checked >= total and not self.started:
+            self.started = True
             self.stop()
             await self.ctx.send("🌕 **全員已確認身分，天黑請閉眼...**")
             await self.cog.start_night(self.ctx, self.game)
@@ -194,9 +204,10 @@ class IdentityView(View):
         if interaction.user.id != self.game.host.id:
             return await interaction.response.send_message("只有主持人可按", ephemeral=True)
         
-        if self.game.phase == PHASE_WAITING:
+        if not self.started:
+            self.started = True
             self.stop()
-            await interaction.response.send_message("🚨 主持人強制開始遊戲！", ephemeral=False)
+            await interaction.response.send_message("🚨 主持人強制進入夜晚！", ephemeral=False)
             await self.cog.start_night(self.ctx, self.game)
 
 # --- 3. 夜間選單 (Phase 1) ---
@@ -559,7 +570,7 @@ class Werewolf(commands.Cog):
         w, k, s, wi, h, m = wolves_count, 0, 0, 0, 0, 0
         
         if game.board_id == "auto":
-            if n < 6: w, k, s, wi, h, m = 1, 0, 1, 1, 0, 0
+            if n < 6: w, k, s, wi, h, m = 1, 0, 1, 0, 0, 0 # [人性化修正] 1狼 1預 (無女巫)
             elif n < 9: w, k, s, wi, h, m = 1, 1, 1, 1, 1, 0
             elif n < 10: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 0
             else: w, k, s, wi, h, m = 2, 1, 1, 1, 1, 1
