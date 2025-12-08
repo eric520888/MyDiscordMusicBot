@@ -10,20 +10,17 @@ from collections import Counter
 # --- 設定 ---
 SOUND_FOLDER = "./sounds"
 
-# --- [架構升級] 角色與陣營定義 ---
-# 狼人陣營
+# --- 角色與陣營定義 ---
 ROLE_WEREWOLF = "狼人"
 ROLE_WOLF_KING = "狼王"
 WOLF_CAMP = {ROLE_WEREWOLF, ROLE_WOLF_KING}
 
-# 神職陣營
 ROLE_SEER = "預言家"
 ROLE_WITCH = "女巫"
 ROLE_HUNTER = "獵人"
 ROLE_MERCHANT = "奇跡商人"
 GOD_CAMP = {ROLE_SEER, ROLE_WITCH, ROLE_HUNTER, ROLE_MERCHANT}
 
-# 村民陣營
 ROLE_VILLAGER = "村民"
 VILLAGER_CAMP = {ROLE_VILLAGER}
 
@@ -53,6 +50,9 @@ class WerewolfGame:
         self.board_id = "auto"
         self.confirmed_players = set()
         
+        # [新增] 狼人討論串
+        self.wolf_thread = None 
+        
         # 道具與技能
         self.witch_potions = {"antidote": True, "poison": True}
         self.merchant_status = {"used": False} 
@@ -69,23 +69,17 @@ class WerewolfGame:
     def get_alive_players(self):
         return [p for p in self.players if self.is_alive(p.id)]
     
-    # --- [架構升級] 陣營判斷 helper ---
     def is_wolf_team(self, user_id):
-        return self.get_role(user_id) in WOLF_CAMP
-
-    def is_god(self, user_id):
-        return self.get_role(user_id) in GOD_CAMP
-
-    def is_villager(self, user_id):
-        return self.get_role(user_id) in VILLAGER_CAMP
+        role = self.roles.get(user_id)
+        return role in ["狼人", "狼王"]
 
 # --- 1. 大廳與設定 ---
 class BoardSelect(Select):
     def __init__(self, game):
         self.game = game
         options = [
-            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡"),
-            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="無狼王、無商人"),
+            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡 (3-5人無女巫)"),
+            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="強制開啟女巫/獵人"),
             discord.SelectOption(label="👑 狼王板 (預女獵+狼王)", value="wolf_king", description="加入狼王"),
             discord.SelectOption(label="💰 奇跡板 (狼王+商人)", value="merchant", description="加入奇跡商人")
         ]
@@ -191,7 +185,7 @@ class IdentityView(View):
         
         role = self.game.roles.get(interaction.user.id)
         
-        # --- [架構升級] 顯示陣營 ---
+        # --- 顯示陣營 ---
         camp = "未知"
         if role in WOLF_CAMP: camp = "🐺 狼人陣營"
         elif role in GOD_CAMP: camp = "🔱 神職陣營"
@@ -203,6 +197,7 @@ class IdentityView(View):
             teammates = [p.display_name for p in self.game.players if self.game.is_wolf_team(p.id) and p.id != interaction.user.id]
             msg += f"\n🐺 隊友：{', '.join(teammates) if teammates else '無 (孤狼)'}"
             msg += "\n🔪 目標：**屠邊** (殺光神職 或 殺光村民)。"
+            msg += "\n💬 **請注意：狼人聊天室已建立，請在頻道列表中查看並進入討論。**"
             if role == ROLE_WOLF_KING: msg += "\n👑 特殊能力：死後可以開槍帶走一人 (被毒死除外)。"
         elif role == ROLE_SEER: msg += "\n🔮 技能：每晚查驗一名玩家是好人還是狼人。"
         elif role == ROLE_WITCH: msg += "\n🧪 技能：解藥(救人)與毒藥(殺人)，每晚限用一瓶。"
@@ -588,6 +583,13 @@ class Werewolf(commands.Cog):
     async def stop_game(self, ctx, reason=""):
         if ctx.guild.id in self.games:
             game = self.games[ctx.guild.id]
+            
+            # --- [新增] 清除討論串 ---
+            if game.wolf_thread:
+                try: await game.wolf_thread.delete()
+                except: pass
+            # ---------------------
+            
             asyncio.create_task(self.mute_all(ctx, game, False))
             asyncio.create_task(self.stop_bgm(ctx))
             del self.games[ctx.guild.id]
@@ -632,6 +634,22 @@ class Werewolf(commands.Cog):
         random.shuffle(roles)
         game.roles = {p.id: roles[i] for i, p in enumerate(game.players)}
         game.status = {p.id: "alive" for p in game.players}
+        
+        # --- [新增] 建立狼人討論串 ---
+        try:
+            thread = await ctx.channel.create_thread(name=f"🐺-狼人-{random.randint(100,999)}", type=discord.ChannelType.private_thread, invitable=False)
+            game.wolf_thread = thread
+            mentions = []
+            for pid, role in game.roles.items():
+                if role in WOLF_CAMP:
+                    mem = ctx.guild.get_member(pid)
+                    if mem: 
+                        await thread.add_user(mem)
+                        mentions.append(mem.mention)
+            await thread.send(f"🐺 **狼人密謀區**\n成員：{' '.join(mentions)}\n天黑請在此討論。")
+        except Exception as e:
+            print(f"無法建立狼人討論串: {e}")
+        # ------------------------
 
         await game.channel.send("🎲 **身分已分配！請確認身分以開始遊戲**", view=IdentityView(game, self, ctx))
         return True
@@ -660,6 +678,11 @@ class Werewolf(commands.Cog):
             
             title = "🌃 上半夜" if needs_phase_2 else "🌃 夜晚"
             roles_str = "、".join(p1_roles) if p1_roles else "無人"
+            
+            # 提醒狼人討論串
+            if game.wolf_thread:
+                try: await game.wolf_thread.send("🌃 **天黑了，請開始討論戰術！**")
+                except: pass
             
             await game.channel.send(f"{title}：{roles_str} (請點擊行動)", view=NightViewPhase1(game, self, ctx))
             
@@ -729,9 +752,11 @@ class Werewolf(commands.Cog):
             await self.start_day(ctx, game)
 
     async def check_night_phase_2_end(self, ctx, game):
+        # 1. 檢查女巫
         alive_witch = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == ROLE_WITCH]
         witch_done = not alive_witch or alive_witch[0].id in game.night_actions
         
+        # 2. 檢查幸運兒
         lucky_done = True
         lid = game.lucky_data["user_id"]
         if lid and game.is_alive(lid) and game.lucky_data["target"] is None:
