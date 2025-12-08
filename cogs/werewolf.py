@@ -4,6 +4,7 @@ from discord.ui import Button, View, Select
 import random
 import asyncio
 import os
+from collections import Counter
 
 # --- 設定 ---
 SOUND_FOLDER = "./sounds"
@@ -115,6 +116,7 @@ class LobbyView(View):
 
     @discord.ui.button(label="關閉大廳", style=discord.ButtonStyle.grey, emoji="✖️")
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        # 主持人或管理員可以關閉
         if interaction.user.id != self.game.host.id and not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ 只有主持人或管理員可以關閉大廳。", ephemeral=True)
             return
@@ -141,8 +143,22 @@ class IdentityView(View):
         role = self.game.roles.get(interaction.user.id)
         msg = f"你的身分是：**{role}**"
         
+        # --- [新增] 狼人顯示隊友邏輯 ---
         if role == "狼人":
-            msg += "\n🔪 你的目標是在晚上與隊友殺死所有村民。"
+            # 找出其他狼人隊友 (排除自己)
+            teammates = []
+            for p in self.game.players:
+                if self.game.roles.get(p.id) == "狼人" and p.id != interaction.user.id:
+                    teammates.append(p.display_name)
+            
+            if teammates:
+                msg += f"\n🐺 你的狼人隊友是：**{', '.join(teammates)}**"
+            else:
+                msg += "\n🐺 你是孤狼 (沒有其他隊友)。"
+
+            msg += "\n🔪 你的目標是在晚上與隊友投票殺死村民。"
+        # ---------------------------
+        
         elif role == "預言家":
             msg += "\n🔮 你每晚可以查驗一名玩家的身分。"
         else:
@@ -170,7 +186,9 @@ class WolfSelect(Select):
         # 狼人投票邏輯
         target_id = int(self.values[0])
         self.game.wolf_votes[interaction.user.id] = target_id
-        self.game.night_actions.add(interaction.user.id) # 標記此狼人已行動
+        
+        # 雖然狼人可以改票，但只要有投過就算行動過(用於檢查是否所有狼人都動了)
+        self.game.night_actions.add(interaction.user.id) 
         
         target_name = "不殺 (空刀)"
         if target_id != -1:
@@ -179,16 +197,18 @@ class WolfSelect(Select):
 
         await interaction.response.send_message(f"🩸 你投給了：**{target_name}**", ephemeral=True)
         
-        # 檢查是否所有活著的狼人都投完票了
-        alive_wolves = [pid for pid in self.game.players if self.game.is_alive(pid) and self.game.roles[pid] == "狼人"]
+        # 檢查是否所有活著的狼人都投完票了 (用 night_actions 檢查不夠，要檢查 wolf_votes 數量)
+        alive_wolves = [pid for pid in self.game.players if self.game.is_alive(pid.id) and self.game.roles[pid.id] == "狼人"]
         
-        if len([v for v in self.game.wolf_votes.keys() if v in alive_wolves]) >= len(alive_wolves):
+        # 過濾掉已死狼人的舊票 (保險起見)
+        current_valid_votes = [uid for uid in self.game.wolf_votes.keys() if uid in [w.id for w in alive_wolves]]
+
+        if len(current_valid_votes) >= len(alive_wolves):
             # 結算狼人目標 (多數決)
-            from collections import Counter
-            valid_votes = [target for uid, target in self.game.wolf_votes.items() if uid in alive_wolves]
+            valid_targets = [target for uid, target in self.game.wolf_votes.items() if uid in [w.id for w in alive_wolves]]
             
-            if valid_votes:
-                vote_counts = Counter(valid_votes)
+            if valid_targets:
+                vote_counts = Counter(valid_targets)
                 # 取票數最高的，如果平票取第一個 (或隨機)
                 most_common = vote_counts.most_common()
                 max_votes = most_common[0][1]
@@ -228,6 +248,7 @@ class SeerSelect(Select):
             await interaction.response.send_message("🔮 你選擇了 **不查驗**。", ephemeral=True)
         else:
             role = self.game.roles.get(target_id)
+            # --- 預言家邏輯修復：狼人是壞人，其他是好人 ---
             if role == "狼人":
                 result_msg = "這人是 **🐺 狼人 (壞人)**！"
             else:
@@ -441,14 +462,19 @@ class Werewolf(commands.Cog):
 
     async def check_night_end(self, ctx, game):
         """檢查是否所有夜間角色都行動完畢"""
-        alive_night_roles = []
-        for pid in game.players:
-            if game.is_alive(pid.id):
-                role = game.roles.get(pid.id)
-                if role in ["狼人", "預言家"]:
-                    alive_night_roles.append(pid.id)
+        alive_wolves = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "狼人"]
+        alive_seer = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == "預言家"]
         
-        if set(alive_night_roles).issubset(game.night_actions):
+        # 狼人: 檢查投票人數是否 >= 活著狼人數
+        wolves_done = len([v for v in game.wolf_votes.keys() if v in [w.id for w in alive_wolves]]) >= len(alive_wolves)
+        
+        # 預言家: 檢查是否在 night_actions (有行動過)
+        seer_done = True
+        if alive_seer:
+            if alive_seer[0].id not in game.night_actions:
+                seer_done = False
+        
+        if wolves_done and seer_done:
             await self.start_day(ctx, game, game.wolf_target)
 
     async def start_night(self, ctx, game):
@@ -483,7 +509,7 @@ class Werewolf(commands.Cog):
             if dead_user:
                 game.status[dead_player_id] = "dead"
                 msg += f"昨晚 **{dead_user.display_name}** 慘遭殺害...\n"
-                # 讓死者保持靜音 (選擇性)
+                # 讓死者保持靜音
                 try: await dead_user.edit(mute=True)
                 except: pass
             else:
