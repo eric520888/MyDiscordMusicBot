@@ -6,7 +6,8 @@ import asyncio
 import os
 
 # --- 設定 ---
-# 請確保專案根目錄下有 'sounds' 資料夾，並放入 'night.mp3'
+# 請確保專案根目錄下有 'sounds' 資料夾
+# 並且放入 'night.mp3' (背景音樂) 和 'voice_night_start.mp3' (語音)
 SOUND_FOLDER = "./sounds"
 
 # 定義遊戲狀態
@@ -31,7 +32,7 @@ class WerewolfGame:
     def is_alive(self, user_id):
         return self.status.get(user_id) == "alive"
 
-# --- 介面元件 ---
+# --- 1. 大廳介面 (Lobby) ---
 class LobbyView(View):
     def __init__(self, cog, game, ctx):
         super().__init__(timeout=None)
@@ -74,6 +75,7 @@ class LobbyView(View):
             await interaction.response.send_message("人數不足，至少需要 3 人才能開始！", ephemeral=True)
             return
         
+        # 嘗試幫主持人連語音，確保能播音樂
         if interaction.user.voice:
             voice_channel = interaction.user.voice.channel
             if not self.ctx.guild.voice_client:
@@ -85,6 +87,7 @@ class LobbyView(View):
         await interaction.response.send_message("遊戲開始！正在分配身分...", ephemeral=False)
         await self.cog.start_game_logic(self.ctx)
 
+# --- 2. 身分查看介面 ---
 class IdentityView(View):
     def __init__(self, game):
         super().__init__(timeout=None)
@@ -108,6 +111,7 @@ class IdentityView(View):
 
         await interaction.response.send_message(msg, ephemeral=True)
 
+# --- 3. 夜晚選單 (狼人/預言家) ---
 class WolfSelect(Select):
     def __init__(self, game, cog, ctx):
         self.game = game
@@ -124,6 +128,7 @@ class WolfSelect(Select):
         target_user = interaction.guild.get_member(target_id)
         self.game.wolf_target = target_id
         await interaction.response.send_message(f"🩸 你已選擇殺害 **{target_user.display_name}**。", ephemeral=True)
+        # 狼人殺完人後，延遲 2 秒直接天亮
         await asyncio.sleep(2)
         await self.cog.start_day(self.ctx, self.game, self.game.wolf_target)
 
@@ -143,10 +148,17 @@ class SeerSelect(Select):
 
         target_id = int(self.values[0])
         role = self.game.roles.get(target_id)
-        is_good = "好人" if role != "狼人" else "狼人"
+        
+        # --- [關鍵修復] 預言家查驗邏輯 ---
+        # 明確判斷：如果是狼人，就是「壞人/狼人」；否則都是「好人」
+        if role == "狼人":
+            result_msg = "這人是 **🐺 狼人 (壞人)**！"
+        else:
+            result_msg = "這人是 **好人** (村民或神職)。"
+        # -------------------------------
         
         self.game.night_actions.add(interaction.user.id)
-        await interaction.response.send_message(f"🔮 查驗結果：此人是 **{is_good}**", ephemeral=True)
+        await interaction.response.send_message(f"🔮 查驗結果：{result_msg}", ephemeral=True)
 
 class NightActionView(View):
     def __init__(self, game, cog, ctx):
@@ -178,10 +190,9 @@ class NightActionView(View):
         else:
             await interaction.response.send_message("💤 你是村民，今晚無事發生，請繼續睡覺。", ephemeral=True)
 
-# --- 新增：白天投票按鈕與介面 ---
+# --- 4. 白天投票介面 ---
 class CandidateButton(Button):
     def __init__(self, player, game, cog, ctx, view):
-        # 顯示玩家名稱作為按鈕標籤
         super().__init__(label=player.display_name, style=discord.ButtonStyle.secondary)
         self.target_id = player.id
         self.game = game
@@ -190,35 +201,26 @@ class CandidateButton(Button):
         self.parent_view = view
 
     async def callback(self, interaction: discord.Interaction):
-        # 1. 檢查投票者是否活著
         if not self.game.is_alive(interaction.user.id):
             await interaction.response.send_message("💀 死人無法投票。", ephemeral=True)
             return
 
-        # 2. 執行投票
         self.game.votes[interaction.user.id] = self.target_id
-        
-        # 公開顯示誰投給了誰
         await interaction.response.send_message(f"🗳️ **{interaction.user.display_name}** 投票給了 **{self.label}**")
         
-        # 3. 檢查是否所有活人都投完了
         alive_count = sum(1 for s in self.game.status.values() if s == "alive")
         if len(self.game.votes) >= alive_count:
-            self.parent_view.stop() # 停止按鈕監聽
+            self.parent_view.stop()
             await self.cog.tally_votes(self.ctx, self.game)
 
 class VotingView(View):
     def __init__(self, game, cog, ctx):
         super().__init__(timeout=None)
-        self.game = game
-        self.cog = cog
-        self.ctx = ctx
-        
-        # 動態產生按鈕：為每一個活著的玩家建立一個投票按鈕
         for player in game.players:
             if game.is_alive(player.id):
                 self.add_item(CandidateButton(player, game, cog, ctx, self))
 
+# --- 5. 主程式 ---
 class Werewolf(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -227,30 +229,57 @@ class Werewolf(commands.Cog):
     def get_game(self, ctx):
         return self.games.get(ctx.guild.id)
 
-    # --- BGM 音樂控制 ---
-    async def play_bgm(self, ctx, filename):
+    # --- [核心功能] 混音播放 ---
+    async def play_mixed_audio(self, ctx, bgm_file, voice_file=None):
+        """
+        利用 FFmpeg 同時播放背景音樂(循環)與人聲(單次)。
+        """
         voice_client = ctx.guild.voice_client
         if not voice_client: return
-        file_path = os.path.join(SOUND_FOLDER, filename)
-        if not os.path.exists(file_path): 
-            print(f"找不到音效檔: {file_path}")
+
+        bgm_path = os.path.join(SOUND_FOLDER, bgm_file)
+        if not os.path.exists(bgm_path):
+            print(f"❌ 找不到 BGM: {bgm_path}")
             return
-        
-        if voice_client.is_playing(): 
+
+        if voice_client.is_playing():
             voice_client.stop()
-            
-        try:
-            source = discord.FFmpegPCMAudio(file_path, before_options="-stream_loop -1", options="-vn")
+
+        # 如果沒有語音檔，就退化成只播 BGM
+        if not voice_file:
+            source = discord.FFmpegPCMAudio(bgm_path, before_options="-stream_loop -1", options="-vn")
             voice_client.play(source)
-        except Exception as e: 
-            print(f"BGM Error: {e}")
+            return
+
+        voice_path = os.path.join(SOUND_FOLDER, voice_file)
+        if not os.path.exists(voice_path):
+            print(f"❌ 找不到語音: {voice_path}")
+            source = discord.FFmpegPCMAudio(bgm_path, before_options="-stream_loop -1", options="-vn")
+            voice_client.play(source)
+            return
+
+        # 混音指令：
+        # Input 0: BGM (音量 0.4, 循環)
+        # Input 1: Voice (音量 1.5)
+        # amix: 混合兩個軌道, duration=first (以 BGM 長度為主/無限)
+        ffmpeg_opts = '-vn'
+        complex_filter = f'[0:a]volume=0.4[bg];[1:a]volume=1.5[vc];[bg][vc]amix=inputs=2:duration=first:dropout_transition=2'
+        before_opts = f'-stream_loop -1 -i "{bgm_path}" -filter_complex "{complex_filter}"'
+        
+        try:
+            # 這裡我們傳入 voice_path 作為主要 source，它會變成 Input 1
+            # Input 0 (BGM) 則是在 before_opts 裡引入的
+            source = discord.FFmpegPCMAudio(voice_path, before_options=before_opts, options=ffmpeg_opts)
+            voice_client.play(source)
+        except Exception as e:
+            print(f"混音播放失敗: {e}")
 
     async def stop_bgm(self, ctx):
         voice_client = ctx.guild.voice_client
         if voice_client and voice_client.is_playing(): 
             voice_client.stop()
 
-    # --- Commands ---
+    # --- 流程控制 ---
     
     @commands.hybrid_command(name='ww_create', description='[狼人殺] 建立遊戲大廳')
     async def create_game(self, ctx):
@@ -281,6 +310,7 @@ class Werewolf(commands.Cog):
             game.roles[player.id] = role
             game.status[player.id] = "alive"
 
+        # 發送查看身分按鈕
         identity_view = IdentityView(game)
         await game.channel.send("🎲 **身分已分配！請點擊下方按鈕查看你的身分** (只有你自己看得到)", view=identity_view)
 
@@ -292,7 +322,9 @@ class Werewolf(commands.Cog):
         game.wolf_target = None
         game.night_actions.clear()
         
-        await self.play_bgm(ctx, "night.mp3")
+        # --- 播放 BGM + 語音 ---
+        # 請確保 sounds 資料夾有這些檔案
+        await self.play_mixed_audio(ctx, "night.mp3", "voice_night_start.mp3")
         
         view = NightActionView(game, self, ctx)
         await game.channel.send("🌃 **天黑請閉眼...** (背景音樂播放中)\n請點擊下方按鈕進行行動。", view=view)
@@ -302,6 +334,7 @@ class Werewolf(commands.Cog):
         game.votes = {} 
         
         await self.stop_bgm(ctx)
+        # 如果有白天音樂，可以用 await self.play_mixed_audio(ctx, "day.mp3", "voice_day_start.mp3")
         
         msg = "🌅 **天亮了！**\n"
         if dead_player_id:
@@ -319,7 +352,6 @@ class Werewolf(commands.Cog):
             del self.games[ctx.guild.id]
             return
 
-        # --- 變更點：傳送投票按鈕 View 取代純文字指令 ---
         msg += "現在開始討論，並點擊下方按鈕進行投票處決。"
         vote_view = VotingView(game, self, ctx)
         await game.channel.send(msg, view=vote_view)
@@ -332,12 +364,7 @@ class Werewolf(commands.Cog):
         if wolves >= villagers: return "狼人陣營"
         return None
 
-    # --- 移除 vote 指令，改由按鈕觸發 ---
-    # @commands.hybrid_command(name='vote'...) 
-    # async def vote(...)
-
     async def tally_votes(self, ctx, game):
-        """計算票數並執行處決"""
         vote_counts = {}
         for target_id in game.votes.values():
             vote_counts[target_id] = vote_counts.get(target_id, 0) + 1
