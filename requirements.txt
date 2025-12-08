@@ -14,3 +14,4 @@ typing_extensions==4.15.0
 yarl==1.22.0
 yt-dlp==2025.10.22
 python-dotenv
+google-generativeai
