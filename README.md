@@ -60,3 +60,25 @@
     └── general.py       # 一般指令 (Ping, Info 等)
 ```bash
  pip install -r requirements.txt
+```
+
+### 3. 設定環境變數
+請在目錄下建立 `.env` 檔案，並填入以下環境變數：
+```bash
+# Discord 機器人 Token (從 Discord Developer Portal 取得)
+DISCORD_BOT_TOKEN=你的_Discord_Bot_Token
+
+# Google Gemini API Key (從 Google AI Studio 取得)
+GEMINI_API_KEY=你的_Gemini_API_Key
+```
+
+### 4. 執行機器人
+```bash
+python main.py
+```
+
+---
+
+## 📚 文件
+* [Discord.py 官方文件](https://discordpy.readthedocs.io/)
+* [Google Gemini API 文件](https://cloud.google.com/ai-platform/gemini)
