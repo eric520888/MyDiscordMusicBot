@@ -86,3 +86,8 @@ python main.py
 ## 📚 文件
 * [Discord.py 官方文件](https://discordpy.readthedocs.io/)
 * [Google Gemini API 文件](https://cloud.google.com/ai-platform/gemini)
+
+### Owner / 開發者指令
+
+* 本機器人包含少量僅供 bot 擁有者使用的開發與維護指令（例如遊戲強制結束、重載配置、同步指令樹等）。
+* 這些指令只會影響狼人殺遊戲本身的狀態，不會進行伺服器層級的管理操作（如 ban/kick）。
