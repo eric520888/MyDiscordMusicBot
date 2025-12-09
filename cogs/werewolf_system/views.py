@@ -23,6 +23,34 @@ class LobbyView(View):
         super().__init__(timeout=None) # 大廳不設超時，由 Game loop 控制
         self.game = game_state
         self.add_item(BoardSelect(game_state))
+    
+    def update_embed(self):
+        """產生大廳 Embed"""
+        board_names = {
+            BOARD_AUTO: "🎲 自動配置",
+            BOARD_STANDARD: "🔮 標準板",
+            BOARD_WOLF_KING: "👑 狼王板",
+            BOARD_MERCHANT: "💰 奇跡板"
+        }
+        
+        embed = discord.Embed(
+            title="🐺 狼人殺大廳",
+            description="點擊下方按鈕加入遊戲！",
+            color=discord.Color.dark_red()
+        )
+        
+        # 玩家列表
+        if self.game.players:
+            player_list = "\n".join([f"• {p.display_name}" for p in self.game.players])
+        else:
+            player_list = "（等待玩家加入...）"
+        
+        embed.add_field(name=f"👥 玩家 ({len(self.game.players)})", value=player_list, inline=False)
+        embed.add_field(name="📜 板子", value=board_names.get(self.game.board_id, "未知"), inline=True)
+        embed.add_field(name="🎮 房主", value=self.game.host.display_name, inline=True)
+        embed.set_footer(text="需要至少 3 人才能開始遊戲")
+        
+        return embed
 
     @discord.ui.button(label="加入", style=discord.ButtonStyle.green, emoji="✋")
     async def join(self, interaction: discord.Interaction, button: Button):
