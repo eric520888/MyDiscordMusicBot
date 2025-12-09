@@ -3,17 +3,21 @@ from discord.ext import commands
 from .werewolf_system.game import WerewolfGame
 from .werewolf_system.views import LobbyView
 
-class WerewolfBot(commands.Cog):
+# [修正] 在這裡加入 name="Werewolf"，讓 Help 和 Music 模組都能找到它
+class WerewolfBot(commands.Cog, name="Werewolf"):
     def __init__(self, bot):
         self.bot = bot
         self.games = {} # {guild_id: WerewolfGame}
 
-    @commands.hybrid_command(name='ww_create', description='[狼人殺] 建立遊戲大廳 (新架構)')
+    @commands.hybrid_command(name='ww_create', description='[狼人殺] 建立遊戲大廳')
     async def create_game(self, ctx):
+        # 避免重複創建
         if ctx.guild.id in self.games:
-            await ctx.send("這裡已經有一場遊戲了！", ephemeral=True)
-            return
-        
+            # 檢查舊遊戲是否其實已經結束但沒清掉
+            if self.games[ctx.guild.id].phase == "waiting":
+                 await ctx.send("這裡已經有一個等待中的大廳了！", ephemeral=True)
+                 return
+
         game = WerewolfGame(self.bot, ctx.channel, ctx.author)
         self.games[ctx.guild.id] = game
         
@@ -21,13 +25,17 @@ class WerewolfBot(commands.Cog):
         msg = await ctx.send(embed=view.update_embed(), view=view)
         game.lobby_message = msg
 
+    # 取得遊戲實例 (給 Music 模組檢查用)
+    def get_game(self, ctx):
+        return self.games.get(ctx.guild.id)
+
     @commands.hybrid_command(name='ww_force_stop', description='[管理員] 強制結束遊戲')
     @commands.has_permissions(administrator=True)
     async def force_stop(self, ctx):
         if ctx.guild.id in self.games:
             game = self.games[ctx.guild.id]
-            # 這裡簡單處理，理想情況是呼叫 game.end_game 但不分勝負
-            # 直接清理資源
+            
+            # 清理資源
             from .werewolf_system.audio import AudioManager
             await AudioManager.stop(ctx.channel)
             await AudioManager.mute_all(ctx.channel, game.players, False)
