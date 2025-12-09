@@ -54,25 +54,36 @@ async def load_extensions():
 
     print("📂 開始掃描 cogs 資料夾...") 
 
+    loaded_count = 0
+    failed_count = 0
+    
     for filename in os.listdir('./cogs'):
-        # 排除 __pycache__ 資料夾
-        if filename == "__pycache__" or os.path.isdir(os.path.join('./cogs', filename)):
+        full_path = os.path.join('./cogs', filename)
+        
+        # 排除資料夾 (如 __pycache__, werewolf_system)
+        if os.path.isdir(full_path):
+            print(f"   [跳過資料夾] {filename}")
             continue
-
-        print(f"   -> 發現檔案: {filename}") 
 
         if filename.endswith('.py'):
             extension_name = f'cogs.{filename[:-3]}'
             try:
                 await bot.load_extension(extension_name)
                 print(f'   ✅ 已載入模組: {extension_name}')
+                loaded_count += 1
             except Exception as e:
-                # 這裡就是抓出兇手的關鍵
                 print(f'   ❌ 無法載入模組 {extension_name}')
+                print(f'      錯誤類型: {type(e).__name__}')
                 print(f'      錯誤詳情: {e}') 
                 import traceback
-                traceback.print_exc() # 印出詳細錯誤位置
+                traceback.print_exc()
                 print("-" * 30)
+                failed_count += 1
+    
+    print(f"\n📊 載入結果: {loaded_count} 成功, {failed_count} 失敗")
+    
+    # 列出所有已載入的 Cog
+    print(f"🔧 已載入的 Cogs: {list(bot.cogs.keys())}")
 
 async def main():
     async with bot:
