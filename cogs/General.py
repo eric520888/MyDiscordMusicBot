@@ -63,7 +63,7 @@ async def checkowner(self, ctx):
         is_owner = await self.bot.is_owner(ctx.author)
 
         if is_owner:
-            await ctx.send(f"✅ {ctx.author.mention} 認證通過！你是狐狸鬆餅的主人！")
+            await ctx.send(f"✅ {ctx.author.mention} 認證通過！歡迎使用主人！")
         else:
             # 這裡做個判斷：如果是多人模式，就顯示 IDs 集合；單人模式就顯示 ID
             # 這樣你才能看到到底設定了哪些 ID
