@@ -29,12 +29,17 @@ class HelpSelect(Select):
                 
                 # 自動讀取該 Cog 下的所有指令 (包含 slash command)
                 # 這裡混合讀取 hybrid_commands 和 app_commands
-                commands_list = cog.get_commands()
-                if not commands_list:
-                    # 嘗試讀取 app_commands (如果該 cog 只有斜線指令)
-                    commands_list = cog.get_app_commands()
+                cmd_set = set()
+                
+                # 1. 取得一般/Hybrid指令
+                for cmd in cog.get_commands():
+                    cmd_set.add(cmd)
+                
+                # 2. 取得 App Commands (Slash only)
+                for cmd in cog.get_app_commands():
+                    cmd_set.add(cmd)
 
-                for cmd in commands_list:
+                for cmd in cmd_set:
                     # 處理指令名稱與說明
                     name = cmd.name
                     desc = cmd.description or "暫無說明"
@@ -65,7 +70,7 @@ class CustomHelp(commands.Cog):
         self.bot = bot
 
     @commands.hybrid_command(name="help", description="顯示指令說明選單")
-    async def help(self, ctx):
+    async def show_help(self, ctx):
         embed = discord.Embed(
             title="🤖 機器人指令中心",
             description="請從下方選單選擇你想查詢的功能分類。",
