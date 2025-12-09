@@ -20,11 +20,11 @@ class Role:
     camp = "中立"
     description = "無技能"
     can_shoot = False
-    used_skill = False # 用於商人/女巫等
     
     def __init__(self):
         self.has_antidote = False
         self.has_poison = False
+        self.used_skill = False  # 移至實例變數，避免類別共用問題
 
 class Wolf(Role):
     name = ROLE_WEREWOLF

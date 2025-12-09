@@ -11,12 +11,20 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
 
     @commands.hybrid_command(name='ww_create', description='[狼人殺] 建立遊戲大廳')
     async def create_game(self, ctx):
-        # 避免重複創建
+        # 檢查是否有舊遊戲
         if ctx.guild.id in self.games:
-            # 檢查舊遊戲是否其實已經結束但沒清掉
-            if self.games[ctx.guild.id].phase == "waiting":
-                 await ctx.send("這裡已經有一個等待中的大廳了！", ephemeral=True)
-                 return
+            old_game = self.games[ctx.guild.id]
+            # 如果舊遊戲已結束或在等待中，可以覆蓋
+            if old_game.phase == "waiting":
+                await ctx.send("這裡已經有一個等待中的大廳了！", ephemeral=True)
+                return
+            elif old_game.phase == "ended":
+                # 舊遊戲已結束，清除並建立新遊戲
+                del self.games[ctx.guild.id]
+            else:
+                # 遊戲進行中
+                await ctx.send("❌ 遊戲正在進行中！請先使用 `/ww_force_stop` 結束。", ephemeral=True)
+                return
 
         game = WerewolfGame(self.bot, ctx.channel, ctx.author)
         self.games[ctx.guild.id] = game

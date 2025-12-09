@@ -68,6 +68,10 @@ class SkillManager:
         if not player.role.has_antidote: return await interaction.response.send_message("❌ 解藥已用", ephemeral=True)
         if self.game.wolf_target == -1: return await interaction.response.send_message("❌ 無人死亡", ephemeral=True)
         
+        # [新增] 女巫不能自救
+        if self.game.wolf_target == player.id:
+            return await interaction.response.send_message("❌ 女巫規則：不能自救！", ephemeral=True)
+        
         player.role.has_antidote = False
         self.game.wolf_target = -1 
         self.game.night_actions.add(player.id)

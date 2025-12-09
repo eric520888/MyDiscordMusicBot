@@ -29,9 +29,6 @@ class WerewolfGame:
         # 奇跡商人/幸運兒數據
         self.lucky_data = {"user_id": None, "skill": None, "target": None}
         
-        # 守衛數據
-        self.guard_target = None
-        
         # 投票數據
         self.votes = {}     # {user_id: target_id}
         self.stop_votes = set()
@@ -534,6 +531,8 @@ class WerewolfGame:
         return None
 
     async def end_game(self, winner):
+        self.phase = PHASE_ENDED  # 標記遊戲已結束，讓 create_game 可以清除
+        
         text = "**遊戲結束！獲勝者：** " + winner + "\n\n**身分揭曉：**\n"
         for p in self.players:
             text += f"{p.display_name}: {p.role.name}\n"
@@ -548,7 +547,8 @@ class WerewolfGame:
             except: pass
 
     async def handle_stop_vote(self, interaction):
-        if not self.get_player(interaction.user.id).status == "alive":
+        player = self.get_player(interaction.user.id)
+        if not player or player.status != "alive":
             return await interaction.response.send_message("死人無法投票", ephemeral=True)
             
         if interaction.user.id in self.stop_votes:
