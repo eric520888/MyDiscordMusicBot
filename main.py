@@ -56,14 +56,22 @@ async def load_extensions():
         print("⚠️ 警告: 找不到 'cogs' 資料夾")
         return
 
+    print("📂 開始掃描 cogs 資料夾...") # [新增]
+
     for filename in os.listdir('./cogs'):
+        # [新增] 印出所有看到的檔案，確認 werewolf_bot.py 是否在其中
+        print(f"   -> 發現檔案: {filename}") 
+
         if filename.endswith('.py'):
             extension_name = f'cogs.{filename[:-3]}'
             try:
                 await bot.load_extension(extension_name)
-                print(f'✅ 已載入模組: {extension_name}')
+                print(f'   ✅ 已載入模組: {extension_name}')
             except Exception as e:
-                print(f'❌ 無法載入模組 {extension_name}: {e}')
+                # [修改] 加上 repr(e) 讓錯誤訊息更詳細，並印出明顯的分隔線
+                print(f'   ❌ 無法載入模組 {extension_name}')
+                print(f'      錯誤詳情: {repr(e)}') 
+                print("-" * 30)模組 {extension_name}: {e}')
 
 async def main():
     async with bot:
