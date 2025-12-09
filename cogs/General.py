@@ -63,7 +63,7 @@ class General(commands.Cog):
         if is_owner:
             await ctx.send(f"✅ {ctx.author.mention} 是 bot 擁有者！")
         else:
-            owner = self.bot.owner_id or "未設定"
-            await ctx.send(f"❌ 你不是 bot 擁有者\n目前設定的 owner ID: {owner}")
+            owner = self.bot.owner_id or "狐狸鬆餅沒有允許你成為 owner"
+            await ctx.send(f"❌ 你不是狐狸鬆餅，我只認狐狸鬆餅為主人，或其他允許的人\n目前設定的 owner ID: {owner}")
 async def setup(bot):
     await bot.add_cog(General(bot))

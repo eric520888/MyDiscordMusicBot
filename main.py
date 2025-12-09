@@ -20,6 +20,7 @@ bot = commands.Bot(
     command_prefix='!', 
     intents=intents,
     owner_ids=OWNER_IDS  # 在這裡直接傳入 owner_ids
+    help_command=None  # 關閉預設幫助指令
 )
 
 # --- Opus 載入邏輯 (Linux 環境需要，若為 Windows 開發可忽略) ---
