@@ -121,7 +121,12 @@ class WerewolfGame:
             except: pass
 
         await self.create_wolf_thread()
-        await self.channel.send("🎲 **請確認身分**", view=IdentityView(self))
+        await self.channel.send("🎲 **請確認身分** (10秒後自動入夜)", view=IdentityView(self))
+        
+        # 自動入夜：等待 10 秒讓玩家確認身分
+        await asyncio.sleep(10)
+        if self.phase == PHASE_WAITING:  # 確保還沒被強制入夜
+            await self.start_night()
 
     def assign_roles(self):
         n = len(self.players)
