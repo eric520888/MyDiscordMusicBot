@@ -167,7 +167,11 @@ class WerewolfGame:
         try:
             if self.wolf_thread: await self.wolf_thread.delete()
             thread_name = f"🐺-狼人密謀-{random.randint(100,999)}"
-            self.wolf_thread = await self.channel.create_thread(name=thread_name, type=discord.ChannelType.private_thread)
+            self.wolf_thread = await self.channel.create_thread(
+                name=thread_name, 
+                type=discord.ChannelType.private_thread,
+                invitable=False
+            )
             mentions = []
             for p in self.players:
                 if p.role.camp == CAMP_WOLF:
@@ -474,16 +478,34 @@ class WerewolfGame:
     # ==========================
     async def handle_vote(self, interaction, target_id):
         p = self.get_player(interaction.user.id)
-        if not p or p.status != "alive": return await interaction.response.send_message("死人無法投票", ephemeral=True)
+        if not p or p.status != "alive": 
+            return await interaction.response.send_message("死人無法投票", ephemeral=True)
+        
+        # [修正] 檢查是否已經投過票
+        if p.id in self.votes:
+            return await interaction.response.send_message("❌ 你已經投過票了！", ephemeral=True)
         
         self.votes[p.id] = target_id
         target_p = self.get_player(target_id)
-        await interaction.response.send_message(f"🗳️ 投給了 **{target_p.display_name}**")
+        await interaction.response.send_message(f"🗳️ 投給了 **{target_p.display_name}**", ephemeral=True)
+        
+        # 發送公開訊息讓大家知道有人投票了
+        await self.channel.send(f"🗳️ **{p.display_name}** 已投票 ({len(self.votes)}/{len(self.get_alive_players())})")
         
         if len(self.votes) >= len(self.get_alive_players()):
             await self.tally_votes()
 
     async def tally_votes(self):
+        # [新增] 公布投票結果
+        vote_reveal = "📊 **投票結果公開：**\n"
+        for voter_id, target_id in self.votes.items():
+            voter = self.get_player(voter_id)
+            target = self.get_player(target_id)
+            if voter and target:
+                vote_reveal += f"• {voter.display_name} → **{target.display_name}**\n"
+        
+        await self.channel.send(vote_reveal)
+        
         counts = Counter(self.votes.values())
         if not counts:
             await self.channel.send("無人投票，直接入夜。")
