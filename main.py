@@ -38,11 +38,7 @@ async def on_ready():
     
     # --- 同步斜線指令 ---
     try:
-        print("🔄 清除舊指令...")
-        bot.tree.clear_commands(guild=None)  # 清除全域指令
-        await bot.tree.sync()
-        
-        print("📋 重新註冊指令...")
+        print("📋 正在同步指令...")
         synced = await bot.tree.sync()
         print(f"✅ 已同步 {len(synced)} 個斜線指令")
         
