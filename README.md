@@ -49,7 +49,8 @@
 ### 2. 安裝依賴套件
 請確保目錄下有 `requirements.txt`，然後執行：
 ### 🛠️ 安裝與執行
-.
+
+```bash
 ├── main.py              # 主程式 (負責載入 Cogs 與啟動)
 ├── requirements.txt     # 套件清單
 ├── .env                 # 環境變數 (請勿上傳到 GitHub)
@@ -58,6 +59,7 @@
     ├── werewolf.py      # 狼人殺功能
     ├── chat.py          # AI 對話功能
     └── general.py       # 一般指令 (Ping, Info 等)
+
 ```bash
  pip install -r requirements.txt
 ```
@@ -78,6 +80,7 @@ python main.py
 ```
 
 ---
+
 
 ## 📚 文件
 * [Discord.py 官方文件](https://discordpy.readthedocs.io/)
