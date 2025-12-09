@@ -59,6 +59,7 @@
     ├── werewolf.py      # 狼人殺功能
     ├── chat.py          # AI 對話功能
     └── general.py       # 一般指令 (Ping, Info 等)
+```
 
 ```bash
  pip install -r requirements.txt
