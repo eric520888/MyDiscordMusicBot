@@ -19,7 +19,7 @@ intents.message_content = True
 bot = commands.Bot(
     command_prefix='!', 
     intents=intents,
-    owner_ids=OWNER_IDS,  # 在這裡直接傳入 owner_ids
+    owner_ids=OWNER_IDS,
     help_command=None  # 關閉預設幫助指令
 )
 
@@ -33,19 +33,29 @@ if not discord.opus.is_loaded():
 @bot.event
 async def on_ready():
     print(f'主程式啟動成功：登入身分 {bot.user}')
-    print(f'Owner IDs: {bot.owner_ids}') # 檢查一下是否有成功讀取
+    print(f'Owner IDs: {bot.owner_ids}')
     await bot.change_presence(activity=discord.Game(name="/help | 多功能機器人"))
     
     # --- 同步斜線指令 ---
     try:
+        print("🔄 清除舊指令...")
+        bot.tree.clear_commands(guild=None)  # 清除全域指令
+        await bot.tree.sync()
+        
+        print("📋 重新註冊指令...")
         synced = await bot.tree.sync()
-        print(f"✅ 已同步 {len(synced)} 個斜線指令 (Slash Commands)")
+        print(f"✅ 已同步 {len(synced)} 個斜線指令")
+        
+        for cmd in synced:
+            print(f"  ✓ /{cmd.name}")
+            
     except Exception as e:
         print(f"❌ 同步指令失敗: {e}")
+        import traceback
+        traceback.print_exc()
 
 async def load_extensions():
     """自動讀取 cogs 資料夾下的所有 .py 檔案並載入"""
-    # 確保 cogs 資料夾存在，避免報錯
     if not os.path.exists('./cogs'):
         print("⚠️ 警告: 找不到 'cogs' 資料夾")
         return
