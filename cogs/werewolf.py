@@ -10,7 +10,7 @@ from collections import Counter
 # --- 設定 ---
 SOUND_FOLDER = "./sounds"
 
-# --- 角色與陣營定義 ---
+# --- 角色與陣營定義 (統一常數) ---
 ROLE_WEREWOLF = "狼人"
 ROLE_WOLF_KING = "狼王"
 WOLF_CAMP = {ROLE_WEREWOLF, ROLE_WOLF_KING}
@@ -50,9 +50,6 @@ class WerewolfGame:
         self.board_id = "auto"
         self.confirmed_players = set()
         
-        # [新增] 狼人討論串
-        self.wolf_thread = None 
-        
         # 道具與技能
         self.witch_potions = {"antidote": True, "poison": True}
         self.merchant_status = {"used": False} 
@@ -69,9 +66,9 @@ class WerewolfGame:
     def get_alive_players(self):
         return [p for p in self.players if self.is_alive(p.id)]
     
+    # [修正] 統一使用常數判斷
     def is_wolf_team(self, user_id):
-        role = self.roles.get(user_id)
-        return role in ["狼人", "狼王"]
+        return self.get_role(user_id) in WOLF_CAMP
 
 # --- 1. 大廳與設定 ---
 class BoardSelect(Select):
@@ -584,11 +581,10 @@ class Werewolf(commands.Cog):
         if ctx.guild.id in self.games:
             game = self.games[ctx.guild.id]
             
-            # --- [新增] 清除討論串 ---
+            # 清除討論串
             if game.wolf_thread:
                 try: await game.wolf_thread.delete()
                 except: pass
-            # ---------------------
             
             asyncio.create_task(self.mute_all(ctx, game, False))
             asyncio.create_task(self.stop_bgm(ctx))
@@ -635,7 +631,7 @@ class Werewolf(commands.Cog):
         game.roles = {p.id: roles[i] for i, p in enumerate(game.players)}
         game.status = {p.id: "alive" for p in game.players}
         
-        # --- [新增] 建立狼人討論串 ---
+        # 建立狼人討論串
         try:
             thread = await ctx.channel.create_thread(name=f"🐺-狼人-{random.randint(100,999)}", type=discord.ChannelType.private_thread, invitable=False)
             game.wolf_thread = thread
@@ -649,7 +645,6 @@ class Werewolf(commands.Cog):
             await thread.send(f"🐺 **狼人密謀區**\n成員：{' '.join(mentions)}\n天黑請在此討論。")
         except Exception as e:
             print(f"無法建立狼人討論串: {e}")
-        # ------------------------
 
         await game.channel.send("🎲 **身分已分配！請確認身分以開始遊戲**", view=IdentityView(game, self, ctx))
         return True
@@ -679,7 +674,6 @@ class Werewolf(commands.Cog):
             title = "🌃 上半夜" if needs_phase_2 else "🌃 夜晚"
             roles_str = "、".join(p1_roles) if p1_roles else "無人"
             
-            # 提醒狼人討論串
             if game.wolf_thread:
                 try: await game.wolf_thread.send("🌃 **天黑了，請開始討論戰術！**")
                 except: pass
@@ -712,6 +706,9 @@ class Werewolf(commands.Cog):
             if not game.merchant_status["used"] and m_id not in game.night_actions:
                 merchant_done = False
 
+        # --- 除錯訊息 (印在後台) ---
+        print(f"[Debug] 狼人({len(alive_wolves)}): {wolves_done}, 預言家({len(alive_seer)}): {seer_done}, 商人({len(alive_merchant)}): {merchant_done}")
+
         if wolves_done and seer_done and merchant_done:
             if game.wolf_votes:
                 valid_votes = [t for u, t in game.wolf_votes.items() if u in [w.id for w in alive_wolves]]
@@ -722,7 +719,6 @@ class Werewolf(commands.Cog):
                 else: game.wolf_target = -1
             else: game.wolf_target = -1
             
-            # --- [智慧跳夜判斷] ---
             has_witch_role = ROLE_WITCH in game.roles.values()
             has_merchant_role = ROLE_MERCHANT in game.roles.values()
             
@@ -752,16 +748,16 @@ class Werewolf(commands.Cog):
             await self.start_day(ctx, game)
 
     async def check_night_phase_2_end(self, ctx, game):
-        # 1. 檢查女巫
         alive_witch = [p for p in game.players if game.is_alive(p.id) and game.roles[p.id] == ROLE_WITCH]
         witch_done = not alive_witch or alive_witch[0].id in game.night_actions
         
-        # 2. 檢查幸運兒
         lucky_done = True
         lid = game.lucky_data["user_id"]
         if lid and game.is_alive(lid) and game.lucky_data["target"] is None:
              lucky_done = False
         
+        print(f"[Debug] 女巫: {witch_done}, 幸運兒: {lucky_done}")
+
         if witch_done and lucky_done: 
             await self.start_day(ctx, game)
 
@@ -824,23 +820,13 @@ class Werewolf(commands.Cog):
         await game.channel.send("現在開始討論，並點擊下方按鈕投票。", view=VotingView(game, self, ctx))
 
     def check_winner(self, game):
-        # 屠邊規則：殺光所有神職 OR 殺光所有村民
-        alive_wolves = 0
-        alive_gods = 0
-        alive_villagers = 0
+        wolves = sum(1 for pid, s in game.status.items() if s=="alive" and game.is_wolf_team(pid))
+        gods = sum(1 for pid, s in game.status.items() if s=="alive" and game.is_god(pid))
+        villagers = sum(1 for pid, s in game.status.items() if s=="alive" and game.is_villager(pid))
         
-        for pid in game.players:
-            if not game.is_alive(pid.id): continue
-            
-            if game.is_wolf_team(pid.id): alive_wolves += 1
-            elif game.is_god(pid.id): alive_gods += 1
-            elif game.is_villager(pid.id): alive_villagers += 1
-            
-        if alive_wolves == 0: return "好人陣營"
-        if alive_gods == 0 or alive_villagers == 0: return "狼人陣營" # 屠邊成功
-        
-        # 防止卡死：狼人數量 >= 好人數量
-        if alive_wolves >= (alive_gods + alive_villagers): return "狼人陣營"
+        if wolves == 0: return "好人陣營"
+        if gods == 0 or villagers == 0: return "狼人陣營"
+        if wolves >= (gods + villagers): return "狼人陣營"
         
         return None
 
