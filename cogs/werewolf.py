@@ -10,8 +10,7 @@ from collections import Counter
 # --- 設定 ---
 SOUND_FOLDER = "./sounds"
 
-# --- [核心架構] 角色與陣營定義 ---
-# 只要在這裡新增角色，下方的邏輯就會自動適配
+# --- 角色與陣營定義 ---
 ROLE_WEREWOLF = "狼人"
 ROLE_WOLF_KING = "狼王"
 WOLF_CAMP = {ROLE_WEREWOLF, ROLE_WOLF_KING}
@@ -24,9 +23,6 @@ GOD_CAMP = {ROLE_SEER, ROLE_WITCH, ROLE_HUNTER, ROLE_MERCHANT}
 
 ROLE_VILLAGER = "村民"
 VILLAGER_CAMP = {ROLE_VILLAGER}
-
-# 定義能開槍的角色 (死後觸發)
-SHOOTER_ROLES = {ROLE_HUNTER, ROLE_WOLF_KING}
 
 # 定義遊戲狀態
 PHASE_WAITING = "waiting"
@@ -54,6 +50,9 @@ class WerewolfGame:
         self.board_id = "auto"
         self.confirmed_players = set()
         
+        # [狼人討論串]
+        self.wolf_thread = None 
+        
         # 道具與技能
         self.witch_potions = {"antidote": True, "poison": True}
         self.merchant_status = {"used": False} 
@@ -70,26 +69,18 @@ class WerewolfGame:
     def get_alive_players(self):
         return [p for p in self.players if self.is_alive(p.id)]
     
-    # 判斷是否為狼人陣營 (通用)
     def is_wolf_team(self, user_id):
-        return self.get_role(user_id) in WOLF_CAMP
-
-    # 判斷是否為神職
-    def is_god(self, user_id):
-        return self.get_role(user_id) in GOD_CAMP
-
-    # 判斷是否為村民
-    def is_villager(self, user_id):
-        return self.get_role(user_id) in VILLAGER_CAMP
+        role = self.roles.get(user_id)
+        return role in WOLF_CAMP
 
 # --- 1. 大廳與設定 ---
 class BoardSelect(Select):
     def __init__(self, game):
         self.game = game
         options = [
-            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡"),
-            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="無狼王、無商人"),
-            discord.SelectOption(label="👑 狼王板 (預女獵+狼王)", value="wolf_king", description="狼隊有一名狼王"),
+            discord.SelectOption(label="🎲 自動配置 (預設)", value="auto", description="依照人數自動平衡 (3-5人無女巫)"),
+            discord.SelectOption(label="🔮 標準板 (預女獵)", value="standard", description="強制開啟女巫/獵人"),
+            discord.SelectOption(label="👑 狼王板 (預女獵+狼王)", value="wolf_king", description="加入狼王"),
             discord.SelectOption(label="💰 奇跡板 (狼王+商人)", value="merchant", description="加入奇跡商人")
         ]
         super().__init__(placeholder="📜 請選擇遊戲板子...", min_values=1, max_values=1, options=options, row=0)
@@ -201,12 +192,11 @@ class IdentityView(View):
         
         msg = f"你的身分是：**{role}** ({camp})"
         
-        # [修正] 使用 WOLF_CAMP 判斷，自動涵蓋狼王
         if role in WOLF_CAMP:
             teammates = [p.display_name for p in self.game.players if self.game.is_wolf_team(p.id) and p.id != interaction.user.id]
             msg += f"\n🐺 隊友：{', '.join(teammates) if teammates else '無 (孤狼)'}"
             msg += "\n🔪 目標：**屠邊** (殺光神職 或 殺光村民)。"
-            msg += "\n💬 **請注意：狼人聊天室已建立，請在頻道列表中查看並進入討論。**"
+            msg += "\n💬 **狼人討論區** 將在天黑時建立，請留意頻道列表。"
             if role == ROLE_WOLF_KING: msg += "\n👑 特殊能力：死後可以開槍帶走一人 (被毒死除外)。"
         elif role == ROLE_SEER: msg += "\n🔮 技能：每晚查驗一名玩家是好人還是狼人。"
         elif role == ROLE_WITCH: msg += "\n🧪 技能：解藥(救人)與毒藥(殺人)，每晚限用一瓶。"
@@ -263,7 +253,6 @@ class WolfSelect(Select):
         
         await interaction.response.send_message(f"🩸 你投給了：**{target_name}**", ephemeral=True)
         
-        # [修正] 使用 is_wolf_team 確保狼王也算在內
         alive_wolves = [p for p in self.game.players if self.game.is_alive(p.id) and self.game.is_wolf_team(p.id)]
         valid_votes = [uid for uid in self.game.wolf_votes.keys() if uid in [w.id for w in alive_wolves]]
         
@@ -288,7 +277,6 @@ class SeerSelect(Select):
             await interaction.response.send_message("🔮 你選擇不查驗。", ephemeral=True)
         else:
             role = self.game.roles.get(target_id)
-            # [修正] 使用 WOLF_CAMP 判斷壞人
             res = "🐺 狼人 (壞人)" if role in WOLF_CAMP else "好人"
             await interaction.response.send_message(f"🔮 查驗結果：{res}", ephemeral=True)
         
@@ -346,7 +334,6 @@ class NightViewPhase1(View):
         if not self.game.is_alive(uid): return await interaction.response.send_message("你已死亡", ephemeral=True)
         role = self.game.roles.get(uid)
         
-        # [修正] 使用 WOLF_CAMP 判斷是否顯示狼人選單
         if role in WOLF_CAMP:
             await interaction.response.send_message("🐺 **狼人行動**", view=View().add_item(WolfSelect(self.game, self.cog, self.ctx)), ephemeral=True)
         elif role == ROLE_SEER:
@@ -430,7 +417,6 @@ class LuckyOneView(View):
     async def check_callback(self, interaction: discord.Interaction):
         target = int(interaction.data['values'][0])
         role = self.game.roles.get(target)
-        # [修正] 幸運兒查驗也統一用 WOLF_CAMP
         res = "🐺 狼人" if role in WOLF_CAMP else "好人"
         self.game.lucky_data["target"] = target 
         await interaction.response.send_message(f"🔮 查驗結果：{res}", ephemeral=True)
@@ -651,9 +637,16 @@ class Werewolf(commands.Cog):
         game.roles = {p.id: roles[i] for i, p in enumerate(game.players)}
         game.status = {p.id: "alive" for p in game.players}
         
+        # --- [修正] 建立狼人討論串 (使用 create_thread) ---
         try:
-            thread = await ctx.channel.create_thread(name=f"🐺-狼人-{random.randint(100,999)}", type=discord.ChannelType.private_thread, invitable=False)
+            # 清除舊的 (如果存在)
+            if game.wolf_thread:
+                try: await game.wolf_thread.delete()
+                except: pass
+
+            thread = await ctx.channel.create_thread(name=f"🐺-狼人密謀-{random.randint(100,999)}", type=discord.ChannelType.private_thread, invitable=False)
             game.wolf_thread = thread
+            
             mentions = []
             for pid, role in game.roles.items():
                 if role in WOLF_CAMP:
@@ -661,9 +654,12 @@ class Werewolf(commands.Cog):
                     if mem: 
                         await thread.add_user(mem)
                         mentions.append(mem.mention)
+            
             await thread.send(f"🐺 **狼人密謀區**\n成員：{' '.join(mentions)}\n天黑請在此討論。")
+            
         except Exception as e:
             print(f"無法建立狼人討論串: {e}")
+        # -----------------------------------------------
 
         await game.channel.send("🎲 **身分已分配！請確認身分以開始遊戲**", view=IdentityView(game, self, ctx))
         return True
@@ -725,9 +721,6 @@ class Werewolf(commands.Cog):
             if not game.merchant_status["used"] and m_id not in game.night_actions:
                 merchant_done = False
 
-        # Debug print
-        print(f"[Debug] 狼隊({len(alive_wolves)}): {wolves_done}, 預({len(alive_seer)}): {seer_done}, 商({len(alive_merchant)}): {merchant_done}")
-
         if wolves_done and seer_done and merchant_done:
             if game.wolf_votes:
                 valid_votes = [t for u, t in game.wolf_votes.items() if u in [w.id for w in alive_wolves]]
@@ -784,6 +777,13 @@ class Werewolf(commands.Cog):
         game.votes = {}
         game.stop_votes.clear()
         
+        # --- [新增] 刪除狼人討論串 ---
+        if game.wolf_thread:
+            try: await game.wolf_thread.delete()
+            except: pass
+            game.wolf_thread = None
+        # -------------------------
+
         asyncio.create_task(self.stop_bgm(ctx))
         asyncio.create_task(self.mute_all(ctx, game, False))
         
@@ -822,8 +822,7 @@ class Werewolf(commands.Cog):
         shooter_role = ""
         for uid in game.deaths_tonight:
             role = game.roles.get(uid)
-            # [修正] 使用 SHOOTER_ROLES
-            if role in SHOOTER_ROLES:
+            if role in [ROLE_HUNTER, ROLE_WOLF_KING]:
                 is_poisoned = (uid == game.witch_poison_target) or (game.lucky_data["skill"] == "poison" and uid == game.lucky_data["target"])
                 if is_poisoned:
                     await game.channel.send(f"🚫 {role} 被毒殺，無法開槍！")
@@ -876,8 +875,7 @@ class Werewolf(commands.Cog):
             winner = self.check_winner(game)
             if winner: return await self.end_game(ctx, game, winner)
 
-            # [修正] 使用 SHOOTER_ROLES
-            if role in SHOOTER_ROLES:
+            if role in [ROLE_HUNTER, ROLE_WOLF_KING]:
                 game.phase = PHASE_SHOOT
                 await game.channel.send(f"🔫 **{role} 發動技能！請開槍帶走一人！**", view=ShooterView(game, self, ctx, role))
             else:
