@@ -13,7 +13,7 @@ class General(commands.Cog):
         await ctx.send(f'🏓 Pong! 延遲: {latency}ms')
 
     # --- 麥當勞點餐 ---
-    @commands.hybrid_command(name='mcdonalds', aliases=['麥當勞', 'mcd'], description='肚子餓了？開啟麥當勞歡樂送網頁')
+    @commands.hybrid_command(name='麥當勞', aliases=['mcdonalds', 'mcd'], description='肚子餓了？開啟麥當勞歡樂送網頁')
     async def mcdonalds(self, ctx):
         view = View()
         btn_delivery = Button(
