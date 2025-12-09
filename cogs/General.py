@@ -56,6 +56,14 @@ class General(commands.Cog):
             await ctx.send(f"✅ 成功同步 {len(synced)} 個指令！")
         except Exception as e:
             await ctx.send(f"❌ 同步失敗: {e}")
-
+    @commands.command(name='checkowner')
+    async def checkowner(self, ctx):
+        """檢查你是否為 bot owner"""
+        is_owner = await self.bot.is_owner(ctx.author)
+        if is_owner:
+            await ctx.send(f"✅ {ctx.author.mention} 是 bot 擁有者！")
+        else:
+            owner = self.bot.owner_id or "未設定"
+            await ctx.send(f"❌ 你不是 bot 擁有者\n目前設定的 owner ID: {owner}")
 async def setup(bot):
     await bot.add_cog(General(bot))
