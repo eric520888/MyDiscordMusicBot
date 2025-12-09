@@ -56,14 +56,22 @@ class General(commands.Cog):
             await ctx.send(f"✅ 成功同步 {len(synced)} 個指令！")
         except Exception as e:
             await ctx.send(f"❌ 同步失敗: {e}")
-    @commands.command(name='checkowner')
-    async def checkowner(self, ctx):
+@commands.command(name='checkowner')
+async def checkowner(self, ctx):
         """檢查你是否為 bot owner"""
+        # 這行會自動判斷你在不在 owner_ids 清單內
         is_owner = await self.bot.is_owner(ctx.author)
+
         if is_owner:
-            await ctx.send(f"✅ {ctx.author.mention} 是 bot 擁有者！")
+            await ctx.send(f"✅ {ctx.author.mention} 認證通過！你是狐狸鬆餅的主人！")
         else:
-            owner = self.bot.owner_id or "狐狸鬆餅沒有允許你成為 owner"
-            await ctx.send(f"❌ 你不是狐狸鬆餅，我只認狐狸鬆餅為主人，或其他允許的人\n目前設定的 owner ID: {owner}")
+            # 這裡做個判斷：如果是多人模式，就顯示 IDs 集合；單人模式就顯示 ID
+            # 這樣你才能看到到底設定了哪些 ID
+            current_owners = self.bot.owner_ids or {self.bot.owner_id}
+            
+            await ctx.send(
+                f"❌ 你不是狐狸鬆餅，我只認狐狸鬆餅為主人！\n"
+                f"目前允許的 Owner IDs: {current_owners}"
+            )
 async def setup(bot):
     await bot.add_cog(General(bot))
