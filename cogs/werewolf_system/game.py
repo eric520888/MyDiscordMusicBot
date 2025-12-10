@@ -7,6 +7,7 @@ from .roles import create_role, Player, Wolf, WolfKing, Seer, Witch, Hunter, Mer
 from .views import LobbyView, IdentityView, NightTargetSelect, MerchantSkillSelect, WitchView, LuckyView, ShooterSelect, VotingView
 from .audio import AudioManager
 from .skills import SkillManager # [新增] 引入 SkillManager
+from .replay import ReplayView   # [新增] 引入復盤系統
 
 class WerewolfGame:
     def __init__(self, bot, channel, host):
@@ -40,6 +41,10 @@ class WerewolfGame:
 
         # [新增] 初始化技能管理器
         self.skill_manager = SkillManager(self)
+        
+        # [新增] 復盤系統數據
+        self.game_log = []   # 遊戲事件記錄
+        self.round_num = 0   # 回合計數器
 
     # ==========================
     #      輔助函式 (Helper)
@@ -205,6 +210,7 @@ class WerewolfGame:
     # ==========================
     async def start_night(self):
         self.phase = PHASE_NIGHT_1
+        self.round_num += 1  # [新增] 增加回合計數
         self.night_actions.clear()
         self.wolf_votes.clear()
         self.wolf_target = None
@@ -445,6 +451,9 @@ class WerewolfGame:
                 msg += f"💀 **{p.display_name}**\n"
                 member = self.channel.guild.get_member(uid)
                 if member: asyncio.create_task(member.edit(mute=True))
+                # [新增] 記錄夜晚死亡
+                cause = "狼人殺害" if uid == self.wolf_target else "被毒殺"
+                self.log_event("night_death", {"name": p.display_name, "role": p.role.name, "cause": cause})
 
         winner = self.check_winner()
         if winner: return await self.end_game(winner)
@@ -527,6 +536,8 @@ class WerewolfGame:
             if member: asyncio.create_task(member.edit(mute=True))
             
             await self.channel.send(f"💀 **{p.display_name}** 被處決了！\n身分是：**{p.role.name}**")
+            # [新增] 記錄投票死亡
+            self.log_event("vote_death", {"name": p.display_name, "role": p.role.name})
             
             winner = self.check_winner()
             if winner: return await self.end_game(winner)
@@ -572,6 +583,19 @@ class WerewolfGame:
         if self.wolf_thread:
             try: await self.wolf_thread.delete()
             except: pass
+        
+        # [新增] 顯示復盤介面
+        replay_view = ReplayView(self.game_log, self.players, winner, max(self.round_num, 1))
+        await self.channel.send(embed=replay_view.get_initial_embed(), view=replay_view)
+    
+    def log_event(self, event_type: str, data: dict):
+        """記錄遊戲事件"""
+        self.game_log.append({
+            "round": self.round_num,
+            "phase": self.phase,
+            "event_type": event_type,
+            "data": data
+        })
 
     async def handle_stop_vote(self, interaction):
         player = self.get_player(interaction.user.id)

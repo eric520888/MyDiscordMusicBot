@@ -15,16 +15,22 @@ class SkillManager:
             self.game.night_actions.add(player.id)
             target_name = "空刀" if target_id == -1 else self.game.get_player(target_id).display_name
             await interaction.response.send_message(f"🩸 你投給了：**{target_name}**", ephemeral=True)
+            # [新增] 記錄狼人投票
+            if target_id != -1:
+                self.game.log_event("wolf_kill", {"killer": player.display_name, "target": target_name})
             
         # 2. 預言家查驗
         elif action_type == 'seer_check':
             self.game.night_actions.add(player.id)
             if target_id == -1:
                 await interaction.response.send_message("🔮 驗證結果：空驗", ephemeral=True)
+                self.game.log_event("seer_check", {"target": "空驗", "result": "無"})
             else:
                 target = self.game.get_player(target_id)
                 res = "🐺 狼人 (壞人)" if target.role.camp == CAMP_WOLF else "好人"
                 await interaction.response.send_message(f"🔮 驗證結果：**{res}**", ephemeral=True)
+                # [新增] 記錄查驗
+                self.game.log_event("seer_check", {"target": target.display_name, "result": res})
 
         # 3. [修正] 女巫跳過
         elif action_type == 'witch_skip':
@@ -61,6 +67,8 @@ class SkillManager:
         
         t_player = self.game.get_player(target_id)
         await interaction.response.send_message(f"💰 你給予了 **{t_player.display_name}** **{skill}** 技能。", ephemeral=True)
+        # [新增] 記錄商人給技能
+        self.game.log_event("merchant_gift", {"target": t_player.display_name, "skill": skill})
         await self.game.check_phase_1_end()
 
     # --- 女巫技能 ---
@@ -73,9 +81,12 @@ class SkillManager:
             return await interaction.response.send_message("❌ 女巫規則：不能自救！", ephemeral=True)
         
         player.role.has_antidote = False
+        saved_name = self.game.get_player(self.game.wolf_target).display_name
         self.game.wolf_target = -1 
         self.game.night_actions.add(player.id)
         await interaction.response.send_message("💊 使用了解藥", ephemeral=True)
+        # [新增] 記錄女巫救人
+        self.game.log_event("witch_save", {"target": saved_name})
         await self.game.check_phase_2_end()
 
     async def send_witch_poison_select(self, interaction, player):
@@ -90,7 +101,10 @@ class SkillManager:
             self.game.witch_poison_target = target
             player.role.has_poison = False
             self.game.night_actions.add(player.id)
+            target_p = self.game.get_player(target)
             await inter.response.send_message("☠️ 已下毒", ephemeral=True)
+            # [新增] 記錄女巫毒人
+            self.game.log_event("witch_poison", {"target": target_p.display_name})
             await self.game.check_phase_2_end()
             
         select.callback = callback
@@ -108,6 +122,8 @@ class SkillManager:
             asyncio.create_task(member.edit(mute=True))
 
         await interaction.response.send_message(f"💥 帶走了 **{target_p.display_name}** ({target_p.role.name})")
+        # [新增] 記錄開槍死亡
+        self.game.log_event("shoot_death", {"shooter": shooter.display_name, "name": target_p.display_name, "role": target_p.role.name})
         
         winner = self.game.check_winner()
         if winner: return await self.game.end_game(winner)
