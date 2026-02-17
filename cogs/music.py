@@ -3,25 +3,25 @@ from discord.ext import commands
 import yt_dlp
 import asyncio
 
-# --- yt-dlp 設定 ---
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }],
     'quiet': True,
     'no_warnings': True,
-    'default_search': 'auto', 
-    'source_address': '0.0.0.0',
+    'default_search': 'auto',
+    'nocheckcertificate': True, # 忽略憑證檢查
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', # 模擬瀏覽器
+    'headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-us,en;q=0.5',
+    }
 }
 
-# --- FFmpeg 設定 ---
+# 建議修改後的 FFmpeg 設定
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
+    'options': '-vn -b:a 192k', # 固定音質輸出
 }
 
 class Music(commands.Cog):
@@ -139,7 +139,7 @@ class Music(commands.Cog):
 
         except Exception as e:
             print(f"Play error: {e}")
-            msg = "❌ 發生錯誤，無法播放此歌曲。"
+            msg = "❌ 發生錯誤，無法播放此歌曲，你可以嘗試使用其他關鍵字，或連結，有可能是連結本身的問題。"
             if searching_msg: await searching_msg.edit(content=msg)
             else: await ctx.send(msg)
 
