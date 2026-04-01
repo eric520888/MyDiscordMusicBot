@@ -18,8 +18,9 @@ YDL_OPTIONS = {
     }
 }
 
+# [🌟 關鍵修正 1] 幫 FFmpeg 加上 User-Agent 偽裝，防止被 YouTube 瞬間 403 阻擋閃退
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"',
     'options': '-vn -b:a 192k', 
 }
 
@@ -39,6 +40,12 @@ class Music(commands.Cog):
         source.duration = info.get('duration')
         return source
 
+    def after_play(self, error, ctx):
+        """ [🌟 關鍵修正 2] 捕捉並印出 FFmpeg 隱藏的錯誤，以後就不會死得不明不白 """
+        if error:
+            print(f"⚠️ [音樂播放異常] FFmpeg 發生錯誤: {error}")
+        self.bot.loop.create_task(self.check_queue(ctx))
+
     async def check_queue(self, ctx):
         await asyncio.sleep(1) 
         
@@ -54,9 +61,9 @@ class Music(commands.Cog):
                 last_info = self.currently_playing[guild_id]
                 try:
                     source = self.get_source_from_info(last_info)
-                    voice_client.play(source, after=lambda _: self.bot.loop.create_task(self.check_queue(ctx)))
-                except Exception:
-                    pass 
+                    voice_client.play(source, after=lambda e: self.after_play(e, ctx))
+                except Exception as e:
+                    print(f"⚠️ [單曲循環異常]: {e}")
             return
 
         if loop_state == 2:
@@ -72,21 +79,40 @@ class Music(commands.Cog):
                 source = self.get_source_from_info(info)
                 if loop_state != 1:
                     await ctx.send(f'▶️ 正在播放: **{info.get("title", "未知歌曲")}**')
-                voice_client.play(source, after=lambda _: self.bot.loop.create_task(self.check_queue(ctx)))
+                voice_client.play(source, after=lambda e: self.after_play(e, ctx))
             except Exception as e:
-                print(f"播放失敗，嘗試跳過下一首: {e}")
+                print(f"⚠️ [播放下一首異常]: {e}")
                 self.bot.loop.create_task(self.check_queue(ctx))
         else:
             self.currently_playing.pop(guild_id, None)
             await asyncio.sleep(180) 
             
             current_vc = ctx.guild.voice_client
-            if current_vc and not current_vc.is_playing() and (guild_id not in self.song_queue or not self.song_queue[guild_id]):
+            if current_vc and not current_vc.is_playing() and not current_vc.is_paused() and (guild_id not in self.song_queue or not self.song_queue[guild_id]):
                 await current_vc.disconnect()
+
+    # [🌟 關鍵修正 3] 獨立寫一個安全連線機制，防止連續點歌造成語音頻道進進出出
+    async def ensure_voice(self, ctx):
+        voice_channel = ctx.author.voice.channel
+        voice_client = ctx.guild.voice_client
+
+        if voice_client is None:
+            return await voice_channel.connect(timeout=20.0, self_deaf=True)
+        
+        if not voice_client.is_connected():
+            try:
+                await voice_client.disconnect(force=True)
+            except:
+                pass
+            return await voice_channel.connect(timeout=20.0, self_deaf=True)
+            
+        if voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+            
+        return voice_client
 
     @commands.hybrid_command(name='play', description='播放 YouTube 音樂')
     async def play(self, ctx, *, query: str):
-        # 1. 狼人殺狀態檢查
         ww_cog = self.bot.get_cog("Werewolf")
         if ww_cog:
             game = ww_cog.get_game(ctx)
@@ -94,40 +120,24 @@ class Music(commands.Cog):
                 await ctx.send("🐺 **狼人殺正在進行中！** 為了保持肅殺氣氛，現在禁止點歌 🤫", ephemeral=True)
                 return
 
-        # 2. 語音頻道檢查
         if not ctx.author.voice:
             await ctx.send("❌ 你必須先加入一個語音頻道！", ephemeral=True)
             return
         
-        # 3. 處理 Discord 斜線指令延遲
         if ctx.interaction:
             await ctx.defer()
             
-        # [🌟 關鍵修正 1] 無論如何，第一時間先發送「正在搜尋」，讓使用者知道機器人沒死機
         searching_msg = await ctx.send(f"🔍 正在連線與搜尋: `{query}` ...")
 
-        voice_channel = ctx.author.voice.channel
-        voice_client = ctx.guild.voice_client
-
-        # [🌟 關鍵修正 2] 將連線邏輯放入 try-except 並加上 timeout 保護
         try:
-            if voice_client:
-                if not voice_client.is_connected():
-                    await voice_client.disconnect(force=True)
-                    voice_client = await voice_channel.connect(timeout=10.0)
-                elif voice_client.channel != voice_channel:
-                    await voice_client.move_to(voice_channel)
-            else:
-                voice_client = await voice_channel.connect(timeout=10.0)
+            voice_client = await self.ensure_voice(ctx)
         except Exception as e:
-            print(f"Voice Connect Error: {e}")
-            await searching_msg.edit(content="❌ 無法連線到語音頻道，請檢查機器人權限或伺服器連線狀態。")
+            print(f"⚠️ [語音連線錯誤]: {e}")
+            await searching_msg.edit(content=f"❌ 無法連線到語音頻道 (錯誤訊息: `{e}`)。")
             return
 
-        # 4. 搜尋與播放邏輯
         try:
             loop = asyncio.get_event_loop()
-            # [🌟 關鍵修正 3] 若是文字搜尋，限定 ytsearch1 只抓取第一筆結果，大幅減少卡死超時機率
             search_query = f"ytsearch1:{query}" if not query.startswith("http") else query
             data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(YDL_OPTIONS).extract_info(search_query, download=False))
             
@@ -148,11 +158,11 @@ class Music(commands.Cog):
             else:
                 self.currently_playing[ctx.guild.id] = info
                 source = self.get_source_from_info(info)
-                voice_client.play(source, after=lambda _: self.bot.loop.create_task(self.check_queue(ctx)))
+                voice_client.play(source, after=lambda e: self.after_play(e, ctx))
                 await searching_msg.edit(content=f'▶️ 正在播放: **{info.get("title", "未知歌曲")}**')
 
         except Exception as e:
-            print(f"Play error: {e}")
+            print(f"⚠️ [搜尋/播放錯誤]: {e}")
             await searching_msg.edit(content="❌ 發生錯誤！可能是 YouTube 阻擋了請求或網址無效，請稍後再試。")
 
     @commands.hybrid_command(name='skip', description='跳過目前歌曲')
