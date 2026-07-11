@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 import math
 import os
@@ -329,6 +331,62 @@ def _parse_browser_cookie_spec(spec: str) -> tuple[str, str | None, str | None, 
     return parsed
 
 
+def _materialize_base64_cookie_file() -> str | None:
+    """Decode Railway's YTDLP_COOKIES_B64 into a private Netscape cookie file."""
+    encoded = os.getenv("YTDLP_COOKIES_B64", "").strip()
+    if not encoded:
+        return None
+
+    # Be tolerant if the value was pasted with wrapping quotes or line breaks.
+    if len(encoded) >= 2 and encoded[0] == encoded[-1] and encoded[0] in {"'", '"'}:
+        encoded = encoded[1:-1].strip()
+    compact = "".join(encoded.split())
+
+    try:
+        cookie_bytes = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise CookieConfigurationError(
+            "YTDLP_COOKIES_B64 不是有效的 Base64。"
+        ) from error
+
+    if not cookie_bytes:
+        raise CookieConfigurationError("YTDLP_COOKIES_B64 解碼後是空檔案。")
+
+    # yt-dlp expects the Netscape cookie-file format.
+    check_bytes = cookie_bytes
+    if check_bytes.startswith(b"\xef\xbb\xbf"):
+        check_bytes = check_bytes[3:]
+    first_line = check_bytes.splitlines()[0].strip() if check_bytes.splitlines() else b""
+    if first_line not in {
+        b"# Netscape HTTP Cookie File",
+        b"# HTTP Cookie File",
+    }:
+        raise CookieConfigurationError(
+            "YTDLP_COOKIES_B64 解碼後不是 Netscape cookies.txt 格式。"
+        )
+
+    cookie_path = Path(tempfile.gettempdir()) / "discordbot-ytdlp-master-cookies.txt"
+    temporary_path = cookie_path.with_name(
+        f"{cookie_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary_path.write_bytes(cookie_bytes)
+        try:
+            os.chmod(temporary_path, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary_path, cookie_path)
+        return str(cookie_path.resolve())
+    except OSError as error:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise CookieConfigurationError(
+            "無法把 YTDLP_COOKIES_B64 寫入 Railway 暫存檔。"
+        ) from error
+
+
 def _configured_auth_candidates() -> list[YTDLAuth]:
     cookie_file_value = os.getenv("YTDLP_COOKIE_FILE", "").strip()
     if cookie_file_value:
@@ -346,7 +404,23 @@ def _configured_auth_candidates() -> list[YTDLAuth]:
             )
         ]
 
-    browser_setting = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "auto").strip()
+    base64_cookie_file = _materialize_base64_cookie_file()
+    if base64_cookie_file:
+        return [
+            YTDLAuth(
+                label="Railway Base64 cookie",
+                cli_args=("--cookies", base64_cookie_file),
+                cookiefile=base64_cookie_file,
+            )
+        ]
+
+    # Browser-profile extraction is useful locally, but Railway/Linux normally
+    # has no logged-in Chrome/Firefox profile to read.
+    browser_default = "auto" if os.name == "nt" else "off"
+    browser_setting = os.getenv(
+        "YTDLP_COOKIES_FROM_BROWSER",
+        browser_default,
+    ).strip()
     if browser_setting.lower() in {"", "off", "none", "false", "0"}:
         return []
     specs = (
@@ -2472,14 +2546,15 @@ class Music(commands.Cog):
                         )
                     elif action.failure is PlaybackFailure.AUTH_REQUIRED:
                         failure_message = (
-                            "⚠️ YouTube 要求登入驗證。請在 `.env` 設定 "
-                            "`YTDLP_COOKIES_FROM_BROWSER=firefox`（或你的瀏覽器），"
-                            "再重新啟動機器人。"
+                            "⚠️ YouTube 要求登入驗證。Railway 請設定 "
+                            "`YTDLP_COOKIES_B64`，並刪除 "
+                            "`YTDLP_COOKIES_FROM_BROWSER` 後重新部署。"
                         )
                     elif action.failure is PlaybackFailure.COOKIE_CONFIG:
                         failure_message = (
-                            "⚠️ YouTube cookie 無法讀取；請關閉對應瀏覽器後重試，"
-                            "或改用 `YTDLP_COOKIE_FILE`。"
+                            "⚠️ YouTube cookie 無法讀取；請確認 "
+                            "`YTDLP_COOKIES_B64` 是完整 Base64，"
+                            "或用 `YTDLP_COOKIE_FILE` 指向 cookies.txt。"
                         )
                     elif action.failure is PlaybackFailure.RATE_LIMIT:
                         failure_message = "⚠️ YouTube 暫時限制請求，請稍後再點歌。"
@@ -2730,14 +2805,15 @@ class Music(commands.Cog):
             )
             if error.failure is PlaybackFailure.AUTH_REQUIRED:
                 result_message = (
-                    "❌ YouTube 要求登入驗證，但偵測到的瀏覽器 cookie 仍無法通過。\n"
-                    "請在 `.env` 設定 `YTDLP_COOKIES_FROM_BROWSER=firefox` "
-                    "（或 `chrome` / `edge`），登入 YouTube 後重新啟動機器人。"
+                    "❌ YouTube 要求登入驗證，但 Cookie 仍未通過。\n"
+                    "Railway 請設定 `YTDLP_COOKIES_B64`，刪除 "
+                    "`YTDLP_COOKIES_FROM_BROWSER`，再重新部署。"
                 )
             elif error.failure is PlaybackFailure.COOKIE_CONFIG:
                 result_message = (
-                    "❌ YouTube cookie 無法讀取。請關閉對應瀏覽器後重試，"
-                    "或在 `.env` 使用 `YTDLP_COOKIE_FILE` 指向 Netscape cookies.txt。"
+                    "❌ YouTube cookie 無法讀取。請確認 `YTDLP_COOKIES_B64` "
+                    "是完整 Base64，或使用 `YTDLP_COOKIE_FILE` "
+                    "指向 Netscape cookies.txt。"
                 )
             elif error.failure is PlaybackFailure.RATE_LIMIT:
                 result_message = "❌ YouTube 暫時限制請求，請稍後再試。"
