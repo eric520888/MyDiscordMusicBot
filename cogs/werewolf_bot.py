@@ -45,7 +45,11 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
             
             # 清理資源
             from .werewolf_system.audio import AudioManager
-            await AudioManager.stop(ctx.channel)
+            music = self.bot.get_cog("Music")
+            if music and game.phase not in {"waiting", "ended"}:
+                await music.release_external_audio(ctx.guild)
+            elif not music:
+                await AudioManager.stop(ctx.channel)
             await AudioManager.mute_all(ctx.channel, game.players, False)
             if game.wolf_thread:
                 try: await game.wolf_thread.delete()

@@ -1,6 +1,7 @@
 import discord
 import asyncio
 import random
+import logging
 from collections import Counter
 from .const import *
 from .roles import create_role, Player, Wolf, WolfKing, Seer, Witch, Hunter, Merchant, Villager
@@ -8,6 +9,9 @@ from .views import LobbyView, IdentityView, NightTargetSelect, MerchantSkillSele
 from .audio import AudioManager
 from .skills import SkillManager # [新增] 引入 SkillManager
 from .replay import ReplayView   # [新增] 引入復盤系統
+
+
+log = logging.getLogger(__name__)
 
 class WerewolfGame:
     def __init__(self, bot, channel, host):
@@ -65,6 +69,17 @@ class WerewolfGame:
         """取得特定職業且活著的玩家"""
         return [p for p in self.get_alive_players() if isinstance(p.role, role_class)]
 
+    async def _release_game_audio(self):
+        music = self.bot.get_cog("Music")
+        try:
+            if music:
+                await music.release_external_audio(self.channel.guild)
+            else:
+                await AudioManager.stop(self.channel)
+        except Exception:
+            log.exception("釋放狼人殺語音控制權失敗")
+            await AudioManager.stop(self.channel)
+
     # ==========================
     #      大廳階段 (Lobby)
     # ==========================
@@ -112,13 +127,29 @@ class WerewolfGame:
         if n < 3:
             return await interaction.response.send_message("❌ 人數不足 (最少 3 人)", ephemeral=True)
 
-        if interaction.user.voice and not self.channel.guild.voice_client:
-            try:
-                await interaction.user.voice.channel.connect()
-            except: pass
-
         if not self.assign_roles():
             return await interaction.response.send_message("❌ 人數不足以開啟此板子", ephemeral=True)
+
+        self.phase = PHASE_STARTING
+        guild = self.channel.guild
+        voice_channel = (
+            interaction.user.voice.channel
+            if interaction.user.voice
+            else (guild.voice_client.channel if guild.voice_client else None)
+        )
+        if voice_channel:
+            try:
+                music = self.bot.get_cog("Music")
+                if music:
+                    await music.prepare_external_audio(guild, voice_channel)
+                elif not guild.voice_client:
+                    await voice_channel.connect(
+                        timeout=30.0,
+                        reconnect=True,
+                        self_deaf=True,
+                    )
+            except Exception:
+                log.exception("狼人殺連線語音頻道失敗")
 
         await interaction.response.send_message("🚀 遊戲開始！正在分配身分...", ephemeral=False)
         if self.lobby_message: 
@@ -130,7 +161,7 @@ class WerewolfGame:
         
         # 自動入夜：等待 10 秒讓玩家確認身分
         await asyncio.sleep(10)
-        if self.phase == PHASE_WAITING:  # 確保還沒被強制入夜
+        if self.phase == PHASE_STARTING:  # 確保還沒被強制入夜
             await self.start_night()
 
     def assign_roles(self):
@@ -400,7 +431,7 @@ class WerewolfGame:
         self.votes = {}
         self.stop_votes = set()
         
-        asyncio.create_task(AudioManager.stop(self.channel))
+        await AudioManager.stop(self.channel)
         asyncio.create_task(AudioManager.mute_all(self.channel, self.players, False))
         
         if self.wolf_thread:
@@ -569,6 +600,8 @@ class WerewolfGame:
         return None
 
     async def end_game(self, winner):
+        # 先停止遊戲音效，再開放 Music 指令，避免結束瞬間誤停新歌。
+        await self._release_game_audio()
         self.phase = PHASE_ENDED  # 標記遊戲已結束，讓 create_game 可以清除
         
         text = "**遊戲結束！獲勝者：** " + winner + "\n\n**身分揭曉：**\n"
@@ -578,7 +611,6 @@ class WerewolfGame:
         await self.channel.send(text)
         
         asyncio.create_task(AudioManager.mute_all(self.channel, self.players, False))
-        asyncio.create_task(AudioManager.stop(self.channel))
         
         if self.wolf_thread:
             try: await self.wolf_thread.delete()

@@ -1,2 +1,2 @@
 [phases.setup]
-aptPkgs = ["ffmpeg", "python3-dev", "build-essential"]
+aptPkgs = ["...", "ffmpeg", "libopus0", "ca-certificates", "python3-dev", "build-essential"]

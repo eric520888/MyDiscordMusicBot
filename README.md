@@ -1,7 +1,7 @@
 # 🤖 Discord 多功能機器人 (Music + Werewolf + AI)
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
-![Discord.py](https://img.shields.io/badge/Discord.py-2.0%2B-5865F2?logo=discord&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
+![Discord.py](https://img.shields.io/badge/Discord.py-2.7.1-5865F2?logo=discord&logoColor=white)
 ![Gemini AI](https://img.shields.io/badge/AI-Gemini%201.5%20Flash-4285F4?logo=google&logoColor=white)
 
 這是一個基於 `discord.py` 開發的模組化 Discord 機器人，整合了 **音樂播放**、**狼人殺遊戲** 以及 **Google Gemini AI 對話** 功能。旨在為伺服器提供全方位的娛樂體驗。
@@ -55,7 +55,7 @@
 ## 🛠️ 安裝與執行
 
 ### 1. 環境需求
-* [Python 3.8](https://www.python.org/) 或以上
+* [Python 3.10](https://www.python.org/) 或以上
 * **FFmpeg** (由系統環境變數呼叫，用於音樂播放)
 
 ### 2. 安裝依賴套件
@@ -76,11 +76,11 @@
 ```
 
 ```bash
- pip install -r requirements.txt
+ python -m pip install -r requirements.txt
 ```
 
 ### 3. 設定環境變數
-請在目錄下建立 `.env` 檔案，並填入以下環境變數：
+先複製 `.env.example` 為 `.env`，再填入新的環境變數。`.env` 不可提交到 Git 或打包進 Docker image：
 ```bash
 # Discord 機器人 Token (從 Discord Developer Portal 取得)
 DISCORD_BOT_TOKEN=你的_Discord_Bot_Token

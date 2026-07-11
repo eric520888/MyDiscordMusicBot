@@ -15,10 +15,9 @@ WORKDIR /app
 # 複製「函式庫清單」
 COPY requirements.txt .
 
-# 【第二步：安裝 Python 函式庫】
-# 這裡確保 yt-dlp 永遠安裝到最新版以應對 YouTube 頻繁的改版
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir -U yt-dlp
+# 【第二步：依 requirements 安裝 Python 函式庫】
+# requirements 會一併安裝 Discord DAVE 與 yt-dlp 的 Deno/EJS 支援。
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 【第三步：複製所有程式碼】
 COPY . .

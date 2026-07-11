@@ -17,6 +17,7 @@ CAMP_VILLAGER = "村民陣營"
 
 # --- 遊戲階段定義 ---
 PHASE_WAITING = "waiting"
+PHASE_STARTING = "starting"
 PHASE_NIGHT_1 = "night_wolves_seer_merchant"  # 上半夜
 PHASE_NIGHT_2 = "night_witch_lucky"           # 下半夜
 PHASE_DAY = "day"
