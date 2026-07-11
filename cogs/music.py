@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 IDLE_TIMEOUT_SECONDS = 180
 VOICE_CONNECT_TIMEOUT_SECONDS = 30.0
 PANEL_REFRESH_SECONDS = 10.0
+LOW_RESOURCE_YOUTUBE_ARGS = (
+    "--no-js-runtimes",
+    "--extractor-args",
+    "youtube:player_client=android_vr",
+)
 
 YDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -45,6 +50,7 @@ YDL_OPTIONS = {
 class PlaybackFailure(Enum):
     AUTH_REQUIRED = auto()
     COOKIE_CONFIG = auto()
+    JS_CHALLENGE = auto()
     RATE_LIMIT = auto()
     NETWORK = auto()
     UNAVAILABLE = auto()
@@ -109,7 +115,7 @@ class PlaybackControl:
     seek_to: float | None = None
     keep_paused: bool = False
     failure: PlaybackFailure | None = None
-    safe_to_retry_auth: bool = False
+    safe_to_retry: bool = False
     halt_queue: bool = False
 
 
@@ -134,6 +140,7 @@ class Track:
     auth_args: tuple[str, ...] = ()
     auth_cookiefile: str | None = None
     auth_label: str | None = None
+    ytdlp_extra_args: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +215,40 @@ def progress_bar(position: float, duration: int | None, width: int = 16) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
+def _prefer_low_resource_youtube() -> bool:
+    setting = os.getenv("YTDLP_LOW_RESOURCE", "auto").strip().lower()
+    if setting in {"1", "true", "yes", "on"}:
+        return True
+    if setting in {"0", "false", "no", "off"}:
+        return False
+    return any(
+        os.getenv(name)
+        for name in (
+            "RAILWAY_PROJECT_ID",
+            "RAILWAY_SERVICE_ID",
+            "RAILWAY_ENVIRONMENT_ID",
+        )
+    )
+
+
+def _configure_deno_memory_limit() -> None:
+    if os.getenv("DENO_V8_FLAGS"):
+        return
+    configured = os.getenv("YTDLP_DENO_V8_FLAGS", "").strip()
+    on_railway = any(
+        os.getenv(name)
+        for name in (
+            "RAILWAY_PROJECT_ID",
+            "RAILWAY_SERVICE_ID",
+            "RAILWAY_ENVIRONMENT_ID",
+        )
+    )
+    if not configured and on_railway:
+        configured = "--max-old-space-size=64"
+    if configured:
+        os.environ.setdefault("DENO_V8_FLAGS", configured)
+
+
 def _classify_ytdlp_error(message: str) -> PlaybackFailure:
     lowered = message.lower()
     if (
@@ -233,6 +274,18 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
         )
     ):
         return PlaybackFailure.COOKIE_CONFIG
+    if any(
+        marker in lowered
+        for marker in (
+            "error running deno process",
+            "error running node process",
+            "challenge solving failed",
+            "n challenge solving failed",
+            "signature solving failed",
+            "only images are available",
+        )
+    ):
+        return PlaybackFailure.JS_CHALLENGE
     if any(
         marker in lowered
         for marker in (
@@ -534,6 +587,9 @@ class GuildPlayer:
 
 
 class _YTDLLogger:
+    def __init__(self, *, suppress_errors: bool = False) -> None:
+        self.suppress_errors = suppress_errors
+
     def debug(self, message: str) -> None:
         if message.startswith("[debug]"):
             log.debug("yt-dlp: %s", _sanitize_ytdlp_message(message))
@@ -545,7 +601,11 @@ class _YTDLLogger:
         log.warning("yt-dlp: %s", _sanitize_ytdlp_message(message))
 
     def error(self, message: str) -> None:
-        log.error("yt-dlp: %s", _sanitize_ytdlp_message(message))
+        sanitized = _sanitize_ytdlp_message(message)
+        if self.suppress_errors:
+            log.debug("yt-dlp recoverable attempt: %s", sanitized)
+        else:
+            log.error("yt-dlp: %s", sanitized)
 
 
 class YTDLPipeAudio(discord.AudioSource):
@@ -557,6 +617,7 @@ class YTDLPipeAudio(discord.AudioSource):
     """
 
     def __init__(self, track: Track):
+        _configure_deno_memory_limit()
         self.track = track
         self.failed = False
         self.produced_audio = False
@@ -572,6 +633,16 @@ class YTDLPipeAudio(discord.AudioSource):
         self._ffmpeg_stderr = tempfile.TemporaryFile()
         if not math.isfinite(track.start_at) or track.start_at < 0:
             raise ValueError("track.start_at must be a finite non-negative value")
+        parsed_url = urlparse(track.webpage_url)
+        hostname = (parsed_url.hostname or "").lower().rstrip(".")
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not (
+                hostname in {"youtube.com", "youtu.be"}
+                or hostname.endswith(".youtube.com")
+            )
+        ):
+            raise ValueError("track URL must be an allowed YouTube URL")
 
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         command = [
@@ -606,11 +677,12 @@ class YTDLPipeAudio(discord.AudioSource):
             command.extend(("--cookies", self._cookie_snapshot))
         else:
             command.extend(track.auth_args)
+        command.extend(track.ytdlp_extra_args)
         if track.start_at > 0:
             command.extend(
                 ["--download-sections", f"*{track.start_at:.3f}-inf"]
             )
-        command.append(track.webpage_url)
+        command.extend(("--", track.webpage_url))
 
         try:
             self._ytdl_process = subprocess.Popen(
@@ -1110,6 +1182,7 @@ class Music(commands.Cog):
         requester_id: int,
         start_at: float = 0.0,
     ) -> Track:
+        _configure_deno_memory_limit()
         if Music._is_url(query) and not Music._is_youtube_url(query):
             raise TrackLookupError(
                 "為了安全，點歌網址只接受 youtube.com 或 youtu.be。",
@@ -1120,9 +1193,14 @@ class Music(commands.Cog):
         if not math.isfinite(start_at) or start_at < 0:
             raise TrackLookupError("指定的開始時間無效。", user_safe=True)
 
-        def extract(auth: YTDLAuth | None) -> Any:
+        def extract(auth: YTDLAuth | None, *, low_resource: bool) -> Any:
             options = dict(YDL_OPTIONS)
-            options["logger"] = _YTDLLogger()
+            options["logger"] = _YTDLLogger(suppress_errors=True)
+            if low_resource:
+                options["js_runtimes"] = {}
+                options["extractor_args"] = {
+                    "youtube": {"player_client": ["android_vr"]}
+                }
             cookie_snapshot: str | None = None
             operation_auth = auth
             if auth and auth.cookiefile:
@@ -1140,52 +1218,90 @@ class Music(commands.Cog):
                 _remove_cookie_snapshot(cookie_snapshot)
 
         selected_auth: YTDLAuth | None = None
-        try:
-            data = extract(None)
-        except yt_dlp.utils.DownloadError as anonymous_error:
-            failure = _classify_ytdlp_error(str(anonymous_error))
-            if failure is not PlaybackFailure.AUTH_REQUIRED:
-                raise TrackLookupError(str(anonymous_error), failure) from anonymous_error
-            if not allow_cookie_auth:
-                raise TrackLookupError(str(anonymous_error), failure) from anonymous_error
+        used_low_resource = False
+        attempts: deque[tuple[YTDLAuth | None, bool]] = deque(
+            [(None, _prefer_low_resource_youtube())]
+        )
+        attempted: set[tuple[YTDLAuth | None, bool]] = set()
+        auth_candidates_loaded = False
+        last_error: Exception | None = None
+        last_failure = PlaybackFailure.OTHER
 
+        while attempts:
+            auth, low_resource = attempts.popleft()
+            attempt_key = (auth, low_resource)
+            if attempt_key in attempted:
+                continue
+            attempted.add(attempt_key)
             try:
-                auth_candidates = _configured_auth_candidates()
+                data = extract(auth, low_resource=low_resource)
             except CookieConfigurationError as error:
-                raise TrackLookupError(
-                    str(error), PlaybackFailure.COOKIE_CONFIG
-                ) from error
+                last_error = error
+                last_failure = PlaybackFailure.COOKIE_CONFIG
+                if attempts:
+                    continue
+                raise TrackLookupError(str(error), last_failure) from error
+            except yt_dlp.utils.DownloadError as error:
+                last_error = error
+                last_failure = _classify_ytdlp_error(str(error))
 
-            if not auth_candidates:
-                raise TrackLookupError(
-                    "YouTube 要求登入驗證，但目前沒有可用的 cookie 來源。",
-                    PlaybackFailure.AUTH_REQUIRED,
-                    user_safe=True,
-                ) from anonymous_error
+                if (
+                    last_failure is PlaybackFailure.JS_CHALLENGE
+                    and not low_resource
+                ):
+                    attempts.appendleft((None, True))
+                    continue
 
-            last_error: Exception = anonymous_error
-            last_failure = failure
-            for auth in auth_candidates:
-                try:
-                    data = extract(auth)
-                    selected_auth = auth
-                    break
-                except yt_dlp.utils.DownloadError as auth_error:
-                    last_error = auth_error
-                    last_failure = _classify_ytdlp_error(str(auth_error))
-                    if last_failure not in {
+                if (
+                    low_resource
+                    and last_failure
+                    in {
+                        PlaybackFailure.UNAVAILABLE,
+                        PlaybackFailure.OTHER,
+                    }
+                ):
+                    attempts.appendleft((auth, False))
+                    continue
+
+                if (
+                    last_failure is PlaybackFailure.AUTH_REQUIRED
+                    and allow_cookie_auth
+                    and not auth_candidates_loaded
+                ):
+                    try:
+                        auth_candidates = _configured_auth_candidates()
+                    except CookieConfigurationError as config_error:
+                        raise TrackLookupError(
+                            str(config_error),
+                            PlaybackFailure.COOKIE_CONFIG,
+                        ) from config_error
+                    auth_candidates_loaded = True
+                    if not auth_candidates:
+                        raise TrackLookupError(
+                            "YouTube 要求登入驗證，但目前沒有可用的 cookie 來源。",
+                            PlaybackFailure.AUTH_REQUIRED,
+                            user_safe=True,
+                        ) from error
+                    attempts.extend((candidate, False) for candidate in auth_candidates)
+                    continue
+
+                if (
+                    last_failure
+                    in {
                         PlaybackFailure.AUTH_REQUIRED,
                         PlaybackFailure.COOKIE_CONFIG,
-                    }:
-                        break
-                except CookieConfigurationError as auth_error:
-                    last_error = auth_error
-                    last_failure = PlaybackFailure.COOKIE_CONFIG
+                    }
+                    and attempts
+                ):
+                    continue
+                raise TrackLookupError(str(error), last_failure) from error
             else:
-                raise TrackLookupError(str(last_error), last_failure) from last_error
-
-            if selected_auth is None:
-                raise TrackLookupError(str(last_error), last_failure) from last_error
+                selected_auth = auth
+                used_low_resource = low_resource
+                break
+        else:
+            assert last_error is not None
+            raise TrackLookupError(str(last_error), last_failure) from last_error
 
         info = data
         if data and "entries" in data:
@@ -1202,6 +1318,11 @@ class Music(commands.Cog):
         if not webpage_url:
             raise TrackLookupError(
                 "搜尋結果沒有可重新解析的網址", user_safe=True
+            )
+        if not Music._is_youtube_url(webpage_url):
+            raise TrackLookupError(
+                "搜尋結果不是可接受的 YouTube 網址。",
+                user_safe=True,
             )
 
         duration = info.get("duration")
@@ -1237,6 +1358,9 @@ class Music(commands.Cog):
                 selected_auth.cookiefile if selected_auth else None
             ),
             auth_label=selected_auth.label if selected_auth else None,
+            ytdlp_extra_args=(
+                LOW_RESOURCE_YOUTUBE_ARGS if used_low_resource else ()
+            ),
         )
 
     def _game_is_active(self, ctx: commands.Context) -> bool:
@@ -2286,7 +2410,7 @@ class Music(commands.Cog):
                 return PlaybackControl(
                     EndReason.ERROR,
                     failure=failure,
-                    safe_to_retry_auth=bool(source and not source.produced_audio),
+                    safe_to_retry=bool(source and not source.produced_audio),
                 )
             voice_client = guild.voice_client
             if not voice_client or not voice_client.is_connected():
@@ -2317,7 +2441,7 @@ class Music(commands.Cog):
             return PlaybackControl(
                 EndReason.ERROR,
                 failure=PlaybackFailure.COOKIE_CONFIG,
-                safe_to_retry_auth=True,
+                safe_to_retry=True,
             )
         except Exception:
             log.exception("Could not play %r in guild %s", track.title, guild.id)
@@ -2358,6 +2482,10 @@ class Music(commands.Cog):
                 attempt = track
                 start_paused = False
                 seeking = False
+                challenge_fallback_used = (
+                    attempt.ytdlp_extra_args == LOW_RESOURCE_YOUTUBE_ARGS
+                )
+                challenge_failure_seen = False
                 playback_auth_config_error: str | None = None
                 if self._is_youtube_url(track.webpage_url):
                     try:
@@ -2428,12 +2556,37 @@ class Music(commands.Cog):
 
                     if (
                         action.reason is EndReason.ERROR
+                        and action.failure is PlaybackFailure.JS_CHALLENGE
+                        and action.safe_to_retry
+                        and not challenge_fallback_used
+                    ):
+                        attempt = replace(
+                            attempt,
+                            auth_args=(),
+                            auth_cookiefile=None,
+                            auth_label=None,
+                            ytdlp_extra_args=LOW_RESOURCE_YOUTUBE_ARGS,
+                        )
+                        start_paused = retry_paused
+                        seeking = attempt.start_at > 0
+                        challenge_fallback_used = True
+                        challenge_failure_seen = True
+                        log.warning(
+                            "JS challenge failed for %r in guild %s; "
+                            "retrying with the low-resource YouTube client",
+                            track.title,
+                            guild_id,
+                        )
+                        continue
+
+                    if (
+                        action.reason is EndReason.ERROR
                         and action.failure
                         in {
                             PlaybackFailure.AUTH_REQUIRED,
                             PlaybackFailure.COOKIE_CONFIG,
                         }
-                        and action.safe_to_retry_auth
+                        and action.safe_to_retry
                         and playback_auth_fallbacks
                     ):
                         auth = playback_auth_fallbacks.pop(0)
@@ -2444,6 +2597,7 @@ class Music(commands.Cog):
                             ),
                             auth_cookiefile=auth.cookiefile,
                             auth_label=auth.label,
+                            ytdlp_extra_args=(),
                         )
                         start_paused = retry_paused
                         seeking = attempt.start_at > 0
@@ -2456,6 +2610,20 @@ class Music(commands.Cog):
                         continue
 
                     if action.reason is not EndReason.SEEK:
+                        if (
+                            action.reason is EndReason.ERROR
+                            and challenge_failure_seen
+                            and action.failure
+                            in {
+                                PlaybackFailure.AUTH_REQUIRED,
+                                PlaybackFailure.UNAVAILABLE,
+                                PlaybackFailure.OTHER,
+                            }
+                        ):
+                            action = replace(
+                                action,
+                                failure=PlaybackFailure.JS_CHALLENGE,
+                            )
                         if (
                             action.reason is EndReason.ERROR
                             and action.failure is PlaybackFailure.AUTH_REQUIRED
@@ -2543,6 +2711,11 @@ class Music(commands.Cog):
                         failure_message = (
                             "⚠️ 音訊程序未能安全結束，已停止並清空佇列。"
                             "請重新啟動機器人後再點歌。"
+                        )
+                    elif action.failure is PlaybackFailure.JS_CHALLENGE:
+                        failure_message = (
+                            "⚠️ YouTube JS challenge 解題失敗，低資源備援也無法取得音訊。"
+                            "請確認主機有足夠記憶體，且 yt-dlp、yt-dlp-ejs 與 Deno 都是最新版。"
                         )
                     elif action.failure is PlaybackFailure.AUTH_REQUIRED:
                         failure_message = (
@@ -2814,6 +2987,11 @@ class Music(commands.Cog):
                     "❌ YouTube cookie 無法讀取。請確認 `YTDLP_COOKIES_B64` "
                     "是完整 Base64，或使用 `YTDLP_COOKIE_FILE` "
                     "指向 Netscape cookies.txt。"
+                )
+            elif error.failure is PlaybackFailure.JS_CHALLENGE:
+                result_message = (
+                    "❌ YouTube JS challenge 解題失敗，低資源備援也無法取得音訊。"
+                    "請確認主機記憶體足夠，並重新安裝 requirements.txt。"
                 )
             elif error.failure is PlaybackFailure.RATE_LIMIT:
                 result_message = "❌ YouTube 暫時限制請求，請稍後再試。"

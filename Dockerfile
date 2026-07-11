@@ -18,6 +18,8 @@ COPY requirements.txt .
 # 【第二步：依 requirements 安裝 Python 函式庫】
 # requirements 會一併安裝 Discord DAVE 與 yt-dlp 的 Deno/EJS 支援。
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "import yt_dlp, yt_dlp_ejs; print(yt_dlp.version.__version__)" \
+    && deno --version
 
 # 【第三步：複製所有程式碼】
 COPY . .

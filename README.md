@@ -97,6 +97,15 @@ YTDLP_COOKIES_FROM_BROWSER=auto
 # 伺服器或 Docker 建議改用放在專案外的 Netscape cookies.txt。
 # 設定此值時會優先於瀏覽器 cookie。
 YTDLP_COOKIE_FILE=
+
+# Railway 可把 Netscape cookies.txt 做 Base64 後存為 Secret。
+YTDLP_COOKIES_B64=
+
+# auto 會在 Railway 優先使用低資源 YouTube client，避開 Deno OOM/SIGKILL。
+YTDLP_LOW_RESOURCE=auto
+
+# 選填；Railway 未設定時會自動使用 --max-old-space-size=64。
+YTDLP_DENO_V8_FLAGS=
 ```
 
 ### 4. 執行機器人
