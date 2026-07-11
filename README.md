@@ -11,11 +11,13 @@
 ## ✨ 主要功能
 
 ### 🎵 音樂系統 (Music)
-支援從 YouTube 播放音樂，具備完整的佇列管理與多種循環模式。
+支援從 YouTube 播放音樂，具備播放器面板、封面與進度條、按鈕控制、指定時間播放、佇列管理與多種循環模式。
 
 | 指令 | 說明 | 範例 |
 | :--- | :--- | :--- |
-| `!play <關鍵字/網址> [時間]` | 播放音樂 (支援指定開始時間) | `!play song 1:30` |
+| `/play <關鍵字/網址>` | 搜尋並播放音樂 | `/play Never Gonna Give You Up` |
+| `/play_at <時間> <關鍵字/網址>` | 從指定時間開始播放 | `/play_at 1:30 Never Gonna Give You Up` |
+| `/seek <時間>` | 跳轉目前歌曲；也可按播放器的「跳轉」 | `/seek 1:30` |
 | `!pause` / `!resume` | 暫停 / 恢復播放 | |
 | `!skip` | 跳過目前歌曲 | |
 | `!stop` | 停止播放並清空佇列 | |
@@ -87,6 +89,14 @@ DISCORD_BOT_TOKEN=你的_Discord_Bot_Token
 
 # Google Gemini API Key (從 Google AI Studio 取得)
 GEMINI_API_KEY=你的_Gemini_API_Key
+
+# YouTube 出現「請登入以確認不是機器人」時使用。
+# auto 會在 Windows 偵測本機瀏覽器；Firefox 通常最穩定。
+YTDLP_COOKIES_FROM_BROWSER=auto
+
+# 伺服器或 Docker 建議改用放在專案外的 Netscape cookies.txt。
+# 設定此值時會優先於瀏覽器 cookie。
+YTDLP_COOKIE_FILE=
 ```
 
 ### 4. 執行機器人

@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -21,6 +26,7 @@ log = logging.getLogger(__name__)
 
 IDLE_TIMEOUT_SECONDS = 180
 VOICE_CONNECT_TIMEOUT_SECONDS = 30.0
+PANEL_REFRESH_SECONDS = 10.0
 
 YDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -34,8 +40,32 @@ YDL_OPTIONS = {
 }
 
 
+class PlaybackFailure(Enum):
+    AUTH_REQUIRED = auto()
+    COOKIE_CONFIG = auto()
+    RATE_LIMIT = auto()
+    NETWORK = auto()
+    UNAVAILABLE = auto()
+    OTHER = auto()
+
+
 class TrackLookupError(Exception):
     """Raised when yt-dlp cannot find a playable track."""
+
+    def __init__(
+        self,
+        message: str,
+        failure: PlaybackFailure = PlaybackFailure.OTHER,
+        *,
+        user_safe: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.failure = failure
+        self.user_safe = user_safe
+
+
+class CookieConfigurationError(Exception):
+    """Raised when a configured cookie source cannot be used safely."""
 
 
 class VoiceChannelMismatch(Exception):
@@ -56,8 +86,37 @@ class EndReason(Enum):
     NATURAL = auto()
     ERROR = auto()
     SKIP = auto()
+    SEEK = auto()
     STOP = auto()
     LEAVE = auto()
+
+
+class PlaybackState(Enum):
+    IDLE = auto()
+    LOADING = auto()
+    PLAYING = auto()
+    PAUSED = auto()
+    SEEKING = auto()
+    ERROR = auto()
+    EXTERNAL = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class PlaybackControl:
+    reason: EndReason
+    seek_to: float | None = None
+    keep_paused: bool = False
+    failure: PlaybackFailure | None = None
+    safe_to_retry_auth: bool = False
+    halt_queue: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class YTDLAuth:
+    label: str
+    cli_args: tuple[str, ...]
+    cookiefile: str | None = None
+    cookiesfrombrowser: tuple[str, str | None, str | None, str | None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +125,300 @@ class Track:
     webpage_url: str
     duration: int | None
     text_channel_id: int
+    requester_id: int
+    uploader: str | None = None
+    thumbnail_url: str | None = None
+    start_at: float = 0.0
+    auth_args: tuple[str, ...] = ()
+    auth_cookiefile: str | None = None
+    auth_label: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerSnapshot:
+    state: PlaybackState
+    current: Track | None
+    last_track: Track | None
+    queued: tuple[Track, ...]
+    loop_mode: LoopMode
+    position: float
+    playback_id: int
+    voice_channel_id: int | None
+
+
+def parse_time_value(value: str) -> float:
+    """Parse seconds, MM:SS, HH:MM:SS, or compact h/m/s notation."""
+    raw = value.strip().lower()
+    if not raw:
+        raise ValueError("請輸入時間，例如 `90`、`1:30` 或 `1h2m3s`。")
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        seconds = float(raw)
+    elif ":" in raw:
+        parts = raw.split(":")
+        if len(parts) not in {2, 3} or not all(
+            re.fullmatch(r"\d+", part) for part in parts
+        ):
+            raise ValueError("時間格式錯誤，請使用 `MM:SS` 或 `HH:MM:SS`。")
+        numbers = [int(part) for part in parts]
+        if numbers[-1] >= 60 or (len(numbers) == 3 and numbers[-2] >= 60):
+            raise ValueError("秒數與小時格式中的分鐘必須介於 0 到 59。")
+        if len(numbers) == 2:
+            seconds = numbers[0] * 60 + numbers[1]
+        else:
+            seconds = numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+    else:
+        unit_match = re.fullmatch(
+            r"\s*(?:(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours|小時|時))?"
+            r"\s*(?:(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes|分鐘|分))?"
+            r"\s*(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds|秒))?\s*",
+            raw,
+        )
+        if not unit_match or not any(unit_match.groups()):
+            raise ValueError("時間格式錯誤，請使用 `90`、`1:30` 或 `1h2m3s`。")
+        hours, minutes, unit_seconds = (
+            float(part) if part is not None else 0.0
+            for part in unit_match.groups()
+        )
+        seconds = hours * 3600 + minutes * 60 + unit_seconds
+
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("時間必須是大於或等於 0 的有限數值。")
+    return seconds
+
+
+def format_time_value(seconds: float | int | None) -> str:
+    if seconds is None or not math.isfinite(float(seconds)):
+        return "未知"
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def progress_bar(position: float, duration: int | None, width: int = 16) -> str:
+    if not duration or duration <= 0:
+        return "▰" + "▱" * (width - 1)
+    ratio = min(1.0, max(0.0, position / duration))
+    filled = min(width, max(0, round(ratio * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def _classify_ytdlp_error(message: str) -> PlaybackFailure:
+    lowered = message.lower()
+    if (
+        "permission denied" in lowered
+        and "cookie" in lowered
+    ) or (
+        "could not copy" in lowered
+        and ("cookie" in lowered or "database" in lowered)
+    ):
+        return PlaybackFailure.COOKIE_CONFIG
+    if any(
+        marker in lowered
+        for marker in (
+            "failed to decrypt",
+            "cookie database",
+            "cookies database",
+            "could not find firefox cookies",
+            "could not find chrome cookies",
+            "could not find edge cookies",
+            "failed to load cookies",
+            "does not look like a netscape format",
+            "invalid cookies",
+        )
+    ):
+        return PlaybackFailure.COOKIE_CONFIG
+    if any(
+        marker in lowered
+        for marker in (
+            "sign in to confirm",
+            "login required",
+            "please log in",
+            "not a bot",
+            "confirm you’re not a bot",
+            "confirm you're not a bot",
+            "不是機器人",
+            "不是机器人",
+            "請登入以確認",
+            "请登录以确认",
+            "--cookies-from-browser",
+        )
+    ):
+        return PlaybackFailure.AUTH_REQUIRED
+    if any(marker in lowered for marker in ("http error 429", "too many requests", "rate limit")):
+        return PlaybackFailure.RATE_LIMIT
+    if any(
+        marker in lowered
+        for marker in (
+            "timed out",
+            "timeout",
+            "temporary failure in name resolution",
+            "connection reset",
+            "network is unreachable",
+        )
+    ):
+        return PlaybackFailure.NETWORK
+    if any(
+        marker in lowered
+        for marker in (
+            "private video",
+            "video unavailable",
+            "not available in your country",
+            "has been removed",
+        )
+    ):
+        return PlaybackFailure.UNAVAILABLE
+    return PlaybackFailure.OTHER
+
+
+def _sanitize_ytdlp_message(message: str) -> str:
+    sanitized = re.sub(
+        r"(?im)^([^\r\n]*(?:cookie|authorization)\s*:\s*)[^\r\n]+$",
+        r"\1<redacted>",
+        message,
+    )
+    cookie_file = os.getenv("YTDLP_COOKIE_FILE", "").strip()
+    if cookie_file:
+        cookie_paths = {cookie_file, os.path.expandvars(cookie_file)}
+        try:
+            expanded = Path(os.path.expandvars(cookie_file)).expanduser()
+            cookie_paths.update({str(expanded), str(expanded.resolve())})
+        except OSError:
+            pass
+        cookie_paths.update(path.replace("\\", "/") for path in tuple(cookie_paths))
+        for path in sorted(cookie_paths, key=len, reverse=True):
+            if path:
+                if os.name == "nt":
+                    sanitized = re.sub(
+                        re.escape(path),
+                        "<cookie-file>",
+                        sanitized,
+                        flags=re.IGNORECASE,
+                    )
+                else:
+                    sanitized = sanitized.replace(path, "<cookie-file>")
+    return sanitized
+
+
+def _auto_cookie_browser_specs() -> list[str]:
+    if os.name != "nt":
+        return []
+    local = Path(os.getenv("LOCALAPPDATA", ""))
+    roaming = Path(os.getenv("APPDATA", ""))
+    candidates = (
+        ("firefox", roaming / "Mozilla" / "Firefox" / "Profiles"),
+        ("chrome", local / "Google" / "Chrome" / "User Data"),
+        ("edge", local / "Microsoft" / "Edge" / "User Data"),
+        ("brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
+    )
+    return [name for name, path in candidates if str(path) and path.exists()]
+
+
+def _parse_browser_cookie_spec(spec: str) -> tuple[str, str | None, str | None, str | None]:
+    try:
+        parsed = yt_dlp.parse_options(
+            ["--ignore-config", "--cookies-from-browser", spec]
+        ).ydl_opts["cookiesfrombrowser"]
+    except Exception as error:
+        raise CookieConfigurationError("瀏覽器 cookie 設定格式無效。") from error
+    if not isinstance(parsed, tuple) or len(parsed) != 4:
+        raise CookieConfigurationError("瀏覽器 cookie 設定格式無效。")
+    return parsed
+
+
+def _configured_auth_candidates() -> list[YTDLAuth]:
+    cookie_file_value = os.getenv("YTDLP_COOKIE_FILE", "").strip()
+    if cookie_file_value:
+        cookie_path = Path(os.path.expandvars(cookie_file_value)).expanduser()
+        if not cookie_path.is_file():
+            raise CookieConfigurationError(
+                "YTDLP_COOKIE_FILE 指向的 cookie 檔案不存在。"
+            )
+        resolved = str(cookie_path.resolve())
+        return [
+            YTDLAuth(
+                label="cookie 檔案",
+                cli_args=("--cookies", resolved),
+                cookiefile=resolved,
+            )
+        ]
+
+    browser_setting = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "auto").strip()
+    if browser_setting.lower() in {"", "off", "none", "false", "0"}:
+        return []
+    specs = (
+        _auto_cookie_browser_specs()
+        if browser_setting.lower() == "auto"
+        else [browser_setting]
+    )
+
+    candidates: list[YTDLAuth] = []
+    for spec in dict.fromkeys(specs):
+        parsed = _parse_browser_cookie_spec(spec)
+        candidates.append(
+            YTDLAuth(
+                label=f"{parsed[0]} 瀏覽器",
+                cli_args=("--cookies-from-browser", spec),
+                cookiesfrombrowser=parsed,
+            )
+        )
+    return candidates
+
+
+def _apply_auth_options(options: dict[str, Any], auth: YTDLAuth | None) -> None:
+    if auth is None:
+        return
+    if auth.cookiefile:
+        options["cookiefile"] = auth.cookiefile
+    if auth.cookiesfrombrowser:
+        options["cookiesfrombrowser"] = auth.cookiesfrombrowser
+
+
+def _create_cookie_snapshot(source: str) -> str:
+    """Copy a master Netscape cookie file for one isolated yt-dlp operation."""
+    file_descriptor: int | None = None
+    snapshot: str | None = None
+    try:
+        file_descriptor, snapshot = tempfile.mkstemp(
+            prefix="discordbot-ytdlp-cookies-",
+            suffix=".txt",
+        )
+        os.close(file_descriptor)
+        file_descriptor = None
+        shutil.copyfile(source, snapshot)
+        try:
+            os.chmod(snapshot, 0o600)
+        except OSError:
+            pass
+        return snapshot
+    except OSError as error:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        try:
+            if snapshot:
+                os.remove(snapshot)
+        except OSError:
+            pass
+        raise CookieConfigurationError(
+            "Cookie 檔案無法建立安全的暫存副本。"
+        ) from error
+
+
+def _remove_cookie_snapshot(snapshot: str | None) -> None:
+    if not snapshot:
+        return
+    try:
+        os.remove(snapshot)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.warning("Could not remove a temporary yt-dlp cookie snapshot")
 
 
 def _set_event() -> asyncio.Event:
@@ -83,7 +436,7 @@ class GuildPlayer:
     wake: asyncio.Event = field(default_factory=asyncio.Event)
     playback_idle: asyncio.Event = field(default_factory=_set_event)
     current: Track | None = None
-    control: asyncio.Future[EndReason] | None = None
+    control: asyncio.Future[PlaybackControl] | None = None
     worker_task: asyncio.Task[None] | None = None
     idle_task: asyncio.Task[None] | None = None
     loop_mode: LoopMode = LoopMode.OFF
@@ -91,21 +444,34 @@ class GuildPlayer:
     idle_generation: int = 0
     pending_searches: int = 0
     external_audio: bool = False
+    state: PlaybackState = PlaybackState.IDLE
+    last_track: Track | None = None
+    active_source: YTDLPipeAudio | None = None
+    playback_id: int = 0
+    started_at: float | None = None
+    paused_at: float | None = None
+    paused_total: float = 0.0
+    panel_message: discord.Message | None = None
+    panel_update_task: asyncio.Task[None] | None = None
+    panel_view: discord.ui.View | None = None
+    panel_wake: asyncio.Event = field(default_factory=asyncio.Event)
+    panel_generation: int = 0
+    panel_disabled: bool = False
 
 
 class _YTDLLogger:
     def debug(self, message: str) -> None:
         if message.startswith("[debug]"):
-            log.debug("yt-dlp: %s", message)
+            log.debug("yt-dlp: %s", _sanitize_ytdlp_message(message))
 
     def info(self, message: str) -> None:
-        log.info("yt-dlp: %s", message)
+        log.info("yt-dlp: %s", _sanitize_ytdlp_message(message))
 
     def warning(self, message: str) -> None:
-        log.warning("yt-dlp: %s", message)
+        log.warning("yt-dlp: %s", _sanitize_ytdlp_message(message))
 
     def error(self, message: str) -> None:
-        log.error("yt-dlp: %s", message)
+        log.error("yt-dlp: %s", _sanitize_ytdlp_message(message))
 
 
 class YTDLPipeAudio(discord.AudioSource):
@@ -119,6 +485,7 @@ class YTDLPipeAudio(discord.AudioSource):
     def __init__(self, track: Track):
         self.track = track
         self.failed = False
+        self.produced_audio = False
         self.error_summary = ""
         self._cleanup_lock = threading.Lock()
         self._cleaned = False
@@ -126,14 +493,18 @@ class YTDLPipeAudio(discord.AudioSource):
         self._current_error: Exception | None = None
         self.cleanup_done = threading.Event()
         self._audio: discord.FFmpegOpusAudio | None = None
+        self._cookie_snapshot: str | None = None
         self._ytdl_stderr = tempfile.TemporaryFile()
         self._ffmpeg_stderr = tempfile.TemporaryFile()
+        if not math.isfinite(track.start_at) or track.start_at < 0:
+            raise ValueError("track.start_at must be a finite non-negative value")
 
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         command = [
             sys.executable,
             "-m",
             "yt_dlp",
+            "--ignore-config",
             "--format",
             "bestaudio/best",
             "--no-playlist",
@@ -149,8 +520,23 @@ class YTDLPipeAudio(discord.AudioSource):
             "20",
             "--output",
             "-",
-            track.webpage_url,
         ]
+        if track.auth_cookiefile:
+            try:
+                self._cookie_snapshot = _create_cookie_snapshot(
+                    track.auth_cookiefile
+                )
+            except Exception:
+                self._close_logs()
+                raise
+            command.extend(("--cookies", self._cookie_snapshot))
+        else:
+            command.extend(track.auth_args)
+        if track.start_at > 0:
+            command.extend(
+                ["--download-sections", f"*{track.start_at:.3f}-inf"]
+            )
+        command.append(track.webpage_url)
 
         try:
             self._ytdl_process = subprocess.Popen(
@@ -176,6 +562,8 @@ class YTDLPipeAudio(discord.AudioSource):
             )
         except Exception:
             self._terminate_ytdl()
+            _remove_cookie_snapshot(self._cookie_snapshot)
+            self._cookie_snapshot = None
             self._close_logs()
             raise
 
@@ -183,6 +571,8 @@ class YTDLPipeAudio(discord.AudioSource):
         if self._audio is None:
             return b""
         data = self._audio.read()
+        if data and not data.startswith((b"OpusHead", b"OpusTags")):
+            self.produced_audio = True
         if not data:
             inner_error = getattr(self._audio, "_current_error", None)
             if inner_error is not None:
@@ -297,9 +687,9 @@ class YTDLPipeAudio(discord.AudioSource):
                 )
             )
             if self.failed:
-                self.error_summary = "\n".join(
+                self.error_summary = _sanitize_ytdlp_message("\n".join(
                     part for part in (ytdl_log, ffmpeg_log) if part
-                )[-4000:]
+                )[-4000:])
                 log.warning(
                     "Audio pipeline failed for %r (yt-dlp=%s, ffmpeg=%s): %s",
                     self.track.title,
@@ -308,8 +698,234 @@ class YTDLPipeAudio(discord.AudioSource):
                     self.error_summary or "no stderr output",
                 )
         finally:
+            _remove_cookie_snapshot(self._cookie_snapshot)
+            self._cookie_snapshot = None
             self._close_logs()
             self.cleanup_done.set()
+
+
+class SeekModal(discord.ui.Modal):
+    def __init__(
+        self,
+        music: Music,
+        guild_id: int,
+        playback_id: int,
+        panel_message_id: int,
+    ) -> None:
+        super().__init__(title="跳轉播放位置", timeout=60)
+        self.music = music
+        self.guild_id = guild_id
+        self.playback_id = playback_id
+        self.panel_message_id = panel_message_id
+        self.position_input = discord.ui.TextInput(
+            label="要跳到哪裡？",
+            placeholder="例如：90、1:30、01:02:03",
+            min_length=1,
+            max_length=20,
+        )
+        self.add_item(self.position_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_seek_submit(
+            interaction,
+            self.guild_id,
+            self.playback_id,
+            self.panel_message_id,
+            str(self.position_input.value),
+        )
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+    ) -> None:
+        log.error(
+            "Music seek modal failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        await self.music._respond_interaction(
+            interaction,
+            "❌ 跳轉失敗，請稍後再試。",
+        )
+
+
+class MusicControlsView(discord.ui.View):
+    def __init__(
+        self,
+        music: Music,
+        guild_id: int,
+        generation: int,
+        snapshot: PlayerSnapshot,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.music = music
+        self.guild_id = guild_id
+        self.generation = generation
+        self.playback_id = snapshot.playback_id
+
+        externally_controlled = snapshot.state is PlaybackState.EXTERNAL
+        active = snapshot.current is not None and snapshot.state in {
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+        }
+        toggle = discord.ui.Button(
+            label="繼續" if snapshot.state is PlaybackState.PAUSED else "暫停",
+            emoji="▶️" if snapshot.state is PlaybackState.PAUSED else "⏸️",
+            style=(
+                discord.ButtonStyle.success
+                if snapshot.state is PlaybackState.PAUSED
+                else discord.ButtonStyle.primary
+            ),
+            disabled=not active,
+            row=0,
+        )
+        toggle.callback = self._toggle_pause
+        self.add_item(toggle)
+
+        skip = discord.ui.Button(
+            label="跳過",
+            emoji="⏭️",
+            style=discord.ButtonStyle.secondary,
+            disabled=externally_controlled or snapshot.current is None,
+            row=0,
+        )
+        skip.callback = self._skip
+        self.add_item(skip)
+
+        loop_labels = {
+            LoopMode.OFF: "循環：關",
+            LoopMode.ONE: "循環：單曲",
+            LoopMode.QUEUE: "循環：佇列",
+        }
+        loop_button = discord.ui.Button(
+            label=loop_labels[snapshot.loop_mode],
+            emoji="🔁",
+            style=(
+                discord.ButtonStyle.success
+                if snapshot.loop_mode is not LoopMode.OFF
+                else discord.ButtonStyle.secondary
+            ),
+            disabled=externally_controlled or (
+                snapshot.current is None and not snapshot.queued
+            ),
+            row=0,
+        )
+        loop_button.callback = self._loop
+        self.add_item(loop_button)
+
+        seek = discord.ui.Button(
+            label="跳轉",
+            emoji="⏱️",
+            style=discord.ButtonStyle.secondary,
+            disabled=(
+                not active
+                or snapshot.current is None
+                or snapshot.current.duration is None
+            ),
+            row=0,
+        )
+        seek.callback = self._seek
+        self.add_item(seek)
+
+        stop = discord.ui.Button(
+            label="停止",
+            emoji="⏹️",
+            style=discord.ButtonStyle.danger,
+            disabled=externally_controlled or (
+                snapshot.current is None and not snapshot.queued
+            ),
+            row=0,
+        )
+        stop.callback = self._stop
+        self.add_item(stop)
+
+        queue = discord.ui.Button(
+            label=f"佇列（{len(snapshot.queued)}）",
+            emoji="📜",
+            style=discord.ButtonStyle.secondary,
+            disabled=snapshot.current is None and not snapshot.queued,
+            row=1,
+        )
+        queue.callback = self._queue
+        self.add_item(queue)
+
+        leave = discord.ui.Button(
+            label="離開",
+            emoji="🚪",
+            style=discord.ButtonStyle.danger,
+            disabled=externally_controlled or snapshot.voice_channel_id is None,
+            row=1,
+        )
+        leave.callback = self._leave
+        self.add_item(leave)
+
+        if (
+            snapshot.current
+            and Music._is_url(snapshot.current.webpage_url)
+            and len(snapshot.current.webpage_url) <= 512
+        ):
+            self.add_item(
+                discord.ui.Button(
+                    label="在 YouTube 開啟",
+                    emoji="🔗",
+                    style=discord.ButtonStyle.link,
+                    url=snapshot.current.webpage_url,
+                    row=1,
+                )
+            )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        valid = await self.music._is_current_panel(
+            interaction,
+            self.guild_id,
+            self.generation,
+        )
+        if not valid:
+            await self.music._respond_interaction(
+                interaction,
+                "⚠️ 這個播放器面板已過期，請使用最新的面板。",
+            )
+        return valid
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        log.error(
+            "Music control button failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        await self.music._respond_interaction(
+            interaction,
+            "❌ 播放器操作失敗，請稍後再試。",
+        )
+
+    async def _toggle_pause(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_toggle_pause(
+            interaction, self.guild_id, self.playback_id
+        )
+
+    async def _skip(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_skip(interaction, self.guild_id, self.playback_id)
+
+    async def _loop(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_loop_mode(interaction, self.guild_id)
+
+    async def _seek(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_open_seek(
+            interaction, self.guild_id, self.playback_id
+        )
+
+    async def _stop(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_stop(interaction, self.guild_id)
+
+    async def _queue(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_queue(interaction, self.guild_id)
+
+    async def _leave(self, interaction: discord.Interaction) -> None:
+        await self.music._panel_leave(interaction, self.guild_id)
 
 
 class Music(commands.Cog):
@@ -323,13 +939,18 @@ class Music(commands.Cog):
         for guild_id, player in self.players.items():
             player.command_epoch += 1
             if player.control and not player.control.done():
-                player.control.set_result(EndReason.STOP)
+                player.control.set_result(PlaybackControl(EndReason.STOP))
             if player.worker_task:
                 player.worker_task.cancel()
                 tasks.append(player.worker_task)
             if player.idle_task:
                 player.idle_task.cancel()
                 tasks.append(player.idle_task)
+            if player.panel_update_task:
+                player.panel_update_task.cancel()
+                tasks.append(player.panel_update_task)
+            if player.panel_view:
+                player.panel_view.stop()
 
             guild = self.bot.get_guild(guild_id)
             voice_client = guild.voice_client if guild else None
@@ -352,6 +973,29 @@ class Music(commands.Cog):
         if disconnects:
             await asyncio.gather(*disconnects, return_exceptions=True)
 
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        player = self.players.pop(guild.id, None)
+        if player is None:
+            return
+        if player.control and not player.control.done():
+            player.control.set_result(PlaybackControl(EndReason.LEAVE))
+        tasks = [
+            task
+            for task in (
+                player.worker_task,
+                player.idle_task,
+                player.panel_update_task,
+            )
+            if task and task is not asyncio.current_task() and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if player.panel_view:
+            player.panel_view.stop()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _get_player(self, guild_id: int) -> GuildPlayer:
         player = self.players.get(guild_id)
         if player is None:
@@ -363,6 +1007,11 @@ class Music(commands.Cog):
                 self._player_worker(guild_id),
                 name=f"music-player-{guild_id}",
             )
+        if player.panel_update_task is None or player.panel_update_task.done():
+            player.panel_update_task = asyncio.create_task(
+                self._panel_updater(guild_id),
+                name=f"music-panel-{guild_id}",
+            )
         return player
 
     @staticmethod
@@ -371,20 +1020,105 @@ class Music(commands.Cog):
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     @staticmethod
-    def _extract_track_sync(query: str, text_channel_id: int) -> Track:
-        search_query = query if Music._is_url(query) else f"ytsearch1:{query}"
-        options = dict(YDL_OPTIONS)
-        options["logger"] = _YTDLLogger()
+    def _is_youtube_url(query: str) -> bool:
+        if not Music._is_url(query):
+            return False
+        hostname = (urlparse(query).hostname or "").lower().rstrip(".")
+        return (
+            hostname in {"youtube.com", "youtu.be"}
+            or hostname.endswith(".youtube.com")
+        )
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            data = ydl.extract_info(search_query, download=False)
+    @staticmethod
+    def _extract_track_sync(
+        query: str,
+        text_channel_id: int,
+        requester_id: int,
+        start_at: float = 0.0,
+    ) -> Track:
+        if Music._is_url(query) and not Music._is_youtube_url(query):
+            raise TrackLookupError(
+                "為了安全，點歌網址只接受 youtube.com 或 youtu.be。",
+                user_safe=True,
+            )
+        search_query = query if Music._is_url(query) else f"ytsearch1:{query}"
+        allow_cookie_auth = not Music._is_url(query) or Music._is_youtube_url(query)
+        if not math.isfinite(start_at) or start_at < 0:
+            raise TrackLookupError("指定的開始時間無效。", user_safe=True)
+
+        def extract(auth: YTDLAuth | None) -> Any:
+            options = dict(YDL_OPTIONS)
+            options["logger"] = _YTDLLogger()
+            cookie_snapshot: str | None = None
+            operation_auth = auth
+            if auth and auth.cookiefile:
+                cookie_snapshot = _create_cookie_snapshot(auth.cookiefile)
+                operation_auth = replace(
+                    auth,
+                    cookiefile=cookie_snapshot,
+                    cli_args=("--cookies", cookie_snapshot),
+                )
+            try:
+                _apply_auth_options(options, operation_auth)
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    return ydl.extract_info(search_query, download=False)
+            finally:
+                _remove_cookie_snapshot(cookie_snapshot)
+
+        selected_auth: YTDLAuth | None = None
+        try:
+            data = extract(None)
+        except yt_dlp.utils.DownloadError as anonymous_error:
+            failure = _classify_ytdlp_error(str(anonymous_error))
+            if failure is not PlaybackFailure.AUTH_REQUIRED:
+                raise TrackLookupError(str(anonymous_error), failure) from anonymous_error
+            if not allow_cookie_auth:
+                raise TrackLookupError(str(anonymous_error), failure) from anonymous_error
+
+            try:
+                auth_candidates = _configured_auth_candidates()
+            except CookieConfigurationError as error:
+                raise TrackLookupError(
+                    str(error), PlaybackFailure.COOKIE_CONFIG
+                ) from error
+
+            if not auth_candidates:
+                raise TrackLookupError(
+                    "YouTube 要求登入驗證，但目前沒有可用的 cookie 來源。",
+                    PlaybackFailure.AUTH_REQUIRED,
+                    user_safe=True,
+                ) from anonymous_error
+
+            last_error: Exception = anonymous_error
+            last_failure = failure
+            for auth in auth_candidates:
+                try:
+                    data = extract(auth)
+                    selected_auth = auth
+                    break
+                except yt_dlp.utils.DownloadError as auth_error:
+                    last_error = auth_error
+                    last_failure = _classify_ytdlp_error(str(auth_error))
+                    if last_failure not in {
+                        PlaybackFailure.AUTH_REQUIRED,
+                        PlaybackFailure.COOKIE_CONFIG,
+                    }:
+                        break
+                except CookieConfigurationError as auth_error:
+                    last_error = auth_error
+                    last_failure = PlaybackFailure.COOKIE_CONFIG
+            else:
+                raise TrackLookupError(str(last_error), last_failure) from last_error
+
+            if selected_auth is None:
+                raise TrackLookupError(str(last_error), last_failure) from last_error
 
         info = data
         if data and "entries" in data:
             info = next((entry for entry in data["entries"] if entry), None)
 
         if not info:
-            raise TrackLookupError("找不到符合的歌曲")
+            raise TrackLookupError("找不到符合的歌曲", user_safe=True)
 
         webpage_url = (
             info.get("webpage_url")
@@ -392,17 +1126,43 @@ class Music(commands.Cog):
             or (query if Music._is_url(query) else None)
         )
         if not webpage_url:
-            raise TrackLookupError("搜尋結果沒有可重新解析的網址")
+            raise TrackLookupError(
+                "搜尋結果沒有可重新解析的網址", user_safe=True
+            )
 
         duration = info.get("duration")
         if not isinstance(duration, int):
             duration = int(duration) if isinstance(duration, float) else None
+
+        if start_at > 0 and duration is None:
+            raise TrackLookupError(
+                "這首歌曲沒有可確認的長度，無法指定開始時間。",
+                user_safe=True,
+            )
+        if duration is not None and start_at >= duration:
+            raise TrackLookupError(
+                f"開始時間必須小於歌曲長度 {format_time_value(duration)}。",
+                user_safe=True,
+            )
 
         return Track(
             title=info.get("title") or "未知歌曲",
             webpage_url=webpage_url,
             duration=duration,
             text_channel_id=text_channel_id,
+            requester_id=requester_id,
+            uploader=info.get("uploader") or info.get("channel"),
+            thumbnail_url=info.get("thumbnail"),
+            start_at=start_at,
+            auth_args=(
+                selected_auth.cli_args
+                if selected_auth and not selected_auth.cookiefile
+                else ()
+            ),
+            auth_cookiefile=(
+                selected_auth.cookiefile if selected_auth else None
+            ),
+            auth_label=selected_auth.label if selected_auth else None,
         )
 
     def _game_is_active(self, ctx: commands.Context) -> bool:
@@ -411,6 +1171,722 @@ class Music(commands.Cog):
             return False
         game = werewolf.get_game(ctx)
         return bool(game and game.phase not in {"waiting", "ended"})
+
+    @staticmethod
+    def _safe_title(title: str, limit: int = 180) -> str:
+        escaped = discord.utils.escape_mentions(
+            discord.utils.escape_markdown(title.strip() or "未知歌曲")
+        )
+        return escaped[:limit]
+
+    def _track_link(
+        self,
+        track: Track,
+        *,
+        title_limit: int = 180,
+        url_limit: int = 180,
+    ) -> str:
+        title = self._safe_title(track.title, title_limit)
+        if self._is_url(track.webpage_url) and len(track.webpage_url) <= url_limit:
+            safe_url = track.webpage_url.replace("(", "%28").replace(")", "%29")
+            return f"[{title}]({safe_url})"
+        return f"**{title}**"
+
+    @staticmethod
+    def _position_locked(player: GuildPlayer, now: float) -> float:
+        track = player.current
+        if track is None:
+            return 0.0
+        position = track.start_at
+        if player.started_at is not None:
+            end = player.paused_at if player.paused_at is not None else now
+            position += max(0.0, end - player.started_at - player.paused_total)
+        if track.duration is not None:
+            position = min(float(track.duration), position)
+        return max(0.0, position)
+
+    def _snapshot_locked(
+        self,
+        guild: discord.Guild,
+        player: GuildPlayer,
+    ) -> PlayerSnapshot:
+        voice_client = guild.voice_client
+        channel = voice_client.channel if voice_client else None
+        return PlayerSnapshot(
+            state=player.state,
+            current=player.current,
+            last_track=player.last_track,
+            queued=tuple(player.queue),
+            loop_mode=player.loop_mode,
+            position=self._position_locked(player, asyncio.get_running_loop().time()),
+            playback_id=player.playback_id,
+            voice_channel_id=getattr(channel, "id", None),
+        )
+
+    def _build_player_embed(
+        self,
+        guild: discord.Guild,
+        snapshot: PlayerSnapshot,
+    ) -> discord.Embed:
+        state_settings = {
+            PlaybackState.IDLE: ("⏹️ 播放已結束", discord.Color.dark_grey()),
+            PlaybackState.LOADING: ("⏳ 正在載入", discord.Color.blurple()),
+            PlaybackState.PLAYING: ("🎶 正在播放", discord.Color.green()),
+            PlaybackState.PAUSED: ("⏸️ 已暫停", discord.Color.gold()),
+            PlaybackState.SEEKING: ("⏩ 正在跳轉", discord.Color.blurple()),
+            PlaybackState.ERROR: ("⚠️ 播放失敗", discord.Color.red()),
+            PlaybackState.EXTERNAL: ("🐺 遊戲音效接管中", discord.Color.red()),
+        }
+        title, color = state_settings[snapshot.state]
+        track = snapshot.current or snapshot.last_track
+        embed = discord.Embed(title=title, color=color)
+
+        if track:
+            embed.description = self._track_link(track)
+            if track.uploader:
+                embed.description += f"\n由 {self._safe_title(track.uploader, 100)} 上傳"
+            if track.thumbnail_url and self._is_url(track.thumbnail_url):
+                embed.set_thumbnail(url=track.thumbnail_url)
+        else:
+            embed.description = "佇列目前是空的，使用 `/play` 加入歌曲。"
+
+        if snapshot.current:
+            duration_label = format_time_value(snapshot.current.duration)
+            embed.add_field(
+                name="播放進度",
+                value=(
+                    f"`{format_time_value(snapshot.position)} / {duration_label}`\n"
+                    f"`{progress_bar(snapshot.position, snapshot.current.duration)}`"
+                ),
+                inline=False,
+            )
+            if snapshot.current.start_at > 0:
+                embed.add_field(
+                    name="開始位置",
+                    value=f"`{format_time_value(snapshot.current.start_at)}`",
+                    inline=True,
+                )
+            embed.add_field(
+                name="點歌者",
+                value=f"<@{snapshot.current.requester_id}>",
+                inline=True,
+            )
+
+        next_track = snapshot.queued[0] if snapshot.queued else None
+        embed.add_field(
+            name="下一首",
+            value=self._safe_title(next_track.title, 100) if next_track else "—",
+            inline=True,
+        )
+        embed.add_field(
+            name="佇列",
+            value=f"{len(snapshot.queued)} 首",
+            inline=True,
+        )
+        loop_labels = {
+            LoopMode.OFF: "關閉",
+            LoopMode.ONE: "單曲循環",
+            LoopMode.QUEUE: "佇列循環",
+        }
+        embed.add_field(
+            name="循環",
+            value=loop_labels[snapshot.loop_mode],
+            inline=True,
+        )
+        embed.add_field(
+            name="語音頻道",
+            value=(
+                f"<#{snapshot.voice_channel_id}>"
+                if snapshot.voice_channel_id is not None
+                else "未連線"
+            ),
+            inline=True,
+        )
+        embed.set_footer(
+            text="控制按鈕限同語音頻道成員使用；伺服器管理員可遠端控制"
+        )
+        return embed
+
+    def _build_queue_embed_from_snapshot(
+        self,
+        snapshot: PlayerSnapshot,
+    ) -> discord.Embed:
+        lines: list[str] = []
+        if snapshot.current:
+            current = snapshot.current
+            lines.append(
+                f"**正在播放**\n{self._track_link(current, title_limit=140)}"
+                f"\n`{format_time_value(snapshot.position)} / {format_time_value(current.duration)}`"
+            )
+        if snapshot.queued:
+            lines.append("\n**接下來**")
+            for index, track in enumerate(snapshot.queued[:10], start=1):
+                offset = (
+                    f" · 從 `{format_time_value(track.start_at)}` 開始"
+                    if track.start_at > 0
+                    else ""
+                )
+                lines.append(
+                    f"`{index:02d}.` {self._track_link(track, title_limit=110)}"
+                    f" · `{format_time_value(track.duration)}`{offset}"
+                )
+            if len(snapshot.queued) > 10:
+                lines.append(f"… 以及其他 {len(snapshot.queued) - 10} 首")
+
+        description = "\n".join(lines) if lines else "佇列目前是空的。"
+        if len(description) > 4000:
+            description = description[:3997] + "..."
+        embed = discord.Embed(
+            title=f"🎵 播放佇列 · {len(snapshot.queued)} 首等待中",
+            description=description,
+            color=discord.Color.blurple(),
+        )
+        return embed
+
+    async def _queue_embed(self, guild: discord.Guild) -> discord.Embed:
+        player = self._get_player(guild.id)
+        async with player.lock:
+            snapshot = self._snapshot_locked(guild, player)
+        return self._build_queue_embed_from_snapshot(snapshot)
+
+    async def _panel_updater(self, guild_id: int) -> None:
+        player = self.players[guild_id]
+        retry_delay = 5.0
+        try:
+            while True:
+                await player.panel_wake.wait()
+                player.panel_wake.clear()
+                guild = self.bot.get_guild(guild_id)
+                if guild is None:
+                    if player.panel_view:
+                        player.panel_view.stop()
+                    for task in (player.worker_task, player.idle_task):
+                        if task and not task.done():
+                            task.cancel()
+                    if self.players.get(guild_id) is player:
+                        self.players.pop(guild_id, None)
+                    return
+
+                async with player.lock:
+                    snapshot = self._snapshot_locked(guild, player)
+                    message = player.panel_message
+                    disabled = player.panel_disabled
+                    generation = player.panel_generation + 1
+
+                if disabled or (message is None and snapshot.current is None):
+                    continue
+
+                embed = self._build_player_embed(guild, snapshot)
+                view = MusicControlsView(
+                    self,
+                    guild_id,
+                    generation,
+                    snapshot,
+                )
+                new_message = message
+                try:
+                    if message is None:
+                        channel_id = snapshot.current.text_channel_id
+                        channel = self.bot.get_channel(channel_id)
+                        if channel is None or not hasattr(channel, "send"):
+                            view.stop()
+                            log.warning(
+                                "Could not find music panel channel %s in guild %s",
+                                channel_id,
+                                guild_id,
+                            )
+                            continue
+                        new_message = await channel.send(embed=embed, view=view)
+                    else:
+                        await message.edit(embed=embed, view=view)
+                except discord.NotFound:
+                    view.stop()
+                    async with player.lock:
+                        if player.panel_message is message:
+                            old_view = player.panel_view
+                            player.panel_message = None
+                            player.panel_view = None
+                            if snapshot.current is not None:
+                                player.panel_wake.set()
+                        else:
+                            old_view = None
+                    if old_view:
+                        old_view.stop()
+                    if snapshot.current is not None:
+                        await asyncio.sleep(1.0)
+                        player.panel_wake.set()
+                    continue
+                except discord.Forbidden:
+                    view.stop()
+                    log.warning("Missing permission to create/update music panel in guild %s", guild_id)
+                    async with player.lock:
+                        player.panel_disabled = True
+                    continue
+                except discord.HTTPException:
+                    view.stop()
+                    log.exception("Could not update music panel in guild %s", guild_id)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(60.0, retry_delay * 2)
+                    player.panel_wake.set()
+                    continue
+
+                async with player.lock:
+                    old_view = player.panel_view
+                    player.panel_message = new_message
+                    player.panel_view = view
+                    player.panel_generation = generation
+                if old_view and old_view is not view:
+                    old_view.stop()
+                retry_delay = 5.0
+
+                if snapshot.state is PlaybackState.PLAYING:
+                    try:
+                        await asyncio.wait_for(
+                            player.panel_wake.wait(),
+                            timeout=PANEL_REFRESH_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        player.panel_wake.set()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Music panel updater crashed in guild %s", guild_id)
+
+    async def _respond_interaction(
+        self,
+        interaction: discord.Interaction,
+        content: str | None = None,
+        *,
+        embed: discord.Embed | None = None,
+        ephemeral: bool = True,
+    ) -> None:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    content=content,
+                    embed=embed,
+                    ephemeral=ephemeral,
+                )
+            else:
+                await interaction.response.send_message(
+                    content=content,
+                    embed=embed,
+                    ephemeral=ephemeral,
+                )
+        except discord.HTTPException:
+            log.exception("Could not answer music interaction")
+
+    async def _is_current_panel(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+        generation: int,
+    ) -> bool:
+        if interaction.guild_id != guild_id or interaction.message is None:
+            return False
+        player = self.players.get(guild_id)
+        if player is None:
+            return False
+        async with player.lock:
+            return bool(
+                player.panel_message
+                and player.panel_message.id == interaction.message.id
+                and player.panel_generation == generation
+            )
+
+    async def _controller_error(
+        self,
+        guild: discord.Guild,
+        member: discord.Member | discord.User,
+    ) -> str | None:
+        player = self._get_player(guild.id)
+        async with player.lock:
+            if player.external_audio:
+                return "🐺 狼人殺正在使用語音，現在不能控制音樂。"
+
+        voice_client = guild.voice_client
+        if not voice_client or not voice_client.is_connected():
+            return "機器人目前不在語音頻道。"
+        if isinstance(member, discord.Member):
+            if member.guild_permissions.manage_guild:
+                return None
+            voice_state = member.voice
+            if voice_state and voice_state.channel and voice_state.channel.id == voice_client.channel.id:
+                return None
+        return "請先加入機器人目前所在的語音頻道。"
+
+    async def _toggle_pause_action(
+        self,
+        guild: discord.Guild,
+        expected_playback_id: int | None = None,
+        desired_paused: bool | None = None,
+    ) -> tuple[bool, str]:
+        player = self._get_player(guild.id)
+        voice_client = guild.voice_client
+        async with player.lock:
+            if expected_playback_id is not None and player.playback_id != expected_playback_id:
+                return False, "歌曲已切換，請使用最新的播放器面板。"
+            source = player.active_source
+            control = player.control
+            if not player.current or not source or not voice_client:
+                return False, "目前沒有音樂正在播放。"
+            if (
+                player.state not in {PlaybackState.PLAYING, PlaybackState.PAUSED}
+                or not control
+                or control.done()
+            ):
+                return False, "播放器正在切換歌曲，請稍後再試。"
+            if getattr(voice_client, "source", None) is not source:
+                return False, "播放器正在切換歌曲，請稍後再試。"
+
+            now = asyncio.get_running_loop().time()
+            if voice_client.is_paused():
+                if desired_paused is True:
+                    return False, "目前已經是暫停狀態。"
+                voice_client.resume()
+                if player.paused_at is not None:
+                    player.paused_total += max(0.0, now - player.paused_at)
+                player.paused_at = None
+                player.state = PlaybackState.PLAYING
+                message = "▶️ 繼續播放。"
+            elif voice_client.is_playing():
+                if desired_paused is False:
+                    return False, "目前已經在播放。"
+                voice_client.pause()
+                player.paused_at = now
+                player.state = PlaybackState.PAUSED
+                message = "⏸️ 已暫停。"
+            else:
+                return False, "播放器正在切換歌曲，請稍後再試。"
+            player.panel_wake.set()
+        return True, message
+
+    async def _skip_action(
+        self,
+        guild: discord.Guild,
+        expected_playback_id: int | None = None,
+    ) -> tuple[bool, str]:
+        player = self._get_player(guild.id)
+        async with player.lock:
+            if expected_playback_id is not None and player.playback_id != expected_playback_id:
+                return False, "歌曲已切換，請使用最新的播放器面板。"
+            control = player.control
+            if not player.current or not control or control.done():
+                return False, "目前沒有音樂正在播放。"
+            source = player.active_source
+            control.set_result(PlaybackControl(EndReason.SKIP))
+            player.state = PlaybackState.LOADING
+            player.panel_wake.set()
+
+        voice_client = guild.voice_client
+        if (
+            source
+            and voice_client
+            and getattr(voice_client, "source", None) is source
+            and (voice_client.is_playing() or voice_client.is_paused())
+        ):
+            voice_client.stop()
+        return True, "⏭️ 已跳過。"
+
+    async def _stop_action(self, guild: discord.Guild) -> tuple[bool, str]:
+        player = self._get_player(guild.id)
+        async with player.lock:
+            had_work = bool(
+                player.current or player.queue or player.pending_searches
+            )
+            player.command_epoch += 1
+            player.loop_mode = LoopMode.OFF
+            player.queue.clear()
+            player.wake.clear()
+            self._cancel_idle_locked(player)
+            control = player.control
+            source = player.active_source
+            if control and not control.done():
+                control.set_result(PlaybackControl(EndReason.STOP))
+            player.state = PlaybackState.IDLE
+            player.panel_wake.set()
+            if player.current is None:
+                self._arm_idle_locked(guild, player)
+
+        voice_client = guild.voice_client
+        if (
+            source
+            and voice_client
+            and getattr(voice_client, "source", None) is source
+            and (voice_client.is_playing() or voice_client.is_paused())
+        ):
+            voice_client.stop()
+        if not had_work:
+            return False, "目前沒有音樂或等待中的點歌。"
+        return True, "⏹️ 已停止並清空佇列。"
+
+    async def _cycle_loop_action(self, guild: discord.Guild) -> tuple[bool, str]:
+        player = self._get_player(guild.id)
+        modes = [LoopMode.OFF, LoopMode.ONE, LoopMode.QUEUE]
+        labels = {
+            LoopMode.OFF: "關閉",
+            LoopMode.ONE: "單曲循環",
+            LoopMode.QUEUE: "佇列循環",
+        }
+        async with player.lock:
+            if not player.current and not player.queue:
+                return False, "目前沒有歌曲可以設定循環。"
+            index = (modes.index(player.loop_mode) + 1) % len(modes)
+            player.loop_mode = modes[index]
+            label = labels[player.loop_mode]
+            player.panel_wake.set()
+        return True, f"🔁 循環模式：{label}。"
+
+    async def _seek_action(
+        self,
+        guild: discord.Guild,
+        target: float,
+        expected_playback_id: int | None = None,
+    ) -> tuple[bool, str]:
+        if not math.isfinite(target) or target < 0:
+            return False, "時間必須是大於或等於 0 的有限數值。"
+
+        player = self._get_player(guild.id)
+        async with player.lock:
+            if expected_playback_id is not None and player.playback_id != expected_playback_id:
+                return False, "歌曲已切換，請重新開啟跳轉視窗。"
+            track = player.current
+            control = player.control
+            if not track or not control:
+                return False, "目前沒有音樂正在播放。"
+            if control.done():
+                return False, "播放器正在處理上一個操作，請稍後再試。"
+            if track.duration is None:
+                return False, "這首歌曲沒有可確認的長度，無法跳轉。"
+            if target >= track.duration:
+                return False, (
+                    f"跳轉時間必須小於歌曲長度 "
+                    f"`{format_time_value(track.duration)}`。"
+                )
+            current_position = self._position_locked(
+                player, asyncio.get_running_loop().time()
+            )
+            if abs(current_position - target) < 0.5:
+                return True, f"目前已在 `{format_time_value(target)}` 附近。"
+
+            source = player.active_source
+            keep_paused = player.state is PlaybackState.PAUSED
+            control.set_result(
+                PlaybackControl(
+                    EndReason.SEEK,
+                    seek_to=target,
+                    keep_paused=keep_paused,
+                )
+            )
+            player.state = PlaybackState.SEEKING
+            player.panel_wake.set()
+
+        voice_client = guild.voice_client
+        if (
+            source
+            and voice_client
+            and getattr(voice_client, "source", None) is source
+            and (voice_client.is_playing() or voice_client.is_paused())
+        ):
+            voice_client.stop()
+        return True, f"⏩ 正在跳轉到 `{format_time_value(target)}`。"
+
+    async def _leave_action(self, guild: discord.Guild) -> tuple[bool, str]:
+        player = self._get_player(guild.id)
+        async with player.lock:
+            player.command_epoch += 1
+            player.loop_mode = LoopMode.OFF
+            player.queue.clear()
+            player.wake.clear()
+            self._cancel_idle_locked(player)
+            control = player.control
+            source = player.active_source
+            if control and not control.done():
+                control.set_result(PlaybackControl(EndReason.LEAVE))
+            player.state = PlaybackState.IDLE
+            player.panel_wake.set()
+
+        async with player.voice_lock:
+            voice_client = guild.voice_client
+            if not voice_client:
+                return False, "我不在語音頻道中。"
+            if (
+                source
+                and getattr(voice_client, "source", None) is source
+                and (voice_client.is_playing() or voice_client.is_paused())
+            ):
+                voice_client.stop()
+            await voice_client.disconnect()
+        return True, "👋 已離開語音頻道。"
+
+    async def _panel_toggle_pause(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+        playback_id: int,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        error = await self._controller_error(guild, interaction.user)
+        if error:
+            await self._respond_interaction(interaction, error)
+            return
+        _, message = await self._toggle_pause_action(guild, playback_id)
+        await self._respond_interaction(interaction, message)
+
+    async def _panel_skip(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+        playback_id: int,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        error = await self._controller_error(guild, interaction.user)
+        if error:
+            await self._respond_interaction(interaction, error)
+            return
+        _, message = await self._skip_action(guild, playback_id)
+        await self._respond_interaction(interaction, message)
+
+    async def _panel_loop_mode(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        error = await self._controller_error(guild, interaction.user)
+        if error:
+            await self._respond_interaction(interaction, error)
+            return
+        _, message = await self._cycle_loop_action(guild)
+        await self._respond_interaction(interaction, message)
+
+    async def _panel_open_seek(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+        playback_id: int,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        error = await self._controller_error(guild, interaction.user)
+        if error:
+            await self._respond_interaction(interaction, error)
+            return
+
+        player = self._get_player(guild_id)
+        async with player.lock:
+            current = player.current
+            panel_message = player.panel_message
+            valid = bool(
+                current
+                and current.duration is not None
+                and player.playback_id == playback_id
+                and panel_message
+            )
+            message_id = panel_message.id if panel_message else 0
+        if not valid:
+            await self._respond_interaction(
+                interaction,
+                "歌曲已切換，或目前的歌曲無法跳轉。",
+            )
+            return
+        await interaction.response.send_modal(
+            SeekModal(self, guild_id, playback_id, message_id)
+        )
+
+    async def _panel_seek_submit(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+        playback_id: int,
+        panel_message_id: int,
+        value: str,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        error = await self._controller_error(guild, interaction.user)
+        if error:
+            await self._respond_interaction(interaction, error)
+            return
+        player = self._get_player(guild_id)
+        async with player.lock:
+            panel_is_current = bool(
+                player.panel_message
+                and player.panel_message.id == panel_message_id
+                and player.playback_id == playback_id
+            )
+        if not panel_is_current:
+            await self._respond_interaction(
+                interaction,
+                "歌曲已切換，請在最新播放器重新開啟跳轉視窗。",
+            )
+            return
+        try:
+            target = parse_time_value(value)
+        except ValueError as error:
+            await self._respond_interaction(interaction, f"❌ {error}")
+            return
+        _, message = await self._seek_action(guild, target, playback_id)
+        await self._respond_interaction(interaction, message)
+
+    async def _panel_stop(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        error = await self._controller_error(guild, interaction.user)
+        if error:
+            await self._respond_interaction(interaction, error)
+            return
+        _, message = await self._stop_action(guild)
+        await self._respond_interaction(interaction, message)
+
+    async def _panel_queue(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        embed = await self._queue_embed(guild)
+        await self._respond_interaction(interaction, embed=embed)
+
+    async def _panel_leave(
+        self,
+        interaction: discord.Interaction,
+        guild_id: int,
+    ) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await self._respond_interaction(interaction, "伺服器已無法存取。")
+            return
+        error = await self._controller_error(guild, interaction.user)
+        if error:
+            await self._respond_interaction(interaction, error)
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        _, message = await self._leave_action(guild)
+        await self._respond_interaction(interaction, message)
 
     @staticmethod
     def _settle_audio(
@@ -423,12 +1899,16 @@ class Music(commands.Cog):
     async def _wait_for_source_cleanup(
         source: YTDLPipeAudio,
         guild_id: int,
-    ) -> None:
+    ) -> bool:
         cleaned = await asyncio.to_thread(source.cleanup_done.wait, 3.0)
         if cleaned:
-            return
+            return True
         log.warning("Audio cleanup timed out in guild %s; forcing cleanup", guild_id)
         await asyncio.to_thread(source.cleanup)
+        cleaned = await asyncio.to_thread(source.cleanup_done.wait, 3.0)
+        if not cleaned:
+            log.error("Audio cleanup did not finish in guild %s", guild_id)
+        return cleaned
 
     def _cancel_idle_locked(self, player: GuildPlayer) -> None:
         player.idle_generation += 1
@@ -496,19 +1976,26 @@ class Music(commands.Cog):
                 # task halfway through the voice cleanup.
                 player.idle_task = None
 
+            disconnected = False
             try:
                 await asyncio.shield(voice_client.disconnect())
+                disconnected = True
                 log.info("Disconnected idle voice client in guild %s", guild_id)
             except Exception:
                 log.exception("Failed to disconnect idle voice client in guild %s", guild_id)
                 try:
                     await asyncio.shield(voice_client.disconnect(force=True))
+                    disconnected = True
                 except Exception:
                     log.exception(
                         "Forced idle disconnect also failed in guild %s", guild_id
                     )
                     async with player.lock:
                         self._arm_idle_locked(guild, player)
+            if disconnected:
+                async with player.lock:
+                    player.state = PlaybackState.IDLE
+                    player.panel_wake.set()
 
     async def _ensure_voice(
         self,
@@ -604,8 +2091,10 @@ class Music(commands.Cog):
         guild: discord.Guild,
         player: GuildPlayer,
         track: Track,
-        control: asyncio.Future[EndReason],
-    ) -> EndReason:
+        control: asyncio.Future[PlaybackControl],
+        *,
+        start_paused: bool = False,
+    ) -> PlaybackControl:
         if control.done():
             return control.result()
 
@@ -620,37 +2109,47 @@ class Music(commands.Cog):
 
                 voice_client = guild.voice_client
                 if not voice_client or not voice_client.is_connected():
-                    return EndReason.ERROR
+                    return PlaybackControl(EndReason.ERROR, failure=PlaybackFailure.NETWORK)
                 if voice_client.is_playing() or voice_client.is_paused():
                     log.error("Voice client was already busy before playing %r", track.title)
-                    return EndReason.ERROR
+                    return PlaybackControl(EndReason.ERROR)
 
                 source = await asyncio.to_thread(YTDLPipeAudio, track)
-                cancel_reason = None
                 async with player.lock:
                     if (
                         player.control is not control
                         or control.done()
                         or player.external_audio
                     ):
-                        cancel_reason = (
-                            control.result() if control.done() else EndReason.STOP
+                        cancel_action = (
+                            control.result()
+                            if control.done()
+                            else PlaybackControl(EndReason.STOP)
                         )
-                if cancel_reason is not None:
+                    else:
+                        cancel_action = None
+                        voice_client.play(
+                            source,
+                            after=lambda error: loop.call_soon_threadsafe(
+                                self._settle_audio, audio_done, error
+                            ),
+                        )
+                        if start_paused:
+                            voice_client.pause()
+                        now = loop.time()
+                        player.active_source = source
+                        player.started_at = now
+                        player.paused_at = now if start_paused else None
+                        player.paused_total = 0.0
+                        player.state = (
+                            PlaybackState.PAUSED
+                            if start_paused
+                            else PlaybackState.PLAYING
+                        )
+                        player.panel_wake.set()
+                if cancel_action is not None:
                     await asyncio.to_thread(source.cleanup)
-                    return cancel_reason
-                voice_client.play(
-                    source,
-                    after=lambda error: loop.call_soon_threadsafe(
-                        self._settle_audio, audio_done, error
-                    ),
-                )
-
-            # A slow Discord message must never delay stop/leave/game takeover.
-            asyncio.create_task(
-                self._notify(track.text_channel_id, f"▶️ 正在播放：**{track.title}**"),
-                name=f"music-notify-{guild.id}",
-            )
+                    return cancel_action
 
             await asyncio.wait(
                 {audio_done, control},
@@ -660,7 +2159,7 @@ class Music(commands.Cog):
             # Explicit user controls win if stop() and the audio callback arrive
             # during the same event-loop turn.
             if control.done():
-                reason = control.result()
+                action = control.result()
                 voice_client = guild.voice_client
                 if voice_client and getattr(voice_client, "source", None) is source:
                     voice_client.stop()
@@ -668,21 +2167,60 @@ class Music(commands.Cog):
                     try:
                         await asyncio.wait_for(asyncio.shield(audio_done), timeout=2.0)
                     except asyncio.TimeoutError:
-                        log.warning("Audio callback timed out after %s in guild %s", reason, guild.id)
+                        log.warning(
+                            "Audio callback timed out after %s in guild %s",
+                            action.reason,
+                            guild.id,
+                        )
                 if source:
-                    await self._wait_for_source_cleanup(source, guild.id)
-                return reason
+                    cleanup_complete = await self._wait_for_source_cleanup(
+                        source, guild.id
+                    )
+                    if not cleanup_complete and action.reason in {
+                        EndReason.SEEK,
+                        EndReason.SKIP,
+                    }:
+                        return PlaybackControl(
+                            EndReason.ERROR,
+                            halt_queue=True,
+                        )
+                return action
 
             error = audio_done.result()
             # AudioPlayer calls source.cleanup() immediately after the callback;
             # wait for its explicit signal rather than racing a fixed sleep.
+            cleanup_complete = True
             if source:
-                await self._wait_for_source_cleanup(source, guild.id)
+                cleanup_complete = await self._wait_for_source_cleanup(
+                    source, guild.id
+                )
+            # A control can arrive after audio_done won the wait but while the
+            # AudioPlayer thread is still cleaning up. It must still win over
+            # NATURAL so skip/seek never accidentally triggers a loop.
+            if control.done():
+                return control.result()
+            if not cleanup_complete:
+                return PlaybackControl(EndReason.ERROR, halt_queue=True)
             if error is not None or (source and source.failed):
                 if error:
                     log.warning("Discord audio player failed in guild %s: %s", guild.id, error)
-                return EndReason.ERROR
-            return EndReason.NATURAL
+                failure = (
+                    _classify_ytdlp_error(source.error_summary)
+                    if source and source.error_summary
+                    else PlaybackFailure.OTHER
+                )
+                return PlaybackControl(
+                    EndReason.ERROR,
+                    failure=failure,
+                    safe_to_retry_auth=bool(source and not source.produced_audio),
+                )
+            voice_client = guild.voice_client
+            if not voice_client or not voice_client.is_connected():
+                return PlaybackControl(
+                    EndReason.ERROR,
+                    failure=PlaybackFailure.NETWORK,
+                )
+            return PlaybackControl(EndReason.NATURAL)
         except asyncio.CancelledError:
             voice_client = guild.voice_client
             if voice_client and getattr(voice_client, "source", None) is source:
@@ -694,11 +2232,24 @@ class Music(commands.Cog):
                 except asyncio.CancelledError:
                     pass
             raise
+        except CookieConfigurationError as error:
+            log.warning(
+                "Could not prepare YouTube cookies in guild %s: %s",
+                guild.id,
+                _sanitize_ytdlp_message(str(error)),
+            )
+            if source:
+                await asyncio.to_thread(source.cleanup)
+            return PlaybackControl(
+                EndReason.ERROR,
+                failure=PlaybackFailure.COOKIE_CONFIG,
+                safe_to_retry_auth=True,
+            )
         except Exception:
             log.exception("Could not play %r in guild %s", track.title, guild.id)
             if source:
                 await asyncio.to_thread(source.cleanup)
-            return EndReason.ERROR
+            return PlaybackControl(EndReason.ERROR)
 
     async def _player_worker(self, guild_id: int) -> None:
         player = self.players[guild_id]
@@ -720,32 +2271,186 @@ class Music(commands.Cog):
                     if not player.queue:
                         player.wake.clear()
                     player.current = track
+                    player.last_track = track
                     player.playback_idle.clear()
-                    control = asyncio.get_running_loop().create_future()
-                    player.control = control
+                    player.state = PlaybackState.LOADING
+                    player.active_source = None
+                    player.started_at = None
+                    player.paused_at = None
+                    player.paused_total = 0.0
+                    player.panel_wake.set()
+                    track_epoch = player.command_epoch
 
-                reason = await self._play_track(guild, player, track, control)
+                attempt = track
+                start_paused = False
+                seeking = False
+                playback_auth_config_error: str | None = None
+                if self._is_youtube_url(track.webpage_url):
+                    try:
+                        playback_auth_fallbacks = [
+                            auth
+                            for auth in _configured_auth_candidates()
+                            if not (
+                                (
+                                    auth.cookiefile
+                                    and auth.cookiefile
+                                    == track.auth_cookiefile
+                                )
+                                or (
+                                    not auth.cookiefile
+                                    and track.auth_cookiefile is None
+                                    and auth.cli_args == track.auth_args
+                                )
+                            )
+                        ]
+                    except CookieConfigurationError as error:
+                        playback_auth_fallbacks = []
+                        playback_auth_config_error = str(error)
+                else:
+                    playback_auth_fallbacks = []
+                while True:
+                    async with player.lock:
+                        if (
+                            player.command_epoch != track_epoch
+                            or player.external_audio
+                        ):
+                            action = PlaybackControl(EndReason.STOP)
+                            break
+                        player.current = attempt
+                        player.last_track = attempt
+                        player.playback_id += 1
+                        player.state = (
+                            PlaybackState.SEEKING
+                            if seeking
+                            else PlaybackState.LOADING
+                        )
+                        player.active_source = None
+                        player.started_at = None
+                        player.paused_at = None
+                        player.paused_total = 0.0
+                        control = asyncio.get_running_loop().create_future()
+                        player.control = control
+                        player.panel_wake.set()
+
+                    action = await self._play_track(
+                        guild,
+                        player,
+                        attempt,
+                        control,
+                        start_paused=start_paused,
+                    )
+
+                    async with player.lock:
+                        retry_paused = (
+                            player.state is PlaybackState.PAUSED
+                            or (start_paused and player.active_source is None)
+                        )
+                        if player.control is control:
+                            player.control = None
+                        player.active_source = None
+                        player.started_at = None
+                        player.paused_at = None
+                        player.paused_total = 0.0
+
+                    if (
+                        action.reason is EndReason.ERROR
+                        and action.failure
+                        in {
+                            PlaybackFailure.AUTH_REQUIRED,
+                            PlaybackFailure.COOKIE_CONFIG,
+                        }
+                        and action.safe_to_retry_auth
+                        and playback_auth_fallbacks
+                    ):
+                        auth = playback_auth_fallbacks.pop(0)
+                        attempt = replace(
+                            attempt,
+                            auth_args=(
+                                auth.cli_args if not auth.cookiefile else ()
+                            ),
+                            auth_cookiefile=auth.cookiefile,
+                            auth_label=auth.label,
+                        )
+                        start_paused = retry_paused
+                        seeking = attempt.start_at > 0
+                        log.info(
+                            "Retrying %r with %s cookies in guild %s",
+                            track.title,
+                            auth.label,
+                            guild_id,
+                        )
+                        continue
+
+                    if action.reason is not EndReason.SEEK:
+                        if (
+                            action.reason is EndReason.ERROR
+                            and action.failure is PlaybackFailure.AUTH_REQUIRED
+                            and playback_auth_config_error
+                        ):
+                            log.warning(
+                                "YouTube cookie configuration is invalid in guild %s: %s",
+                                guild_id,
+                                _sanitize_ytdlp_message(
+                                    playback_auth_config_error
+                                ),
+                            )
+                            action = replace(
+                                action,
+                                failure=PlaybackFailure.COOKIE_CONFIG,
+                            )
+                        break
+                    if action.seek_to is None or not math.isfinite(action.seek_to):
+                        action = PlaybackControl(EndReason.ERROR)
+                        break
+
+                    async with player.lock:
+                        if (
+                            player.command_epoch != track_epoch
+                            or player.external_audio
+                        ):
+                            action = PlaybackControl(EndReason.STOP)
+                            break
+                    attempt = replace(attempt, start_at=action.seek_to)
+                    start_paused = action.keep_paused
+                    seeking = True
 
                 async with player.lock:
-                    if player.control is control:
-                        player.control = None
                     player.current = None
+                    player.last_track = attempt
+                    player.active_source = None
+                    player.started_at = None
+                    player.paused_at = None
+                    player.paused_total = 0.0
                     player.playback_idle.set()
 
                     voice_client = guild.voice_client
-                    connection_lost = reason is EndReason.ERROR and (
+                    connection_lost = action.reason is EndReason.ERROR and (
                         not voice_client or not voice_client.is_connected()
                     )
 
-                    if connection_lost:
-                        player.queue.appendleft(track)
-                    elif reason is EndReason.NATURAL:
+                    if action.halt_queue:
+                        player.loop_mode = LoopMode.OFF
+                        player.queue.clear()
+                    elif connection_lost:
+                        player.queue.appendleft(replace(attempt, start_at=0.0))
+                    elif action.reason is EndReason.NATURAL:
+                        loop_track = replace(attempt, start_at=0.0)
                         if player.loop_mode is LoopMode.ONE:
-                            player.queue.appendleft(track)
+                            player.queue.appendleft(loop_track)
                         elif player.loop_mode is LoopMode.QUEUE:
-                            player.queue.append(track)
+                            player.queue.append(loop_track)
 
-                    if connection_lost:
+                    if player.external_audio:
+                        player.state = PlaybackState.EXTERNAL
+                    elif action.reason is EndReason.ERROR:
+                        player.state = PlaybackState.ERROR
+                    else:
+                        player.state = PlaybackState.IDLE
+                    player.panel_wake.set()
+
+                    if action.halt_queue:
+                        player.wake.clear()
+                    elif connection_lost:
                         player.wake.clear()
                     elif player.queue and not player.external_audio:
                         player.wake.set()
@@ -759,10 +2464,32 @@ class Music(commands.Cog):
                         track.text_channel_id,
                         "⚠️ 語音連線已中斷；歌曲已保留，請重新使用 `/play` 連線。",
                     )
-                elif reason is EndReason.ERROR:
+                elif action.reason is EndReason.ERROR:
+                    if action.halt_queue:
+                        failure_message = (
+                            "⚠️ 音訊程序未能安全結束，已停止並清空佇列。"
+                            "請重新啟動機器人後再點歌。"
+                        )
+                    elif action.failure is PlaybackFailure.AUTH_REQUIRED:
+                        failure_message = (
+                            "⚠️ YouTube 要求登入驗證。請在 `.env` 設定 "
+                            "`YTDLP_COOKIES_FROM_BROWSER=firefox`（或你的瀏覽器），"
+                            "再重新啟動機器人。"
+                        )
+                    elif action.failure is PlaybackFailure.COOKIE_CONFIG:
+                        failure_message = (
+                            "⚠️ YouTube cookie 無法讀取；請關閉對應瀏覽器後重試，"
+                            "或改用 `YTDLP_COOKIE_FILE`。"
+                        )
+                    elif action.failure is PlaybackFailure.RATE_LIMIT:
+                        failure_message = "⚠️ YouTube 暫時限制請求，請稍後再點歌。"
+                    else:
+                        failure_message = (
+                            f"⚠️ **{track.title}** 播放失敗，已嘗試播放下一首。"
+                        )
                     await self._notify(
                         track.text_channel_id,
-                        f"⚠️ **{track.title}** 播放失敗，已嘗試播放下一首。",
+                        failure_message,
                     )
         except asyncio.CancelledError:
             return
@@ -771,6 +2498,12 @@ class Music(commands.Cog):
             async with player.lock:
                 player.current = None
                 player.control = None
+                player.active_source = None
+                player.started_at = None
+                player.paused_at = None
+                player.paused_total = 0.0
+                player.state = PlaybackState.ERROR
+                player.panel_wake.set()
                 player.playback_idle.set()
                 if player.queue and not player.external_audio:
                     player.wake.set()
@@ -809,11 +2542,19 @@ class Music(commands.Cog):
             player.queue.clear()
             player.wake.clear()
             self._cancel_idle_locked(player)
+            source = player.active_source
             if player.control and not player.control.done():
-                player.control.set_result(EndReason.STOP)
+                player.control.set_result(PlaybackControl(EndReason.STOP))
+            player.state = PlaybackState.EXTERNAL
+            player.panel_wake.set()
 
         voice_client = guild.voice_client
-        if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        if (
+            source
+            and voice_client
+            and getattr(voice_client, "source", None) is source
+            and (voice_client.is_playing() or voice_client.is_paused())
+        ):
             voice_client.stop()
 
         try:
@@ -822,6 +2563,8 @@ class Music(commands.Cog):
         except Exception:
             async with player.lock:
                 player.external_audio = False
+                player.state = PlaybackState.IDLE
+                player.panel_wake.set()
                 player.playback_idle.set()
                 self._arm_idle_locked(guild, player)
             raise
@@ -836,7 +2579,9 @@ class Music(commands.Cog):
             player.queue.clear()
             player.wake.clear()
             if player.control and not player.control.done():
-                player.control.set_result(EndReason.STOP)
+                player.control.set_result(PlaybackControl(EndReason.STOP))
+            player.state = PlaybackState.IDLE
+            player.panel_wake.set()
 
         voice_client = guild.voice_client
         if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
@@ -850,8 +2595,15 @@ class Music(commands.Cog):
         async with player.lock:
             self._arm_idle_locked(guild, player)
 
-    @commands.hybrid_command(name="play", description="播放 YouTube 音樂")
-    async def play(self, ctx: commands.Context, *, query: str) -> None:
+    async def _enqueue_query(
+        self,
+        ctx: commands.Context,
+        query: str,
+        start_at: float,
+    ) -> None:
+        if ctx.guild is None:
+            await ctx.send("❌ 點歌只能在伺服器內使用。", ephemeral=True)
+            return
         if self._game_is_active(ctx):
             await ctx.send(
                 "🐺 **狼人殺正在進行中！** 現在暫停點歌功能。",
@@ -866,7 +2618,12 @@ class Music(commands.Cog):
         if ctx.interaction:
             await ctx.defer()
 
-        searching_message = await ctx.send(f"🔍 正在搜尋：`{query}` ...")
+        start_label = (
+            f"（從 `{format_time_value(start_at)}` 開始）" if start_at > 0 else ""
+        )
+        searching_message = await ctx.send(
+            f"🔍 正在搜尋：`{query}` {start_label}..."
+        )
         player = self._get_player(ctx.guild.id)
 
         async with player.lock:
@@ -874,7 +2631,8 @@ class Music(commands.Cog):
             player.pending_searches += 1
             self._cancel_idle_locked(player)
 
-        result_message = "❌ 點歌失敗，請稍後再試。"
+        result_message: str | None = "❌ 點歌失敗，請稍後再試。"
+        result_embed: discord.Embed | None = None
         try:
             # Preserve command order while keeping skip/stop responsive.
             async with player.request_lock:
@@ -890,6 +2648,8 @@ class Music(commands.Cog):
                     self._extract_track_sync,
                     query,
                     ctx.channel.id,
+                    ctx.author.id,
+                    start_at,
                 )
 
                 if self._game_is_active(ctx):
@@ -929,21 +2689,76 @@ class Music(commands.Cog):
                     player.queue.append(track)
                     player.wake.set()
                     self._cancel_idle_locked(player)
+                    player.panel_disabled = False
+                    player.panel_wake.set()
                     position = len(player.queue) + (1 if player.current else 0)
 
-                if was_idle:
-                    result_message = f"✅ 已找到 **{track.title}**，準備播放。"
-                else:
-                    result_message = (
-                        f"✅ **{track.title}** 已加入佇列（目前第 {position} 首）。"
+                result_message = None
+                result_embed = discord.Embed(
+                    title="✅ 準備播放" if was_idle else "✅ 已加入佇列",
+                    description=self._track_link(track),
+                    color=discord.Color.green(),
+                )
+                if track.thumbnail_url and self._is_url(track.thumbnail_url):
+                    result_embed.set_thumbnail(url=track.thumbnail_url)
+                result_embed.add_field(
+                    name="長度",
+                    value=f"`{format_time_value(track.duration)}`",
+                    inline=True,
+                )
+                result_embed.add_field(
+                    name="播放順序",
+                    value="即將播放" if was_idle else f"第 {position} 首",
+                    inline=True,
+                )
+                if track.start_at > 0:
+                    result_embed.add_field(
+                        name="從這裡開始",
+                        value=f"`{format_time_value(track.start_at)}`",
+                        inline=True,
                     )
+                result_embed.set_footer(text=f"由 {ctx.author.display_name} 點歌")
         except PlayCancelled:
             result_message = "⚠️ 這次點歌已被停止、離開或遊戲音效取消。"
         except VoiceChannelMismatch as error:
             result_message = f"❌ {error}"
-        except (TrackLookupError, yt_dlp.utils.DownloadError) as error:
-            log.warning("Track lookup failed for %r: %s", query, error)
-            result_message = "❌ 找不到可播放的歌曲，請換一個關鍵字或網址。"
+        except TrackLookupError as error:
+            log.warning(
+                "Track lookup failed for %r: %s",
+                query,
+                _sanitize_ytdlp_message(str(error)),
+            )
+            if error.failure is PlaybackFailure.AUTH_REQUIRED:
+                result_message = (
+                    "❌ YouTube 要求登入驗證，但偵測到的瀏覽器 cookie 仍無法通過。\n"
+                    "請在 `.env` 設定 `YTDLP_COOKIES_FROM_BROWSER=firefox` "
+                    "（或 `chrome` / `edge`），登入 YouTube 後重新啟動機器人。"
+                )
+            elif error.failure is PlaybackFailure.COOKIE_CONFIG:
+                result_message = (
+                    "❌ YouTube cookie 無法讀取。請關閉對應瀏覽器後重試，"
+                    "或在 `.env` 使用 `YTDLP_COOKIE_FILE` 指向 Netscape cookies.txt。"
+                )
+            elif error.failure is PlaybackFailure.RATE_LIMIT:
+                result_message = "❌ YouTube 暫時限制請求，請稍後再試。"
+            elif error.failure is PlaybackFailure.NETWORK:
+                result_message = "❌ 連線 YouTube 逾時，請檢查網路後重試。"
+            elif error.failure is PlaybackFailure.UNAVAILABLE:
+                result_message = "❌ 影片不可用、為私人影片，或受到地區限制。"
+            else:
+                detail = str(error)
+                result_message = (
+                    f"❌ {discord.utils.escape_mentions(detail)}"
+                    if error.user_safe and detail and len(detail) <= 180
+                    else "❌ 找不到可播放的歌曲，請換一個關鍵字或網址。"
+                )
+        except yt_dlp.utils.DownloadError as error:
+            log.warning(
+                "Unexpected yt-dlp lookup failure for %r: %s",
+                query,
+                _sanitize_ytdlp_message(str(error)),
+            )
+            result_message = "❌ YouTube 無法解析這首歌曲，請換一個網址或稍後再試。"
         except Exception as error:
             log.exception("Play command failed in guild %s", ctx.guild.id)
             result_message = f"❌ 點歌失敗（{type(error).__name__}），請稍後再試。"
@@ -951,158 +2766,162 @@ class Music(commands.Cog):
             async with player.lock:
                 player.pending_searches = max(0, player.pending_searches - 1)
                 self._arm_idle_locked(ctx.guild, player)
-            await searching_message.edit(content=result_message)
+            try:
+                await searching_message.edit(
+                    content=result_message,
+                    embed=result_embed,
+                )
+            except discord.HTTPException:
+                log.exception("Could not update play search response")
+
+    @commands.hybrid_command(name="play", description="播放 YouTube 音樂")
+    async def play(self, ctx: commands.Context, *, query: str) -> None:
+        await self._enqueue_query(ctx, query, 0.0)
+
+    @commands.hybrid_command(
+        name="play_at",
+        description="從指定時間開始播放 YouTube 音樂",
+    )
+    async def play_at(
+        self,
+        ctx: commands.Context,
+        start_time: str,
+        *,
+        query: str,
+    ) -> None:
+        try:
+            start_at = parse_time_value(start_time)
+        except ValueError as error:
+            await ctx.send(f"❌ {error}", ephemeral=True)
+            return
+        await self._enqueue_query(ctx, query, start_at)
 
     @commands.hybrid_command(name="skip", description="跳過目前歌曲")
     async def skip(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
+            return
         if self._game_is_active(ctx):
             await ctx.send("🐺 狼人殺進行中，不能控制遊戲音效。", ephemeral=True)
             return
-
-        player = self._get_player(ctx.guild.id)
-        async with player.lock:
-            control = player.control
-            can_skip = bool(player.current and control and not control.done())
-            if can_skip:
-                control.set_result(EndReason.SKIP)
-
-        if not can_skip:
-            await ctx.send("目前沒有音樂正在播放。", ephemeral=True)
+        error = await self._controller_error(ctx.guild, ctx.author)
+        if error:
+            await ctx.send(error, ephemeral=True)
             return
-
-        voice_client = ctx.guild.voice_client
-        if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
-            voice_client.stop()
-        await ctx.send("⏭️ 已跳過。")
+        ok, message = await self._skip_action(ctx.guild)
+        await ctx.send(message, ephemeral=not ok)
 
     @commands.hybrid_command(name="pause", description="暫停")
     async def pause(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
+            return
         if self._game_is_active(ctx):
             await ctx.send("🐺 狼人殺進行中，不能控制遊戲音效。", ephemeral=True)
             return
-        voice_client = ctx.guild.voice_client
-        if voice_client and voice_client.is_playing():
-            voice_client.pause()
-            await ctx.send("⏸️ 已暫停")
-        else:
-            await ctx.send("目前沒有音樂正在播放。", ephemeral=True)
+        error = await self._controller_error(ctx.guild, ctx.author)
+        if error:
+            await ctx.send(error, ephemeral=True)
+            return
+        ok, message = await self._toggle_pause_action(
+            ctx.guild, desired_paused=True
+        )
+        await ctx.send(message, ephemeral=not ok)
 
     @commands.hybrid_command(name="resume", description="恢復")
     async def resume(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
+            return
         if self._game_is_active(ctx):
             await ctx.send("🐺 狼人殺進行中，不能控制遊戲音效。", ephemeral=True)
             return
-        voice_client = ctx.guild.voice_client
-        if voice_client and voice_client.is_paused():
-            voice_client.resume()
-            await ctx.send("▶️ 繼續播放")
-        else:
-            await ctx.send("目前沒有暫停中的音樂。", ephemeral=True)
+        error = await self._controller_error(ctx.guild, ctx.author)
+        if error:
+            await ctx.send(error, ephemeral=True)
+            return
+        ok, message = await self._toggle_pause_action(
+            ctx.guild, desired_paused=False
+        )
+        await ctx.send(message, ephemeral=not ok)
+
+    @commands.hybrid_command(
+        name="seek",
+        description="跳轉目前歌曲的播放時間",
+    )
+    async def seek(self, ctx: commands.Context, *, position: str) -> None:
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
+            return
+        if self._game_is_active(ctx):
+            await ctx.send("🐺 狼人殺進行中，不能控制遊戲音效。", ephemeral=True)
+            return
+        error = await self._controller_error(ctx.guild, ctx.author)
+        if error:
+            await ctx.send(error, ephemeral=True)
+            return
+        try:
+            target = parse_time_value(position)
+        except ValueError as error:
+            await ctx.send(f"❌ {error}", ephemeral=True)
+            return
+        ok, message = await self._seek_action(ctx.guild, target)
+        await ctx.send(message, ephemeral=not ok)
 
     @commands.hybrid_command(name="stop", description="停止並清空佇列")
     async def stop(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
+            return
         if self._game_is_active(ctx):
             await ctx.send("🐺 狼人殺進行中，不能停止遊戲音效。", ephemeral=True)
             return
-
-        player = self._get_player(ctx.guild.id)
-        async with player.lock:
-            player.command_epoch += 1
-            player.loop_mode = LoopMode.OFF
-            player.queue.clear()
-            player.wake.clear()
-            self._cancel_idle_locked(player)
-            if player.control and not player.control.done():
-                player.control.set_result(EndReason.STOP)
-
-        voice_client = ctx.guild.voice_client
-        if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
-            voice_client.stop()
-
-        async with player.lock:
-            self._arm_idle_locked(ctx.guild, player)
-        await ctx.send("⏹️ 已停止並清空佇列。")
+        if ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
+            error = await self._controller_error(ctx.guild, ctx.author)
+            if error:
+                await ctx.send(error, ephemeral=True)
+                return
+        ok, message = await self._stop_action(ctx.guild)
+        await ctx.send(message, ephemeral=not ok)
 
     @commands.hybrid_command(name="queue", description="查看播放清單")
     async def queue(self, ctx: commands.Context) -> None:
-        player = self._get_player(ctx.guild.id)
-        async with player.lock:
-            current = player.current
-            queued = list(player.queue)
-
-        if not current and not queued:
-            await ctx.send("佇列是空的。")
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
             return
-
-        lines = []
-        if current:
-            lines.append(f"正在播放：**{current.title}**")
-        lines.extend(
-            f"{index}. {track.title}"
-            for index, track in enumerate(queued[:10], start=1)
-        )
-        if len(queued) > 10:
-            lines.append(f"... 以及其他 {len(queued) - 10} 首")
-
-        embed = discord.Embed(
-            title="🎵 播放佇列",
-            description="\n".join(lines),
-            color=discord.Color.blue(),
-        )
+        embed = await self._queue_embed(ctx.guild)
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="loop", description="切換循環模式")
     async def loop(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
+            return
         if self._game_is_active(ctx):
             await ctx.send("🐺 狼人殺進行中，不能變更循環模式。", ephemeral=True)
             return
-
-        player = self._get_player(ctx.guild.id)
-        modes = [LoopMode.OFF, LoopMode.ONE, LoopMode.QUEUE]
-        labels = {
-            LoopMode.OFF: "關閉",
-            LoopMode.ONE: "單曲循環",
-            LoopMode.QUEUE: "佇列循環",
-        }
-        async with player.lock:
-            index = (modes.index(player.loop_mode) + 1) % len(modes)
-            player.loop_mode = modes[index]
-            label = labels[player.loop_mode]
-        await ctx.send(f"🔁 循環模式：{label}")
+        error = await self._controller_error(ctx.guild, ctx.author)
+        if error:
+            await ctx.send(error, ephemeral=True)
+            return
+        ok, message = await self._cycle_loop_action(ctx.guild)
+        await ctx.send(message, ephemeral=not ok)
 
     @commands.hybrid_command(name="leave", description="讓機器人離開")
     async def leave(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("這個指令只能在伺服器內使用。", ephemeral=True)
+            return
         if self._game_is_active(ctx):
             await ctx.send("🐺 狼人殺還沒結束，我不能離開。", ephemeral=True)
             return
-
-        player = self._get_player(ctx.guild.id)
-        async with player.lock:
-            player.command_epoch += 1
-            player.loop_mode = LoopMode.OFF
-            player.queue.clear()
-            player.wake.clear()
-            self._cancel_idle_locked(player)
-            if player.control and not player.control.done():
-                player.control.set_result(EndReason.LEAVE)
-
-        async with player.voice_lock:
-            # Re-read while holding the same lock used by connect(). A pending
-            # /play may have created the VoiceClient after leave incremented
-            # command_epoch.
-            voice_client = ctx.guild.voice_client
-            if not voice_client:
-                disconnected = False
-            else:
-                if voice_client.is_playing() or voice_client.is_paused():
-                    voice_client.stop()
-                await voice_client.disconnect()
-                disconnected = True
-
-        if disconnected:
-            await ctx.send("掰掰！")
-        else:
-            await ctx.send("我不在語音頻道中。", ephemeral=True)
+        if ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
+            error = await self._controller_error(ctx.guild, ctx.author)
+            if error:
+                await ctx.send(error, ephemeral=True)
+                return
+        ok, message = await self._leave_action(ctx.guild)
+        await ctx.send(message, ephemeral=not ok)
 
 
 async def setup(bot: commands.Bot) -> None:
