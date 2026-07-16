@@ -46,6 +46,7 @@ class Witch(Role):
     camp = CAMP_GOD
     description = "技能：解藥(救人)與毒藥(殺人)，每晚限用一瓶。"
     def __init__(self):
+        super().__init__()
         self.has_antidote = True
         self.has_poison = True
 

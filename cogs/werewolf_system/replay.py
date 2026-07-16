@@ -11,14 +11,15 @@ class ReplaySelect(Select):
         self.total_rounds = total_rounds
         
         options = [
-            discord.SelectOption(label="🏠 遊戲總覽", description="查看遊戲整體摘要", value="overview", emoji="🏠"),
-            discord.SelectOption(label="🎭 身分一覽", description="查看所有玩家身分", value="identity", emoji="🎭"),
+            discord.SelectOption(label="遊戲總覽", description="查看遊戲整體摘要", value="overview", emoji="🏠"),
+            discord.SelectOption(label="身分一覽", description="查看所有玩家身分", value="identity", emoji="🎭"),
         ]
         
-        # 動態添加各回合選項
-        for i in range(1, total_rounds + 1):
+        # Discord Select 最多 25 個選項；保留總覽、身分與最近 23 回合。
+        first_round = max(1, total_rounds - 22)
+        for i in range(first_round, total_rounds + 1):
             options.append(discord.SelectOption(
-                label=f"📜 第 {i} 回合", 
+                label=f"第 {i} 回合",
                 description=f"查看第 {i} 回合的事件",
                 value=f"round_{i}",
                 emoji="📜"
@@ -117,18 +118,27 @@ class ReplaySelect(Select):
         # 夜晚事件
         night_events = [e for e in round_events if "night" in e["phase"].lower()]
         if night_events:
-            night_str = ""
-            for e in night_events:
-                night_str += self._format_event(e) + "\n"
-            embed.add_field(name="🌙 夜晚", value=night_str or "無事件", inline=False)
+            night_str = "\n".join(self._format_event(e) for e in night_events)
+            embed.add_field(name="🌙 夜晚", value=night_str[:1024] or "無事件", inline=False)
         
         # 白天事件
         day_events = [e for e in round_events if "day" in e["phase"].lower()]
         if day_events:
-            day_str = ""
-            for e in day_events:
-                day_str += self._format_event(e) + "\n"
-            embed.add_field(name="☀️ 白天", value=day_str or "無事件", inline=False)
+            day_str = "\n".join(self._format_event(e) for e in day_events)
+            embed.add_field(name="☀️ 白天", value=day_str[:1024] or "無事件", inline=False)
+
+        other_events = [
+            event
+            for event in round_events
+            if event not in night_events and event not in day_events
+        ]
+        if other_events:
+            other_str = "\n".join(self._format_event(e) for e in other_events)
+            embed.add_field(
+                name="📌 其他事件",
+                value=other_str[:1024] or "無事件",
+                inline=False,
+            )
         
         if not round_events:
             embed.description = "此回合沒有記錄到事件。"
@@ -141,15 +151,18 @@ class ReplaySelect(Select):
         data = event["data"]
         
         formats = {
-            "wolf_kill": f"🔪 狼人殺害了 **{data.get('target', '?')}**",
+            "wolf_vote": f"🐺 **{data.get('voter', '?')}** 投給 **{data.get('target', '?')}**",
+            "wolf_kill": f"🔪 狼人選擇了 **{data.get('target', '?')}**",
             "seer_check": f"🔮 預言家查驗了 **{data.get('target', '?')}**，結果：{data.get('result', '?')}",
+            "lucky_check": f"✨ 幸運兒查驗了 **{data.get('target', '?')}**，結果：{data.get('result', '?')}",
+            "lucky_poison": f"☠️ 幸運兒毒殺了 **{data.get('target', '?')}**",
+            "lucky_guard": f"🛡️ 幸運兒守護了 **{data.get('target', '?')}**",
             "witch_save": f"💊 女巫救了 **{data.get('target', '?')}**",
             "witch_poison": f"☠️ 女巫毒殺了 **{data.get('target', '?')}**",
             "night_death": f"💀 **{data.get('name', '?')}** 死亡（{data.get('cause', '?')}）",
             "vote_death": f"💀 **{data.get('name', '?')}** 被投票處決",
             "shoot_death": f"🔫 **{data.get('name', '?')}** 被開槍帶走",
-            "merchant_gift": f"🎁 商人給予 **{data.get('target', '?')}** 技能",
-            "guard_protect": f"🛡️ 幸運兒守護了 **{data.get('target', '?')}**",
+            "merchant_gift": f"🎁 商人給予 **{data.get('target', '?')}** {data.get('skill', '?')} 技能",
         }
         
         return formats.get(event_type, f"📝 {event_type}: {data}")

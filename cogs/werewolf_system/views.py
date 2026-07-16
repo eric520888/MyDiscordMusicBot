@@ -7,10 +7,10 @@ class BoardSelect(Select):
     def __init__(self, game_state):
         self.game = game_state
         options = [
-            discord.SelectOption(label="🎲 自動配置", value=BOARD_AUTO, description="依照人數自動平衡"),
-            discord.SelectOption(label="🔮 標準板", value=BOARD_STANDARD, description="無狼王、無商人"),
-            discord.SelectOption(label="👑 狼王板", value=BOARD_WOLF_KING, description="狼隊有一名狼王"),
-            discord.SelectOption(label="💰 奇跡板", value=BOARD_MERCHANT, description="加入奇跡商人與狼王")
+            discord.SelectOption(label="自動配置", value=BOARD_AUTO, description="3 人起，依人數自動平衡", emoji="🎲"),
+            discord.SelectOption(label="標準板", value=BOARD_STANDARD, description="5 人起，無狼王、無商人", emoji="🔮"),
+            discord.SelectOption(label="狼王板", value=BOARD_WOLF_KING, description="5 人起，狼隊有一名狼王", emoji="👑"),
+            discord.SelectOption(label="奇跡板", value=BOARD_MERCHANT, description="7 人起，加入奇跡商人與狼王", emoji="💰")
         ]
         super().__init__(placeholder="📜 選擇板子...", min_values=1, max_values=1, options=options)
 
@@ -26,16 +26,9 @@ class LobbyView(View):
     
     def update_embed(self):
         """產生大廳 Embed"""
-        board_names = {
-            BOARD_AUTO: "🎲 自動配置",
-            BOARD_STANDARD: "🔮 標準板",
-            BOARD_WOLF_KING: "👑 狼王板",
-            BOARD_MERCHANT: "💰 奇跡板"
-        }
-        
         embed = discord.Embed(
             title="🐺 狼人殺大廳",
-            description="點擊下方按鈕加入遊戲！",
+            description=f"點擊下方按鈕加入遊戲，最多 {MAX_PLAYERS} 人。",
             color=discord.Color.dark_red()
         )
         
@@ -46,9 +39,10 @@ class LobbyView(View):
             player_list = "（等待玩家加入...）"
         
         embed.add_field(name=f"👥 玩家 ({len(self.game.players)})", value=player_list, inline=False)
-        embed.add_field(name="📜 板子", value=board_names.get(self.game.board_id, "未知"), inline=True)
+        embed.add_field(name="📜 板子", value=BOARD_NAMES.get(self.game.board_id, "未知"), inline=True)
         embed.add_field(name="🎮 房主", value=self.game.host.display_name, inline=True)
-        embed.set_footer(text="需要至少 3 人才能開始遊戲")
+        minimum = BOARD_MIN_PLAYERS.get(self.game.board_id, 3)
+        embed.set_footer(text=f"目前板子至少需要 {minimum} 人；板子與開始／關閉僅限房主操作")
         
         return embed
 
@@ -133,7 +127,7 @@ class MerchantSkillSelect(Select):
 # --- 4. 女巫選單 ---
 class WitchView(View):
     def __init__(self, game_state, player_obj):
-        super().__init__(timeout=None)
+        super().__init__(timeout=300)
         self.game = game_state
         self.player = player_obj
 
@@ -153,7 +147,7 @@ class WitchView(View):
 # --- 5. 幸運兒選單 (動態生成) ---
 class LuckyView(View):
     def __init__(self, game_state, player_obj, skill_type):
-        super().__init__(timeout=None)
+        super().__init__(timeout=300)
         # 這裡直接復用 NightTargetSelect，只是 action_type 不同
         action_map = {
             "check": "lucky_check",
@@ -173,6 +167,19 @@ class ShooterSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         await self.game.handle_shoot(interaction, self.player, int(self.values[0]))
+
+
+class ShooterView(View):
+    def __init__(self, game_state, player_obj):
+        super().__init__(timeout=300)
+        self.game = game_state
+        self.player = player_obj
+        if game_state.get_alive_players():
+            self.add_item(ShooterSelect(game_state, player_obj))
+
+    @discord.ui.button(label="放棄開槍", style=discord.ButtonStyle.grey, emoji="✋")
+    async def skip(self, interaction: discord.Interaction, button: Button):
+        await self.game.handle_skip_shoot(interaction, self.player)
 
 class VoteButton(Button):
     def __init__(self, game_state, target_player):

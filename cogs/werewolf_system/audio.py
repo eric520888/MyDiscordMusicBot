@@ -24,11 +24,21 @@ class AudioManager:
     @staticmethod
     async def mute_all(ctx, players, mute=True):
         """將所有遊戲玩家靜音或解除靜音。"""
+        states = {player.id: mute for player in players}
+        await AudioManager.set_mute_states(ctx, states)
+
+    @staticmethod
+    async def set_mute_states(ctx, states: dict[int, bool]):
+        """依玩家套用伺服器靜音狀態，並保留個別差異。"""
         tasks = []
-        for player in players:
-            member = ctx.guild.get_member(player.id)
-            if member and member.voice:
-                tasks.append(member.edit(mute=mute))
+        for user_id, muted in states.items():
+            member = ctx.guild.get_member(user_id)
+            if (
+                member
+                and member.voice
+                and bool(member.voice.mute) != bool(muted)
+            ):
+                tasks.append(member.edit(mute=muted))
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
