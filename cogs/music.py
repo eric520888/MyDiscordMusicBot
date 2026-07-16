@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 IDLE_TIMEOUT_SECONDS = 180
 VOICE_CONNECT_TIMEOUT_SECONDS = 30.0
 PANEL_REFRESH_SECONDS = 10.0
+METADATA_RETRY_BUDGET_SECONDS = 45.0
 LOW_RESOURCE_YOUTUBE_ARGS = (
     "--no-js-runtimes",
     "--extractor-args",
@@ -283,6 +285,9 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
             "n challenge solving failed",
             "signature solving failed",
             "only images are available",
+            "requested format is not available",
+            "no video formats found",
+            "no formats found",
         )
     ):
         return PlaybackFailure.JS_CHALLENGE
@@ -299,11 +304,24 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
             "不是机器人",
             "請登入以確認",
             "请登录以确认",
+            "cookies are no longer valid",
+            "cookies have expired",
+            "cookies have been rotated",
+            "account cookies have expired",
             "--cookies-from-browser",
         )
     ):
         return PlaybackFailure.AUTH_REQUIRED
-    if any(marker in lowered for marker in ("http error 429", "too many requests", "rate limit")):
+    if any(
+        marker in lowered
+        for marker in (
+            "http error 403",
+            "http error 429",
+            "status code 403",
+            "too many requests",
+            "rate limit",
+        )
+    ):
         return PlaybackFailure.RATE_LIMIT
     if any(
         marker in lowered
@@ -312,7 +330,13 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
             "timeout",
             "temporary failure in name resolution",
             "connection reset",
+            "connection refused",
+            "failed to establish a new connection",
+            "remote end closed connection",
             "network is unreachable",
+            "unable to download api page",
+            "unable to download webpage",
+            "winerror 10013",
         )
     ):
         return PlaybackFailure.NETWORK
@@ -589,6 +613,19 @@ class GuildPlayer:
 class _YTDLLogger:
     def __init__(self, *, suppress_errors: bool = False) -> None:
         self.suppress_errors = suppress_errors
+        # DownloadError often contains only the final "format unavailable"
+        # line. Keep the warnings that explain the real cause (for example an
+        # n-signature challenge failure) so fallback selection is reliable.
+        self.messages: deque[str] = deque(maxlen=40)
+
+    def _remember(self, message: str) -> str:
+        sanitized = _sanitize_ytdlp_message(message)
+        self.messages.append(sanitized)
+        return sanitized
+
+    @property
+    def summary(self) -> str:
+        return "\n".join(self.messages)
 
     def debug(self, message: str) -> None:
         if message.startswith("[debug]"):
@@ -598,10 +635,14 @@ class _YTDLLogger:
         log.info("yt-dlp: %s", _sanitize_ytdlp_message(message))
 
     def warning(self, message: str) -> None:
-        log.warning("yt-dlp: %s", _sanitize_ytdlp_message(message))
+        sanitized = self._remember(message)
+        if self.suppress_errors:
+            log.debug("yt-dlp recoverable attempt: %s", sanitized)
+        else:
+            log.warning("yt-dlp: %s", sanitized)
 
     def error(self, message: str) -> None:
-        sanitized = _sanitize_ytdlp_message(message)
+        sanitized = self._remember(message)
         if self.suppress_errors:
             log.debug("yt-dlp recoverable attempt: %s", sanitized)
         else:
@@ -1193,9 +1234,13 @@ class Music(commands.Cog):
         if not math.isfinite(start_at) or start_at < 0:
             raise TrackLookupError("指定的開始時間無效。", user_safe=True)
 
+        last_attempt_log = ""
+
         def extract(auth: YTDLAuth | None, *, low_resource: bool) -> Any:
+            nonlocal last_attempt_log
             options = dict(YDL_OPTIONS)
-            options["logger"] = _YTDLLogger(suppress_errors=True)
+            attempt_logger = _YTDLLogger(suppress_errors=True)
+            options["logger"] = attempt_logger
             if low_resource:
                 options["js_runtimes"] = {}
                 options["extractor_args"] = {
@@ -1215,93 +1260,158 @@ class Music(commands.Cog):
                 with yt_dlp.YoutubeDL(options) as ydl:
                     return ydl.extract_info(search_query, download=False)
             finally:
+                last_attempt_log = attempt_logger.summary
                 _remove_cookie_snapshot(cookie_snapshot)
 
         selected_auth: YTDLAuth | None = None
         used_low_resource = False
-        attempts: deque[tuple[YTDLAuth | None, bool]] = deque(
-            [(None, _prefer_low_resource_youtube())]
-        )
+        preferred_low_resource = _prefer_low_resource_youtube()
+        attempts: deque[tuple[YTDLAuth | None, bool, bool]] = deque()
+        queued_attempts: set[tuple[YTDLAuth | None, bool, bool]] = set()
         attempted: set[tuple[YTDLAuth | None, bool]] = set()
+        retried: set[tuple[YTDLAuth | None, bool]] = set()
         auth_candidates_loaded = False
-        last_error: Exception | None = None
-        last_failure = PlaybackFailure.OTHER
+        auth_candidates: list[YTDLAuth] = []
+        best_error: Exception | None = None
+        best_failure = PlaybackFailure.OTHER
+        failure_priority = {
+            PlaybackFailure.OTHER: 0,
+            PlaybackFailure.UNAVAILABLE: 10,
+            PlaybackFailure.NETWORK: 20,
+            PlaybackFailure.JS_CHALLENGE: 30,
+            PlaybackFailure.RATE_LIMIT: 40,
+            PlaybackFailure.AUTH_REQUIRED: 50,
+            PlaybackFailure.COOKIE_CONFIG: 60,
+        }
+
+        def remember_failure(error: Exception, failure: PlaybackFailure) -> None:
+            nonlocal best_error, best_failure
+            if (
+                best_error is None
+                or failure_priority[failure] > failure_priority[best_failure]
+            ):
+                best_error = error
+                best_failure = failure
+
+        def schedule_attempt(
+            auth: YTDLAuth | None,
+            low_resource: bool,
+            *,
+            retry: bool = False,
+            front: bool = False,
+        ) -> None:
+            # android_vr is deliberately anonymous; cookie-authenticated
+            # extraction must use a client that supports account cookies.
+            if low_resource:
+                auth = None
+            key = (auth, low_resource)
+            item = (auth, low_resource, retry)
+            if item in queued_attempts:
+                return
+            if retry:
+                if key in retried:
+                    return
+            elif key in attempted:
+                return
+            queued_attempts.add(item)
+            if front:
+                attempts.appendleft(item)
+            else:
+                attempts.append(item)
+
+        schedule_attempt(None, preferred_low_resource)
+        lookup_started = time.monotonic()
 
         while attempts:
-            auth, low_resource = attempts.popleft()
-            attempt_key = (auth, low_resource)
-            if attempt_key in attempted:
+            if (
+                (attempted or retried)
+                and time.monotonic() - lookup_started
+                >= METADATA_RETRY_BUDGET_SECONDS
+            ):
+                attempts.clear()
                 continue
-            attempted.add(attempt_key)
+            auth, low_resource, is_retry = attempts.popleft()
+            attempt_key = (auth, low_resource)
+            queued_attempts.discard((auth, low_resource, is_retry))
+            if is_retry:
+                if attempt_key in retried:
+                    continue
+                retried.add(attempt_key)
+                # A short bounded delay helps after a transient CDN/API miss
+                # without making /play appear stuck.
+                time.sleep(0.4)
+            else:
+                if attempt_key in attempted:
+                    continue
+                attempted.add(attempt_key)
             try:
                 data = extract(auth, low_resource=low_resource)
             except CookieConfigurationError as error:
-                last_error = error
-                last_failure = PlaybackFailure.COOKIE_CONFIG
-                if attempts:
-                    continue
-                raise TrackLookupError(str(error), last_failure) from error
+                remember_failure(error, PlaybackFailure.COOKIE_CONFIG)
+                continue
             except yt_dlp.utils.DownloadError as error:
-                last_error = error
-                last_failure = _classify_ytdlp_error(str(error))
+                diagnostic = "\n".join(
+                    part for part in (last_attempt_log, str(error)) if part
+                )
+                failure = _classify_ytdlp_error(diagnostic)
+                remember_failure(error, failure)
+
+                if failure in {
+                    PlaybackFailure.JS_CHALLENGE,
+                    PlaybackFailure.RATE_LIMIT,
+                    PlaybackFailure.NETWORK,
+                    PlaybackFailure.UNAVAILABLE,
+                    PlaybackFailure.OTHER,
+                }:
+                    # YouTube clients fail independently. Always give the
+                    # alternate profile one bounded chance in either direction.
+                    schedule_attempt(auth, not low_resource, front=True)
+                    if failure is not PlaybackFailure.UNAVAILABLE:
+                        schedule_attempt(
+                            auth,
+                            low_resource,
+                            retry=True,
+                            front=failure is PlaybackFailure.NETWORK,
+                        )
 
                 if (
-                    last_failure is PlaybackFailure.JS_CHALLENGE
-                    and not low_resource
-                ):
-                    attempts.appendleft((None, True))
-                    continue
-
-                if (
-                    low_resource
-                    and last_failure
-                    in {
-                        PlaybackFailure.UNAVAILABLE,
-                        PlaybackFailure.OTHER,
-                    }
-                ):
-                    attempts.appendleft((auth, False))
-                    continue
-
-                if (
-                    last_failure is PlaybackFailure.AUTH_REQUIRED
+                    failure is PlaybackFailure.AUTH_REQUIRED
                     and allow_cookie_auth
                     and not auth_candidates_loaded
                 ):
+                    if auth is None:
+                        schedule_attempt(None, not low_resource, front=True)
                     try:
                         auth_candidates = _configured_auth_candidates()
                     except CookieConfigurationError as config_error:
-                        raise TrackLookupError(
-                            str(config_error),
+                        remember_failure(
+                            config_error,
                             PlaybackFailure.COOKIE_CONFIG,
-                        ) from config_error
+                        )
+                        auth_candidates = []
                     auth_candidates_loaded = True
-                    if not auth_candidates:
-                        raise TrackLookupError(
-                            "YouTube 要求登入驗證，但目前沒有可用的 cookie 來源。",
-                            PlaybackFailure.AUTH_REQUIRED,
-                            user_safe=True,
-                        ) from error
-                    attempts.extend((candidate, False) for candidate in auth_candidates)
-                    continue
-
-                if (
-                    last_failure
-                    in {
-                        PlaybackFailure.AUTH_REQUIRED,
-                        PlaybackFailure.COOKIE_CONFIG,
-                    }
-                    and attempts
-                ):
-                    continue
-                raise TrackLookupError(str(error), last_failure) from error
+                    for candidate in auth_candidates:
+                        schedule_attempt(candidate, False)
+                continue
             else:
                 selected_auth = auth
                 used_low_resource = low_resource
                 break
         else:
-            assert last_error is not None
-            raise TrackLookupError(str(last_error), last_failure) from last_error
+            assert best_error is not None
+            if (
+                best_failure is PlaybackFailure.AUTH_REQUIRED
+                and auth_candidates_loaded
+                and not auth_candidates
+            ):
+                raise TrackLookupError(
+                    "YouTube 要求登入驗證，但目前沒有可用的 cookie 來源。",
+                    PlaybackFailure.AUTH_REQUIRED,
+                    user_safe=True,
+                ) from best_error
+            raise TrackLookupError(
+                str(best_error), best_failure
+            ) from best_error
 
         info = data
         if data and "entries" in data:
@@ -1914,7 +2024,15 @@ class Music(commands.Cog):
                 and (voice_client.is_playing() or voice_client.is_paused())
             ):
                 voice_client.stop()
-            await voice_client.disconnect()
+            try:
+                await voice_client.disconnect()
+            except Exception as error:
+                log.warning(
+                    "Voice disconnect failed in guild %s; forcing cleanup: %s",
+                    guild.id,
+                    error,
+                )
+                await voice_client.disconnect(force=True)
         return True, "👋 已離開語音頻道。"
 
     async def _panel_toggle_pause(
@@ -2204,14 +2322,19 @@ class Music(commands.Cog):
         expected_epoch: int | None = None,
     ) -> discord.VoiceClient:
         player = self._get_player(guild.id)
+
+        async def ensure_not_cancelled() -> None:
+            if expected_epoch is None:
+                return
+            async with player.lock:
+                if (
+                    expected_epoch != player.command_epoch
+                    or player.external_audio
+                ):
+                    raise PlayCancelled
+
         async with player.voice_lock:
-            if expected_epoch is not None:
-                async with player.lock:
-                    if (
-                        expected_epoch != player.command_epoch
-                        or player.external_audio
-                    ):
-                        raise PlayCancelled
+            await ensure_not_cancelled()
 
             voice_client = guild.voice_client
             created_voice_client = False
@@ -2240,6 +2363,10 @@ class Music(commands.Cog):
                             connected = True
                             break
 
+                # stop/leave may have happened while the voice handshake was
+                # blocking. Do not clean up and then create a brand-new
+                # connection for an already-cancelled /play request.
+                await ensure_not_cancelled()
                 if voice_client is not None and not connected:
                     log.warning("Cleaning up a stale voice handshake in guild %s", guild.id)
                     try:
@@ -2249,6 +2376,7 @@ class Music(commands.Cog):
                     voice_client = None
 
             if voice_client is None:
+                await ensure_not_cancelled()
                 try:
                     voice_client = await voice_channel.connect(
                         timeout=VOICE_CONNECT_TIMEOUT_SECONDS,
@@ -2265,22 +2393,22 @@ class Music(commands.Cog):
                             log.exception("Failed to clean up failed voice connection")
                     raise
             elif voice_client.channel.id != voice_channel.id:
+                await ensure_not_cancelled()
                 if not allow_move:
                     raise VoiceChannelMismatch(
                         f"請先加入機器人目前所在的語音頻道：{voice_client.channel.name}"
                     )
                 await voice_client.move_to(voice_channel)
 
-            if expected_epoch is not None:
-                async with player.lock:
-                    cancelled = (
-                        expected_epoch != player.command_epoch
-                        or player.external_audio
-                    )
-                if cancelled:
-                    if created_voice_client and voice_client.is_connected():
+            try:
+                await ensure_not_cancelled()
+            except PlayCancelled:
+                if created_voice_client and voice_client.is_connected():
+                    try:
                         await voice_client.disconnect()
-                    raise PlayCancelled
+                    except Exception:
+                        await voice_client.disconnect(force=True)
+                raise
 
             return voice_client
 
@@ -2482,9 +2610,9 @@ class Music(commands.Cog):
                 attempt = track
                 start_paused = False
                 seeking = False
-                challenge_fallback_used = (
-                    attempt.ytdlp_extra_args == LOW_RESOURCE_YOUTUBE_ARGS
-                )
+                playback_attempt_counts: dict[
+                    tuple[tuple[str, ...], str | None, tuple[str, ...]], int
+                ] = {}
                 challenge_failure_seen = False
                 playback_auth_config_error: str | None = None
                 if self._is_youtube_url(track.webpage_url):
@@ -2534,6 +2662,15 @@ class Music(commands.Cog):
                         player.control = control
                         player.panel_wake.set()
 
+                    profile_key = (
+                        attempt.auth_args,
+                        attempt.auth_cookiefile,
+                        attempt.ytdlp_extra_args,
+                    )
+                    playback_attempt_counts[profile_key] = (
+                        playback_attempt_counts.get(profile_key, 0) + 1
+                    )
+
                     action = await self._play_track(
                         guild,
                         player,
@@ -2553,31 +2690,6 @@ class Music(commands.Cog):
                         player.started_at = None
                         player.paused_at = None
                         player.paused_total = 0.0
-
-                    if (
-                        action.reason is EndReason.ERROR
-                        and action.failure is PlaybackFailure.JS_CHALLENGE
-                        and action.safe_to_retry
-                        and not challenge_fallback_used
-                    ):
-                        attempt = replace(
-                            attempt,
-                            auth_args=(),
-                            auth_cookiefile=None,
-                            auth_label=None,
-                            ytdlp_extra_args=LOW_RESOURCE_YOUTUBE_ARGS,
-                        )
-                        start_paused = retry_paused
-                        seeking = attempt.start_at > 0
-                        challenge_fallback_used = True
-                        challenge_failure_seen = True
-                        log.warning(
-                            "JS challenge failed for %r in guild %s; "
-                            "retrying with the low-resource YouTube client",
-                            track.title,
-                            guild_id,
-                        )
-                        continue
 
                     if (
                         action.reason is EndReason.ERROR
@@ -2608,6 +2720,84 @@ class Music(commands.Cog):
                             guild_id,
                         )
                         continue
+
+                    if (
+                        action.reason is EndReason.ERROR
+                        and action.safe_to_retry
+                        and action.failure
+                        in {
+                            PlaybackFailure.JS_CHALLENGE,
+                            PlaybackFailure.RATE_LIMIT,
+                            PlaybackFailure.NETWORK,
+                            PlaybackFailure.UNAVAILABLE,
+                            PlaybackFailure.OTHER,
+                        }
+                    ):
+                        if action.failure is PlaybackFailure.JS_CHALLENGE:
+                            challenge_failure_seen = True
+
+                        # A network miss is most likely transient, so retry the
+                        # same pipeline once before changing YouTube clients.
+                        current_count = playback_attempt_counts.get(profile_key, 0)
+                        if (
+                            action.failure is PlaybackFailure.NETWORK
+                            and current_count < 2
+                        ):
+                            await asyncio.sleep(0.4)
+                            start_paused = retry_paused
+                            seeking = attempt.start_at > 0
+                            log.info(
+                                "Retrying transient YouTube network failure for %r "
+                                "in guild %s",
+                                track.title,
+                                guild_id,
+                            )
+                            continue
+
+                        using_low_resource = (
+                            attempt.ytdlp_extra_args == LOW_RESOURCE_YOUTUBE_ARGS
+                        )
+                        if using_low_resource:
+                            alternate = replace(
+                                attempt,
+                                ytdlp_extra_args=(),
+                            )
+                            alternate_label = "default YouTube client"
+                        else:
+                            alternate = replace(
+                                attempt,
+                                auth_args=(),
+                                auth_cookiefile=None,
+                                auth_label=None,
+                                ytdlp_extra_args=LOW_RESOURCE_YOUTUBE_ARGS,
+                            )
+                            alternate_label = "low-resource YouTube client"
+                        alternate_key = (
+                            alternate.auth_args,
+                            alternate.auth_cookiefile,
+                            alternate.ytdlp_extra_args,
+                        )
+                        # Each profile gets at most two pre-audio attempts. This
+                        # permits a transient recovery without profile ping-pong.
+                        if playback_attempt_counts.get(alternate_key, 0) < 2:
+                            attempt = alternate
+                            start_paused = retry_paused
+                            seeking = attempt.start_at > 0
+                            log.warning(
+                                "YouTube playback setup failed for %r in guild %s "
+                                "(%s); retrying with the %s",
+                                track.title,
+                                guild_id,
+                                action.failure.name,
+                                alternate_label,
+                            )
+                            continue
+
+                        if current_count < 2:
+                            await asyncio.sleep(0.4)
+                            start_paused = retry_paused
+                            seeking = attempt.start_at > 0
+                            continue
 
                     if action.reason is not EndReason.SEEK:
                         if (
@@ -2655,6 +2845,8 @@ class Music(commands.Cog):
                     attempt = replace(attempt, start_at=action.seek_to)
                     start_paused = action.keep_paused
                     seeking = True
+                    playback_attempt_counts.clear()
+                    challenge_failure_seen = False
 
                 async with player.lock:
                     player.current = None
@@ -2863,21 +3055,32 @@ class Music(commands.Cog):
             await ctx.send("❌ 你必須先加入一個語音頻道！", ephemeral=True)
             return
 
-        if ctx.interaction:
-            await ctx.defer()
-
-        start_label = (
-            f"（從 `{format_time_value(start_at)}` 開始）" if start_at > 0 else ""
-        )
-        searching_message = await ctx.send(
-            f"🔍 正在搜尋：`{query}` {start_label}..."
-        )
         player = self._get_player(ctx.guild.id)
-
         async with player.lock:
             invocation_epoch = player.command_epoch
             player.pending_searches += 1
             self._cancel_idle_locked(player)
+
+        # Register the request before the first response await. Otherwise a
+        # stop/leave issued while Discord is sending "searching" cannot cancel
+        # this /play, and the bot may connect again after it was told to leave.
+        try:
+            if ctx.interaction:
+                await ctx.defer()
+
+            start_label = (
+                f"（從 `{format_time_value(start_at)}` 開始）"
+                if start_at > 0
+                else ""
+            )
+            searching_message = await ctx.send(
+                f"🔍 正在搜尋：`{query}` {start_label}..."
+            )
+        except BaseException:
+            async with player.lock:
+                player.pending_searches = max(0, player.pending_searches - 1)
+                self._arm_idle_locked(ctx.guild, player)
+            raise
 
         result_message: str | None = "❌ 點歌失敗，請稍後再試。"
         result_embed: discord.Embed | None = None
@@ -2918,12 +3121,47 @@ class Music(commands.Cog):
                         return
                     allow_move = player.current is None and not player.queue
 
-                await self._ensure_voice(
+                had_voice_connection = bool(
+                    ctx.guild.voice_client
+                    and ctx.guild.voice_client.is_connected()
+                )
+                connected_voice = await self._ensure_voice(
                     ctx.guild,
                     voice_state.channel,
                     allow_move=allow_move,
                     expected_epoch=invocation_epoch,
                 )
+
+                # The requester can leave or switch channels during Discord's
+                # voice handshake. Never start playing alone in the old room.
+                current_voice = ctx.author.voice
+                if (
+                    not current_voice
+                    or not current_voice.channel
+                    or current_voice.channel.id != voice_state.channel.id
+                ):
+                    result_message = (
+                        "⚠️ 你在連線期間離開或切換了語音頻道，這次點歌已取消。"
+                    )
+                    async with player.lock:
+                        disconnect_unused = (
+                            not had_voice_connection
+                            and player.current is None
+                            and not player.queue
+                            and player.pending_searches == 1
+                        )
+                    if disconnect_unused:
+                        async with player.voice_lock:
+                            if (
+                                ctx.guild.voice_client is connected_voice
+                                and not connected_voice.is_playing()
+                                and not connected_voice.is_paused()
+                            ):
+                                try:
+                                    await connected_voice.disconnect()
+                                except Exception:
+                                    await connected_voice.disconnect(force=True)
+                    return
 
                 async with player.lock:
                     if (
@@ -3001,11 +3239,19 @@ class Music(commands.Cog):
                 result_message = "❌ 影片不可用、為私人影片，或受到地區限制。"
             else:
                 detail = str(error)
-                result_message = (
-                    f"❌ {discord.utils.escape_mentions(detail)}"
-                    if error.user_safe and detail and len(detail) <= 180
-                    else "❌ 找不到可播放的歌曲，請換一個關鍵字或網址。"
-                )
+                if error.user_safe and detail and len(detail) <= 180:
+                    result_message = (
+                        f"❌ {discord.utils.escape_mentions(detail)}"
+                    )
+                elif self._is_youtube_url(query):
+                    result_message = (
+                        "⚠️ YouTube 暫時無法取得這支影片的音訊；"
+                        "已自動重試兩種播放模式，請稍後再試。"
+                    )
+                else:
+                    result_message = (
+                        "❌ 找不到可播放的歌曲，請換一個關鍵字或網址。"
+                    )
         except yt_dlp.utils.DownloadError as error:
             log.warning(
                 "Unexpected yt-dlp lookup failure for %r: %s",
