@@ -1,7 +1,49 @@
+from collections import Counter
+
 import discord
 from discord.ui import View, Select, Button
 from .const import *
-from .roles import AwakenedHunter
+from .roles import (
+    AwakenedGuard,
+    AwakenedHunter,
+    AwakenedWhiteWolfKing,
+    CrimsonApostle,
+    Knight,
+)
+
+
+CAMP_STYLE = {
+    CAMP_WOLF: ("🐺", discord.Color.dark_red()),
+    CAMP_GOD: ("🔮", discord.Color.blurple()),
+    CAMP_VILLAGER: ("🌾", discord.Color.green()),
+    CAMP_THIRD: ("🎭", discord.Color.gold()),
+}
+
+
+def _split_board_name(spec):
+    parts = spec.name.split(" ", 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else ("🎲", spec.name)
+
+
+def _composition_by_camp(roles):
+    counts = Counter(roles)
+    lines = []
+    for camp in (CAMP_WOLF, CAMP_GOD, CAMP_VILLAGER, CAMP_THIRD):
+        camp_roles = [
+            f"{role}×{count}" if count > 1 else role
+            for role, count in counts.items()
+            if ROLE_CATALOG[role].camp == camp
+        ]
+        if camp_roles:
+            emoji, _ = CAMP_STYLE[camp]
+            lines.append(f"{emoji} **{camp.replace('陣營', '')}**｜{'、'.join(camp_roles)}")
+    return "\n".join(lines)
+
+
+def _progress_bar(current, required, width=10):
+    ratio = min(1, current / required) if required else 1
+    filled = round(width * ratio)
+    return "▰" * filled + "▱" * (width - filled)
 
 # --- 1. 大廳板子選擇 ---
 class BoardSelect(Select):
@@ -15,9 +57,10 @@ class BoardSelect(Select):
         )]
         options.extend(
             discord.SelectOption(
-                label=BOARD_SPECS[board_id].name.split(" ", 1)[-1],
+                label=_split_board_name(BOARD_SPECS[board_id])[1],
                 value=board_id,
                 description=f"12 人｜{BOARD_SPECS[board_id].description}",
+                emoji=_split_board_name(BOARD_SPECS[board_id])[0],
             )
             for board_id in OFFICIAL_BOARD_IDS
         )
@@ -35,24 +78,42 @@ class LobbyView(View):
     
     def update_embed(self):
         """產生大廳 Embed"""
+        minimum = BOARD_MIN_PLAYERS.get(self.game.board_id, 3)
+        count = len(self.game.players)
+        ready = count == minimum if self.game.board_id in BOARD_SPECS else count >= minimum
+        status = "✅ 人數已就緒" if ready else "⏳ 等待玩家"
         embed = discord.Embed(
-            title="🐺 狼人殺大廳",
-            description=f"點擊下方按鈕加入遊戲，最多 {MAX_PLAYERS} 人。",
-            color=discord.Color.dark_red()
+            title="🐺 狼人殺｜互動遊戲大廳",
+            description=(
+                f"**{status}**\n"
+                f"`{_progress_bar(count, minimum)}` **{count}/{minimum}**\n"
+                "使用下方按鈕加入；房主可從選單即時切換板子。"
+            ),
+            color=discord.Color.green() if ready else discord.Color.dark_red(),
         )
         
         # 玩家列表
         if self.game.players:
-            player_list = "\n".join([f"• {p.display_name}" for p in self.game.players])
+            player_list = "\n".join(
+                f"`{index:02}` {p.display_name}"
+                for index, p in enumerate(self.game.players, start=1)
+            )
         else:
             player_list = "（等待玩家加入...）"
         
-        embed.add_field(name=f"👥 玩家 ({len(self.game.players)})", value=player_list, inline=False)
-        embed.add_field(name="📜 板子", value=BOARD_NAMES.get(self.game.board_id, "未知"), inline=True)
+        embed.add_field(name=f"👥 玩家名單｜{count} 人", value=player_list, inline=False)
+        embed.add_field(name="📜 目前板子", value=BOARD_NAMES.get(self.game.board_id, "未知"), inline=True)
         embed.add_field(name="🎮 房主", value=self.game.host.display_name, inline=True)
-        minimum = BOARD_MIN_PLAYERS.get(self.game.board_id, 3)
+        if self.game.board_id in BOARD_SPECS:
+            spec = BOARD_SPECS[self.game.board_id]
+            embed.add_field(
+                name="🧩 陣容預覽",
+                value=_composition_by_camp(spec.roles),
+                inline=False,
+            )
+            embed.add_field(name="✨ 板子特色", value=spec.description, inline=False)
         count_text = f"固定需要 {minimum} 人" if self.game.board_id in BOARD_SPECS else f"至少需要 {minimum} 人"
-        embed.set_footer(text=f"目前板子{count_text}；板子與開始／關閉僅限房主操作")
+        embed.set_footer(text=f"{count_text}｜切板、開始與關閉僅限房主")
         
         return embed
 
@@ -133,6 +194,10 @@ class NightTargetSelect(Select):
             "double_check": "🔮 同時選擇兩名玩家...",
             "fate_bind": "🦋 同時選擇兩名玩家...",
             "time_wave": "🌓 選擇作用目標...",
+            "choose_idol": "💞 選擇你的偶像...",
+            "convert": "🗿 選擇相鄰轉化者...",
+            "awakened_guard": "🛡️ 選擇覺醒守護目標...",
+            "dream_speech": "🌌 選擇夢語者...",
         }
         ph = labels.get(action_type, ph)
 
@@ -269,33 +334,84 @@ class VoteButton(Button):
     async def callback(self, interaction: discord.Interaction):
         await self.game.handle_vote(interaction, self.target_id)
 
+
+class DayActionSelect(Select):
+    def __init__(self, game_state):
+        self.game = game_state
+        alive = game_state.get_alive_players()
+        options = [
+            discord.SelectOption(
+                label="提議結束遊戲",
+                value="stop_game",
+                description="超過半數存活玩家同意後強制結束",
+                emoji="🏳️",
+            )
+        ]
+        if any(
+            isinstance(p.role, Knight) and not p.role.disabled and not p.role.used_skill
+            for p in alive
+        ):
+            options.append(discord.SelectOption(label="騎士決鬥", value="knight_duel", emoji="⚔️"))
+        if any(
+            isinstance(p.role, CrimsonApostle)
+            and not p.role.disabled
+            and not p.role.used_skill
+            for p in alive
+        ):
+            options.append(discord.SelectOption(label="赤月自曝", value="crimson_reveal", emoji="🌕"))
+        if any(
+            isinstance(p.role, AwakenedGuard)
+            and not p.role.disabled
+            and p.role.state.get("last_guard_round") != game_state.round_num
+            for p in alive
+        ):
+            options.append(discord.SelectOption(label="覺醒守護", value="awakened_guard", emoji="🛡️"))
+        if any(
+            isinstance(p.role, AwakenedWhiteWolfKing) and not p.role.used_skill
+            for p in alive
+        ):
+            options.append(discord.SelectOption(label="白狼引爆", value="awakened_white_wolf", emoji="🩸"))
+        if any(
+            p.role.can_self_destruct
+            and not p.role.state.get("self_destruct_attempted")
+            for p in alive
+        ):
+            options.append(discord.SelectOption(label="狼人自爆", value="wolf_self_destruct", emoji="💥"))
+        super().__init__(
+            placeholder="☀️ 白天特殊行動...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        action = self.values[0]
+        if action == "stop_game":
+            return await self.game.handle_stop_vote(interaction)
+        if action == "crimson_reveal":
+            return await self.game.handle_crimson_reveal(interaction)
+        if action == "wolf_self_destruct":
+            return await self.game.handle_wolf_self_destruct(interaction)
+        await self.game.send_day_skill_select(interaction, action)
+
 class VotingView(View):
     def __init__(self, game_state):
         super().__init__(timeout=None)
         self.game = game_state
         for p in game_state.get_alive_players():
             self.add_item(VoteButton(game_state, p))
-
-    @discord.ui.button(label="🏳️ 投票結束遊戲", style=discord.ButtonStyle.danger, row=4)
-    async def stop_game(self, interaction: discord.Interaction, button: Button):
-        await self.game.handle_stop_vote(interaction)
-
-    @discord.ui.button(label="⚔️ 騎士決鬥", style=discord.ButtonStyle.primary, row=4)
-    async def knight_duel(self, interaction: discord.Interaction, button: Button):
-        await self.game.send_day_skill_select(interaction, "knight_duel")
-
-    @discord.ui.button(label="🌕 赤月自曝", style=discord.ButtonStyle.danger, row=4)
-    async def crimson_reveal(self, interaction: discord.Interaction, button: Button):
-        await self.game.handle_crimson_reveal(interaction)
+        self.add_item(DayActionSelect(game_state))
 
 
 class BoardRulesSelect(Select):
     def __init__(self):
         options = [
             discord.SelectOption(
-                label=spec.name.split(" ", 1)[-1],
+                label=_split_board_name(spec)[1],
                 value=board_id,
                 description=spec.description,
+                emoji=_split_board_name(spec)[0],
             )
             for board_id, spec in BOARD_SPECS.items()
         ]
@@ -313,23 +429,94 @@ def create_board_rules_embed(board_id):
     counts = {}
     for role in spec.roles:
         counts[role] = counts.get(role, 0) + 1
-    composition = "、".join(
-        f"{count}×{role}" if count > 1 else role
-        for role, count in counts.items()
-    )
     embed = discord.Embed(
         title=f"📚 {spec.name}",
-        description=f"**固定配置：** {composition}\n\n**特色：** {spec.description}",
+        description=(
+            f"### 12 人官方板型\n"
+            f"{_composition_by_camp(spec.roles)}\n\n"
+            f"✨ **核心玩法**｜{spec.description}"
+        ),
         color=discord.Color.dark_purple(),
     )
     for role in counts:
         info = ROLE_CATALOG[role]
+        emoji, _ = CAMP_STYLE[info.camp]
         embed.add_field(
-            name=f"{role}｜{info.camp}",
+            name=f"{emoji} {role}",
             value=info.description[:1024],
-            inline=False,
+            inline=True,
         )
-    embed.set_footer(text="配置與技能依網易《狼人殺官方》12 人進階／競技板型整理")
+    embed.set_footer(
+        text=f"角色種類 {len(counts)}｜配置與技能依網易《狼人殺官方》正式上線板型整理"
+    )
+    return embed
+
+
+def create_identity_embed(game, player):
+    emoji, color = CAMP_STYLE.get(
+        player.role.camp, ("❔", discord.Color.greyple())
+    )
+    embed = discord.Embed(
+        title=f"{emoji} 你的身分｜{player.role.name}",
+        description=player.role.description,
+        color=color,
+    )
+    embed.add_field(name="陣營", value=player.role.camp, inline=True)
+    embed.add_field(
+        name="存活狀態",
+        value="🟢 存活" if player.status == "alive" else "⚫ 已出局",
+        inline=True,
+    )
+    embed.add_field(name="目前回合", value=f"第 {max(game.round_num, 1)} 輪", inline=True)
+    return embed
+
+
+def create_game_status_embed(game):
+    phase_names = {
+        PHASE_WAITING: "⏳ 大廳等待中",
+        PHASE_STARTING: "🎴 身分確認",
+        PHASE_NIGHT_1: "🌃 上半夜行動",
+        PHASE_NIGHT_2: "🌙 下半夜行動",
+        PHASE_DAY: "☀️ 白天討論／投票",
+        PHASE_SHOOT: "🔫 出局技能結算",
+        PHASE_ENDED: "🏁 遊戲已結束",
+    }
+    alive = game.get_alive_players()
+    dead = [player for player in game.players if player.status != "alive"]
+    color = (
+        discord.Color.dark_blue()
+        if game.phase in {PHASE_NIGHT_1, PHASE_NIGHT_2}
+        else discord.Color.gold()
+        if game.phase == PHASE_DAY
+        else discord.Color.dark_red()
+    )
+    embed = discord.Embed(
+        title="🐺 狼人殺｜即時戰況",
+        description=phase_names.get(game.phase, game.phase),
+        color=color,
+    )
+    embed.add_field(
+        name="📜 板子",
+        value=BOARD_NAMES.get(game.board_id, "未知"),
+        inline=True,
+    )
+    embed.add_field(name="🔄 回合", value=f"第 {game.round_num} 輪", inline=True)
+    embed.add_field(
+        name="👥 存活",
+        value=f"{len(alive)} / {len(game.players)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="🟢 存活玩家",
+        value="、".join(player.display_name for player in alive) or "無",
+        inline=False,
+    )
+    embed.add_field(
+        name="⚫ 已出局玩家",
+        value="、".join(player.display_name for player in dead) or "尚無",
+        inline=False,
+    )
+    embed.set_footer(text="戰況卡不會公開尚未揭曉的角色身分")
     return embed
 
 

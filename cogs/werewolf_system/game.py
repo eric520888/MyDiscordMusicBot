@@ -1,5 +1,6 @@
 import discord
 import asyncio
+import copy
 import random
 import logging
 from collections import Counter
@@ -14,6 +15,7 @@ from .views import (
     ShooterView,
     VotingView,
     WitchView,
+    create_identity_embed,
 )
 from .audio import AudioManager
 from .skills import SkillManager # [新增] 引入 SkillManager
@@ -60,6 +62,10 @@ class WerewolfGame:
         self.good_skills_sealed = False
         self.crimson_last_stand = None
         self.last_vote_voters = {}
+        self.awakened_guard_target = None
+        self.awakened_guard_period = None
+        self.pending_awakened_white_wolf = None
+        self.pending_role_notices = []
         
         # 投票數據
         self.votes = {}     # {user_id: target_id}
@@ -79,6 +85,7 @@ class WerewolfGame:
         # 狀態轉換與資源清理
         self._state_lock = asyncio.Lock()
         self._ending = False
+        self._resolving_day = False
         self._vote_tally_started = False
         self._original_mute_states = {}
 
@@ -128,11 +135,21 @@ class WerewolfGame:
             "confuse", "devour", "light_guard", "night_servant",
             "mirror_check", "mimic", "double_check", "fate_bind",
             "knight_duel", "claw_pass", "seer_check", "dream", "mimic_witch",
+            "choose_idol", "dream_speech", "convert",
         }
         if action_type in no_self:
             targets = [target for target in targets if target.id != actor.id]
         if action_type == "wolf_kill":
-            targets = [target for target in targets if target.role.camp != CAMP_WOLF]
+            self_kill_wolves = (
+                AwakenedGargoyle,
+                AwakenedWolfKing,
+                AwakenedWhiteWolfKing,
+            )
+            targets = [
+                target for target in targets
+                if target.role.camp != CAMP_WOLF
+                or isinstance(target.role, self_kill_wolves)
+            ]
         if action_type in {"charm", "awakened_charm"}:
             targets = [target for target in targets if target.role.camp != CAMP_WOLF]
         if action_type == "wolf_witch_check":
@@ -141,12 +158,22 @@ class WerewolfGame:
             targets = [target for target in targets if target.role.camp != CAMP_WOLF]
         if action_type == "claw_pass":
             targets = [target for target in targets if target.role.camp == CAMP_WOLF]
+        if action_type == "convert":
+            actor_index = self.players.index(actor)
+            adjacent_ids = {
+                self.players[(actor_index - 1) % len(self.players)].id,
+                self.players[(actor_index + 1) % len(self.players)].id,
+            }
+            targets = [target for target in targets if target.id in adjacent_ids]
         if action_type in {"exact_check", "mirror_check"}:
             targets = [
                 target for target in targets
                 if target.id not in actor.role.checked_targets
             ]
-        if action_type in {"guard", "fear", "confuse", "devour", "light_guard"}:
+        if action_type in {
+            "guard", "fear", "confuse", "devour", "light_guard",
+            "awakened_guard", "dream_speech",
+        }:
             if actor.role.last_target is not None:
                 previous = actor.role.last_target
                 previous_ids = set(previous) if isinstance(previous, list) else {previous}
@@ -159,6 +186,149 @@ class WerewolfGame:
         if action_type == "wolf_kill" and self.extra_wolf_kill:
             return 2
         return 1 + int(self.night_action_bonuses.get(player.id, 0) > 0)
+
+    def _is_awakened_guarded(self, player):
+        return bool(
+            player
+            and player.status == "alive"
+            and self.awakened_guard_target == player.id
+            and self.awakened_guard_period in {"night", "day"}
+        )
+
+    def _target_acted_tonight(self, player_id):
+        if any(
+            actor_id == player_id and not data.get("skipped")
+            for (actor_id, _), data in self.role_actions.items()
+        ):
+            return True
+        return self.phase2_action_counts[player_id] > 0
+
+    def _resolve_awakened_lonely_idol(self, dead_player, cause):
+        """依偶像死因讓覺醒孤獨少女轉狼或繼承偶像。"""
+        for girl in list(self.get_alive_role(AwakenedLonelyGirl)):
+            if girl.role.disabled:
+                continue
+            if girl.role.state.get("idol_id") != dead_player.id:
+                continue
+            if cause == "投票處決":
+                girl.role.camp = CAMP_WOLF
+                girl.role.night_action = None
+                girl.role.joins_wolf_vote = True
+                girl.role.isolated_wolf = False
+                girl.role.can_self_destruct = True
+                girl.role.description = "偶像遭放逐，已覺醒為狼人並加入狼隊。"
+                notice = f"💔 {girl.display_name} 的偶像遭放逐，覺醒孤獨少女轉化為狼人！"
+                result = "轉化為狼人"
+            else:
+                inherited_role = copy.deepcopy(dead_player.role)
+                inherited_role.state["inherited_by_awakened_lonely_girl"] = True
+                girl.role = inherited_role
+                notice = (
+                    f"💞 {girl.display_name} 的偶像以非放逐方式出局，"
+                    f"她繼承了 **{dead_player.role.name}** 的身分與技能。"
+                )
+                result = f"繼承{dead_player.role.name}"
+            self.pending_role_notices.append(notice)
+            self.log_event(
+                "awakened_lonely_girl",
+                {"player": girl.display_name, "idol": dead_player.display_name, "result": result},
+            )
+
+    async def _collect_awakened_dreamer_kills(self):
+        """天亮前讓覺醒攝夢人得知行動結果，第二夜起決定是否處決。"""
+        entries = [
+            (self.get_player(actor_id), data)
+            for (actor_id, action_type), data in self.role_actions.items()
+            if action_type == "dream_speech" and not data.get("skipped")
+        ]
+        kill_targets = set()
+        for dreamer, data in entries:
+            target = self.get_player(data["target"])
+            if not dreamer or dreamer.status != "alive" or not target:
+                continue
+            acted = self._target_acted_tonight(target.id)
+            dreamer.role.state["last_dream_target"] = target.id
+            dreamer.role.state["last_dream_acted"] = acted
+            if self.round_num < 2:
+                try:
+                    await dreamer.user.send(
+                        f"🌌 夢語結果：**{target.display_name}** 本夜"
+                        f"{'有' if acted else '沒有'}發動行動。第一夜尚不能令其出局。"
+                    )
+                except (AttributeError, discord.HTTPException):
+                    pass
+                self.log_event(
+                    "dream_speech_result",
+                    {
+                        "dreamer": dreamer.display_name,
+                        "target": target.display_name,
+                        "acted": acted,
+                        "kill": False,
+                    },
+                )
+                continue
+            decision = asyncio.get_running_loop().create_future()
+            view = discord.ui.View(timeout=45)
+            kill_button = discord.ui.Button(
+                label="令其夢語出局", style=discord.ButtonStyle.danger, emoji="🌌"
+            )
+            spare_button = discord.ui.Button(
+                label="本夜放過", style=discord.ButtonStyle.secondary, emoji="✨"
+            )
+
+            async def decide(interaction, should_kill):
+                if interaction.user.id != dreamer.id or decision.done():
+                    return await interaction.response.send_message(
+                        "❌ 只有本夜的覺醒攝夢人能決定。", ephemeral=True
+                    )
+                decision.set_result(should_kill)
+                await interaction.response.send_message(
+                    f"🌌 **{target.display_name}** 本夜"
+                    f"{'有' if acted else '沒有'}發動行動；"
+                    f"你選擇{'令其出局' if should_kill else '放過對方'}。",
+                    ephemeral=True,
+                )
+                view.stop()
+
+            async def kill_callback(interaction):
+                await decide(interaction, True)
+
+            async def spare_callback(interaction):
+                await decide(interaction, False)
+
+            kill_button.callback = kill_callback
+            spare_button.callback = spare_callback
+            view.add_item(kill_button)
+            view.add_item(spare_button)
+            try:
+                await dreamer.user.send(
+                    f"🌌 **{target.display_name}** 本夜"
+                    f"{'有' if acted else '沒有'}發動行動。請在 45 秒內決定：",
+                    view=view,
+                )
+            except (AttributeError, discord.HTTPException):
+                await self.channel.send(
+                    "🌌 夢語已回響，覺醒攝夢人請在 45 秒內完成秘密決定。",
+                    view=view,
+                )
+            try:
+                should_kill = await asyncio.wait_for(decision, timeout=45)
+            except asyncio.TimeoutError:
+                should_kill = False
+                view.stop()
+                await self.channel.send("⌛ 覺醒攝夢人逾時，本夜不發動夢語出局。")
+            if should_kill:
+                kill_targets.add(target.id)
+            self.log_event(
+                "dream_speech_result",
+                {
+                    "dreamer": dreamer.display_name,
+                    "target": target.display_name,
+                    "acted": acted,
+                    "kill": should_kill,
+                },
+            )
+        return kill_targets
 
     async def _is_host_or_owner(self, user):
         return user.id == self.host.id or await self.bot.is_owner(user)
@@ -364,7 +534,17 @@ class WerewolfGame:
         if self.phase != PHASE_STARTING:
             await self._release_game_audio()
             return
-        await self.channel.send("🎲 **請確認身分** (10秒後自動入夜)", view=IdentityView(self))
+        await self.channel.send(
+            embed=discord.Embed(
+                title="🎴 身分確認階段",
+                description=(
+                    "點擊下方按鈕查看自己的身分卡與專屬情報。\n"
+                    "⏱️ **10 秒後自動進入第一夜**"
+                ),
+                color=discord.Color.gold(),
+            ),
+            view=IdentityView(self),
+        )
         
         # 自動入夜：等待 10 秒讓玩家確認身分
         await asyncio.sleep(10)
@@ -386,6 +566,7 @@ class WerewolfGame:
             for player, role_name in zip(self.players, role_list):
                 player.role = create_role(role_name)
                 player.status = "alive"
+            self._prepare_assigned_role_state()
             return True
 
         if n < minimum:
@@ -420,8 +601,17 @@ class WerewolfGame:
         for i, p in enumerate(self.players):
             p.role = create_role(role_list[i]) 
             p.status = "alive"
-            
+
+        self._prepare_assigned_role_state()
         return True
+
+    def _prepare_assigned_role_state(self):
+        """建立需要依本局座位或隊友決定的初始私密情報。"""
+        wolves = [player for player in self.players if player.role.camp == CAMP_WOLF]
+        for phantom in self.get_players_by_role(FragrancePhantom):
+            candidates = [wolf for wolf in wolves if wolf.id != phantom.id]
+            if candidates:
+                phantom.role.state["known_wolf_id"] = random.choice(candidates).id
 
     async def create_wolf_thread(self):
         if self.phase not in {PHASE_STARTING, PHASE_NIGHT_1}:
@@ -473,10 +663,14 @@ class WerewolfGame:
                 "❌ 你不是這場遊戲的玩家。", ephemeral=True
             )
 
-        msg = f"你的身分是：**{p.role.name}** ({p.role.camp})\n{p.role.description}"
+        embed = create_identity_embed(self, p)
         if p.role.camp == CAMP_WOLF:
             if p.role.isolated_wolf:
-                msg += "\n🌑 你是孤立狼神，開局不會得知狼隊，也不進入密謀區。"
+                embed.add_field(
+                    name="🌑 狼隊情報",
+                    value="目前尚未與狼隊相認，也不會進入密謀區。",
+                    inline=False,
+                )
             else:
                 teammates = [
                     member.display_name for member in self.players
@@ -484,21 +678,72 @@ class WerewolfGame:
                     and not member.role.isolated_wolf
                     and member.id != p.id
                 ]
-                msg += f"\n🐺 隊友: {', '.join(teammates) if teammates else '無 (孤狼)'}"
-                msg += "\n💬 請留意 **狼人密謀區** 討論串。"
+                embed.add_field(
+                    name="🐺 狼隊情報",
+                    value=(
+                        f"隊友：{', '.join(teammates) if teammates else '無（孤狼）'}\n"
+                        "💬 夜晚請留意狼人密謀區。"
+                    ),
+                    inline=False,
+                )
 
         if isinstance(p.role, Gravekeeper):
             if self.last_exiled_camp:
                 result = "狼人" if self.last_exiled_camp == CAMP_WOLF else "好人"
-                msg += f"\n🪦 上一位被放逐者 **{self.last_exiled_name}** 屬於：**{result}**。"
+                embed.add_field(
+                    name="🪦 守墓情報",
+                    value=f"上一位被放逐者 **{self.last_exiled_name}** 屬於：**{result}**。",
+                    inline=False,
+                )
             else:
-                msg += "\n🪦 目前還沒有上一位被放逐者可查。"
+                embed.add_field(name="🪦 守墓情報", value="目前沒有可查的放逐者。", inline=False)
         if isinstance(p.role, AwakenedWitch):
-            msg += f"\n🧪 剩餘調毒次數：**{p.role.poison_recipes}**。"
+            embed.add_field(name="🧪 技能資源", value=f"剩餘調毒：**{p.role.poison_recipes}** 次", inline=False)
         if isinstance(p.role, AwakenedWolfKing):
-            msg += f"\n🐾 自己持有狼王爪：**{p.role.shoot_count}** 枚。"
+            embed.add_field(name="🐾 技能資源", value=f"持有狼王爪：**{p.role.shoot_count}** 枚", inline=False)
+        if isinstance(p.role, FragrancePhantom):
+            known_wolf = self.get_player(p.role.state.get("known_wolf_id"))
+            embed.add_field(
+                name="🦋 尋香情報",
+                value=(
+                    f"你感知到的狼人：**{known_wolf.display_name}**"
+                    if known_wolf else "沒有感知到其他狼人"
+                ),
+                inline=False,
+            )
+        if isinstance(p.role, AwakenedLonelyGirl):
+            idol = self.get_player(p.role.state.get("idol_id"))
+            embed.add_field(
+                name="💞 偶像",
+                value=idol.display_name if idol else "尚未選擇",
+                inline=False,
+            )
+        if isinstance(p.role, AwakenedGuard):
+            target = self.get_player(self.awakened_guard_target)
+            embed.add_field(
+                name="🛡️ 本日守護",
+                value=target.display_name if target and p.role.state.get("last_guard_round") == self.round_num else "尚未發動",
+                inline=False,
+            )
+        if isinstance(p.role, AwakenedDreamer):
+            target = self.get_player(p.role.last_target)
+            embed.add_field(
+                name="🌌 上一位夢語者",
+                value=target.display_name if target else "尚無",
+                inline=False,
+            )
+            result_target = self.get_player(p.role.state.get("last_dream_target"))
+            if result_target:
+                embed.add_field(
+                    name="🌠 最近夢語結果",
+                    value=(
+                        f"{result_target.display_name} 本夜"
+                        f"{'有' if p.role.state.get('last_dream_acted') else '沒有'}發動行動"
+                    ),
+                    inline=False,
+                )
 
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def force_night(self, interaction):
         if not await self._is_host_or_owner(interaction.user):
@@ -544,6 +789,17 @@ class WerewolfGame:
             self.votes = {}
             self.stop_votes = set()
             self._vote_tally_started = False
+            self.awakened_guard_target = None
+            self.awakened_guard_period = None
+            self.pending_awakened_white_wolf = None
+
+            # 覺醒石像鬼的轉化者要到下一夜才與狼隊相認並加入狼刀。
+            for player in self.get_alive_players():
+                reveal_round = player.role.state.get("wolf_reveal_round")
+                if reveal_round and self.round_num >= reveal_round:
+                    player.role.isolated_wolf = False
+                    player.role.joins_wolf_vote = True
+                    player.role.state.pop("wolf_reveal_round", None)
 
         asyncio.create_task(self._play_night_audio())
         asyncio.create_task(self._mute_for_night())
@@ -605,11 +861,23 @@ class WerewolfGame:
             for player_id, _ in required
             if self.get_player(player_id)
         })
-        await self.channel.send(
-            f"🌃 **第 {self.round_num} 夜："
-            f"{'、'.join(role_names) if role_names else '無角色需要行動'}**",
-            view=view,
+        night_embed = discord.Embed(
+            title=f"🌃 第 {self.round_num} 夜｜上半夜",
+            description="存活玩家請點擊「夜晚行動」，系統只會顯示屬於你的操作。",
+            color=discord.Color.dark_blue(),
         )
+        night_embed.add_field(
+            name="本夜行動角色",
+            value="、".join(role_names) if role_names else "無角色需要行動",
+            inline=False,
+        )
+        night_embed.add_field(
+            name="存活人數",
+            value=f"{len(self.get_alive_players())} / {len(self.players)}",
+            inline=True,
+        )
+        night_embed.set_footer(text="所有目標與查驗結果都只對操作者顯示")
+        await self.channel.send(embed=night_embed, view=view)
         if not required:
             await self.check_phase_1_end()
         return True
@@ -628,6 +896,10 @@ class WerewolfGame:
             "mirror_check": "魔鏡查驗", "mimic": "模仿",
             "claw_pass": "轉交狼王爪",
             "mimic_witch": "模仿女巫毒殺",
+            "choose_idol": "選擇偶像",
+            "convert": "相鄰轉化",
+            "awakened_guard": "覺醒守護",
+            "dream_speech": "選擇夢語者",
         }.get(action_type, action_type)
 
     def _role_action_available(self, player):
@@ -646,13 +918,6 @@ class WerewolfGame:
             role.used_skill or not role.secret_body
         ):
             return False
-        if action_type == "mimic":
-            other_wolves = [
-                wolf for wolf in self.get_alive_players()
-                if wolf.role.camp == CAMP_WOLF and wolf.id != player.id
-            ]
-            if other_wolves:
-                return False
         if action_type == "time_wave":
             if role.state.get("boost_used") and role.state.get("weaken_used"):
                 return False
@@ -661,6 +926,14 @@ class WerewolfGame:
         if action_type == "claw_pass" and role.shoot_count <= 0:
             return False
         if action_type == "mimic_witch" and role.state.get("mimic_witch_used"):
+            return False
+        if action_type in {"choose_idol", "convert"} and (
+            self.round_num != 1 or role.used_skill
+        ):
+            return False
+        if action_type == "awakened_guard" and role.state.get("last_guard_round") == self.round_num:
+            return False
+        if action_type == "fate_bind" and self.fate_triggered:
             return False
         return bool(self.get_action_targets(player, action_type))
 
@@ -881,6 +1154,12 @@ class WerewolfGame:
             result = "至少一名狼人" if any(p.role.camp == CAMP_WOLF for p in pair) else "兩人皆為好人"
             message = f"🔮 **{pair[0].display_name}、{pair[1].display_name}**：{result}"
             self.log_event(action_type, {"targets": [p.display_name for p in pair], "result": result})
+        elif action_type == "mimic":
+            message = f"🎭 模仿目標 **{target.display_name}** 的身分是：**{target.role.name}**"
+            self.log_event(
+                "mimic",
+                {"actor": player.display_name, "target": target.display_name, "role": target.role.name},
+            )
         else:
             names = "、".join(self.get_player(value).display_name for value in target_ids)
             suffix = "（增幅）" if mode == "boost" else "（削弱）" if mode == "weaken" else ""
@@ -910,6 +1189,25 @@ class WerewolfGame:
             target.role.state["awakened_claws"] = target.role.state.get("awakened_claws", 0) + 1
         if action_type == "mimic_witch":
             player.role.state["mimic_witch_used"] = True
+        if action_type == "choose_idol":
+            player.role.state["idol_id"] = primary_target
+            player.role.used_skill = True
+        if action_type == "convert":
+            player.role.used_skill = True
+            try:
+                await target.user.send(
+                    "🗿 你已被覺醒石像鬼選為轉化者；本夜結束後將加入狼人陣營，"
+                    "原技能會失效，下一夜才與狼隊相認。"
+                )
+            except (AttributeError, discord.HTTPException):
+                pass
+        if action_type == "awakened_guard":
+            player.role.last_target = primary_target
+            player.role.state["last_guard_round"] = self.round_num
+            self.awakened_guard_target = primary_target
+            self.awakened_guard_period = "night"
+        if action_type == "dream_speech":
+            player.role.last_target = primary_target
 
         await interaction.response.send_message(message, ephemeral=True)
         await self.check_phase_1_end()
@@ -1172,7 +1470,17 @@ class WerewolfGame:
         if has_witch: roles_str.append("女巫")
         if has_lucky: roles_str.append("幸運兒")
 
-        await self.channel.send(f"🧙‍♀️ **下半夜：{'、'.join(roles_str)}**", view=view)
+        await self.channel.send(
+            embed=discord.Embed(
+                title=f"🌙 第 {self.round_num} 夜｜下半夜",
+                description=(
+                    f"等待 **{'、'.join(roles_str)}** 完成行動。\n"
+                    "點擊按鈕後只會看到自己的技能面板。"
+                ),
+                color=discord.Color.purple(),
+            ),
+            view=view,
+        )
         
         return True
 
@@ -1231,9 +1539,26 @@ class WerewolfGame:
     # ==========================
     async def start_day(self):
         async with self._state_lock:
+            if (
+                self.phase not in {PHASE_NIGHT_1, PHASE_NIGHT_2}
+                or self._resolving_day
+            ):
+                return False
+            self._resolving_day = True
+
+        try:
+            dream_speech_kills = await self._collect_awakened_dreamer_kills()
+        except BaseException:
+            async with self._state_lock:
+                self._resolving_day = False
+            raise
+
+        async with self._state_lock:
             if self.phase not in {PHASE_NIGHT_1, PHASE_NIGHT_2}:
+                self._resolving_day = False
                 return False
             self.phase = PHASE_DAY
+            self._resolving_day = False
             self.votes = {}
             self.stop_votes = set()
             self._vote_tally_started = False
@@ -1260,6 +1585,40 @@ class WerewolfGame:
                 and actor_id not in disabled_ids
                 and not data.get("skipped")
             ]
+
+        # 夜間覺醒守護只有在技能未被封鎖時才生效，效果延續至本日結束。
+        awakened_guard_entries = action_entries("awakened_guard")
+        if awakened_guard_entries:
+            self.awakened_guard_target = awakened_guard_entries[0][1]["target"]
+            self.awakened_guard_period = "night"
+        elif self.awakened_guard_period == "night":
+            self.awakened_guard_target = None
+            self.awakened_guard_period = None
+
+        # 覺醒石像鬼首夜轉化相鄰玩家；轉化者下一夜才與狼隊相認。
+        for actor, data in action_entries("convert"):
+            target = self.get_player(data["target"])
+            if not target or target.status != "alive" or target.role.camp == CAMP_WOLF:
+                continue
+            original_role = target.role.name
+            target.role.camp = CAMP_WOLF
+            target.role.disabled = True
+            target.role.night_action = None
+            target.role.can_shoot = False
+            target.role.shoot_count = 0
+            target.role.can_self_destruct = True
+            target.role.joins_wolf_vote = False
+            target.role.isolated_wolf = True
+            target.role.state["converted_from"] = original_role
+            target.role.state["wolf_reveal_round"] = self.round_num + 1
+            target.role.description = (
+                f"原身分為 {original_role}；已被覺醒石像鬼轉化，原技能失效，"
+                "下一夜與狼隊相認。"
+            )
+            self.log_event(
+                "awakened_gargoyle_convert",
+                {"actor": actor.display_name, "target": target.display_name, "original_role": original_role},
+            )
 
         # 蝕時狼妃封鎖：好人的查驗、毒藥、守護若指向封鎖者會反彈。
         block_entries = action_entries("block")
@@ -1309,6 +1668,17 @@ class WerewolfGame:
             if data.get("copied_action") in {"dream", "light_guard"} and data.get("use_target"):
                 all_damage_guards.add(data["use_target"])
 
+        dream_speech_guards = {
+            data["target"] for _, data in action_entries("dream_speech")
+        }
+        secret_guard_targets = {
+            actor.id: data["target"]
+            for actor, data in action_entries("secret_guard")
+            if actor
+        }
+        deferred_secret_self_damage = {}
+        resolving_secret_fallback = False
+
         # 魅惑在傷害結算前建立，覺醒狼美人的挽歌幻象才能替死。
         charm_actions = action_entries("charm") + action_entries("awakened_charm")
         if charm_actions:
@@ -1337,10 +1707,29 @@ class WerewolfGame:
         )
 
         def add_death(user_id, cause, damage_type="skill"):
+            nonlocal resolving_secret_fallback
             if not isinstance(user_id, int):
                 return False
             player = self.get_player(user_id)
             if player is None or player.status != "alive":
+                return False
+            if self._is_awakened_guarded(player):
+                notices.append(f"🛡️ {player.display_name} 受到覺醒守護，免於出局。")
+                return False
+            if user_id in dream_speech_guards and damage_type != "awakened_dream":
+                notices.append(f"🌌 {player.display_name} 身處夢語，免疫了夜間傷害。")
+                return False
+            protected_target = secret_guard_targets.get(user_id)
+            if (
+                not resolving_secret_fallback
+                and protected_target is not None
+                and protected_target != user_id
+                and player.role.secret_body
+                and protected_target in all_damage_guards
+            ):
+                deferred_secret_self_damage.setdefault(user_id, []).append(
+                    (cause, damage_type)
+                )
                 return False
             if (
                 isinstance(player.role, AwakenedWolfBeauty)
@@ -1465,6 +1854,9 @@ class WerewolfGame:
             else:
                 add_death(actor.id, "獵魔人狩獵反噬", "hunt")
 
+        for target_id in dream_speech_kills:
+            add_death(target_id, "覺醒攝夢人夢語出局", "awakened_dream")
+
         if (
             self.current_dream_target is not None
             and self.current_dream_target == self.previous_dream_target
@@ -1536,6 +1928,28 @@ class WerewolfGame:
                 add_death(left, "尋香命運綁定", "follow")
                 self.fate_triggered = True
 
+        # 保護目標整夜沒有承受傷害時，秘密之身改為替覺醒愚者自己擋一次。
+        resolving_secret_fallback = True
+        for actor_id, pending_damage in deferred_secret_self_damage.items():
+            actor = self.get_player(actor_id)
+            protected_target = secret_guard_targets.get(actor_id)
+            if (
+                actor
+                and actor.role.secret_body
+                and protected_target in all_damage_guards
+                and pending_damage
+            ):
+                all_damage_guards.discard(protected_target)
+                actor.role.secret_body = False
+                actor.role.used_skill = True
+                pending_damage = pending_damage[1:]
+                notices.append(
+                    f"🃏 {actor.display_name} 的秘密之身轉而為自己抵消一次傷害。"
+                )
+            for cause, damage_type in pending_damage:
+                add_death(actor_id, cause, damage_type)
+        resolving_secret_fallback = False
+
         self.deaths_tonight = []
         for user_id in dict.fromkeys(deaths):
             player = self.get_player(user_id)
@@ -1547,15 +1961,20 @@ class WerewolfGame:
             player.status = "dead"
             self.deaths_tonight.append(user_id)
 
+        for user_id in self.deaths_tonight:
+            player = self.get_player(user_id)
+            cause = "、".join(death_causes.get(user_id, ["夜間出局"]))
+            self._resolve_awakened_lonely_idol(player, cause)
+
         self.previous_dream_target = self.current_dream_target
         self.good_skills_sealed = False
 
         # --- 公布結果 ---
-        msg = "🌅 **天亮了！**\n"
+        msg = ""
         if not self.deaths_tonight:
-            msg += "昨晚是個平安夜。"
+            msg += "✨ 昨晚是個平安夜。"
         else:
-            msg += "昨晚死亡名單：\n"
+            msg += "**昨晚死亡名單**\n"
             for uid in self.deaths_tonight:
                 p = self.get_player(uid)
                 msg += f"💀 **{p.display_name}**\n"
@@ -1569,7 +1988,21 @@ class WerewolfGame:
             notices.append(bear_notice)
         if notices:
             msg += "\n" + "\n".join(notices)
-        await self.channel.send(msg)
+        if self.pending_role_notices:
+            msg += "\n" + "\n".join(self.pending_role_notices)
+            self.pending_role_notices.clear()
+        day_embed = discord.Embed(
+            title=f"🌅 第 {self.round_num} 天｜天亮",
+            description=msg,
+            color=discord.Color.gold(),
+        )
+        day_embed.add_field(
+            name="目前存活",
+            value=f"{len(self.get_alive_players())} / {len(self.players)} 人",
+            inline=True,
+        )
+        day_embed.set_footer(text="夜間技能已完成結算，準備進入白天討論")
+        await self.channel.send(embed=day_embed)
 
         # --- 獵人/狼王開槍檢查 ---
         shooters = self.get_shooter_deaths()
@@ -1633,10 +2066,21 @@ class WerewolfGame:
     async def _send_voting_view(self):
         if self.phase != PHASE_DAY:
             return
-        await self.channel.send(
-            "現在開始討論，並點擊下方按鈕投票。",
-            view=VotingView(self),
+        embed = discord.Embed(
+            title=f"☀️ 第 {self.round_num} 天｜討論與放逐",
+            description=(
+                "完成討論後，點擊玩家名稱投票。每位存活且有投票權的玩家限投一次。\n"
+                "特殊白天技能必須在第一張票投出前使用。"
+            ),
+            color=discord.Color.orange(),
         )
+        embed.add_field(
+            name="可投票人數",
+            value=str(len([p for p in self.get_alive_players() if not p.role.vote_disabled])),
+            inline=True,
+        )
+        embed.add_field(name="已投票", value=str(len(self.votes)), inline=True)
+        await self.channel.send(embed=embed, view=VotingView(self))
 
     async def _prompt_next_shooter(self):
         if self.phase != PHASE_SHOOT or not self.pending_shooters:
@@ -1659,6 +2103,10 @@ class WerewolfGame:
             if self.phase != PHASE_DAY:
                 return await interaction.response.send_message(
                     "❌ 這個投票面板已失效。", ephemeral=True
+                )
+            if self.pending_awakened_white_wolf:
+                return await interaction.response.send_message(
+                    "❌ 覺醒白狼王的引爆尚未結算，暫時不能投票。", ephemeral=True
                 )
             p = self.get_player(interaction.user.id)
             target_p = self.get_player(target_id)
@@ -1706,14 +2154,20 @@ class WerewolfGame:
         if self.phase != PHASE_DAY:
             return
         # [新增] 公布投票結果
-        vote_reveal = "📊 **投票結果公開：**\n"
+        vote_reveal = ""
         for voter_id, target_id in self.votes.items():
             voter = self.get_player(voter_id)
             target = self.get_player(target_id)
             if voter and target:
                 vote_reveal += f"• {voter.display_name} → **{target.display_name}**\n"
         
-        await self.channel.send(vote_reveal)
+        await self.channel.send(
+            embed=discord.Embed(
+                title="📊 放逐投票結果",
+                description=vote_reveal or "沒有有效票。",
+                color=discord.Color.orange(),
+            )
+        )
         
         self.cats_due_after_vote = set(self.pending_white_cats)
         counts = Counter(self.votes.values())
@@ -1904,12 +2358,18 @@ class WerewolfGame:
         def mark(target, target_cause):
             if target is None or target.status != "alive":
                 return
+            if self._is_awakened_guarded(target):
+                self.pending_role_notices.append(
+                    f"🛡️ {target.display_name} 受到覺醒守護，免於出局。"
+                )
+                return
             if isinstance(target.role, WhiteCat) and not target.role.used_skill:
                 target.role.used_skill = True
                 self.pending_white_cats.add(target.id)
                 return
             target.status = "dead"
             deaths.append((target, target_cause))
+            self._resolve_awakened_lonely_idol(target, target_cause)
 
         if (
             isinstance(player.role, AwakenedWolfBeauty)
@@ -2004,6 +2464,9 @@ class WerewolfGame:
                     {"name": dead.display_name, "role": dead.role.name, "cause": cause},
                 )
             await self.channel.send("\n".join(lines))
+        if self.pending_role_notices:
+            await self.channel.send("\n".join(self.pending_role_notices))
+            self.pending_role_notices.clear()
 
         shooters = [
             dead for dead, cause in deaths
@@ -2025,11 +2488,83 @@ class WerewolfGame:
         return await self.start_night()
 
     async def send_day_skill_select(self, interaction, action_type):
-        if self.phase != PHASE_DAY or self.votes or self._vote_tally_started:
+        if (
+            self.phase != PHASE_DAY
+            or self.votes
+            or self._vote_tally_started
+            or self.pending_awakened_white_wolf
+        ):
             return await interaction.response.send_message(
                 "❌ 白天技能只能在本輪有人投票前使用。", ephemeral=True
             )
         player = self.get_player(interaction.user.id)
+        if action_type == "awakened_guard":
+            if (
+                not player
+                or player.status != "alive"
+                or not isinstance(player.role, AwakenedGuard)
+                or player.role.disabled
+                or player.role.state.get("last_guard_round") == self.round_num
+            ):
+                return await interaction.response.send_message(
+                    "❌ 只有本日尚未發動的存活覺醒守衛能使用。", ephemeral=True
+                )
+            targets = self.get_action_targets(player, "awakened_guard")
+            if not targets:
+                return await interaction.response.send_message(
+                    "❌ 目前沒有合法的守護目標。", ephemeral=True
+                )
+            select = discord.ui.Select(
+                placeholder="🛡️ 選擇本日守護目標...",
+                options=[
+                    discord.SelectOption(label=target.display_name, value=str(target.id))
+                    for target in targets
+                ],
+            )
+            view = discord.ui.View(timeout=300)
+
+            async def guard_callback(inte):
+                await self.handle_awakened_guard_day(
+                    inte, player, int(select.values[0])
+                )
+
+            select.callback = guard_callback
+            view.add_item(select)
+            return await interaction.response.send_message(
+                "選擇覺醒守護目標；本日結束前，目標不會以任何方式出局。",
+                view=view,
+                ephemeral=True,
+            )
+        if action_type == "awakened_white_wolf":
+            if (
+                not player
+                or player.status != "alive"
+                or not isinstance(player.role, AwakenedWhiteWolfKing)
+                or player.role.used_skill
+                or self.pending_awakened_white_wolf
+            ):
+                return await interaction.response.send_message(
+                    "❌ 只有尚未發動技能的存活覺醒白狼王能引爆。", ephemeral=True
+                )
+            select = discord.ui.Select(
+                placeholder="🩸 選擇要誘導自爆的玩家...",
+                options=[
+                    discord.SelectOption(label=target.display_name, value=str(target.id))
+                    for target in self.get_alive_players()
+                ],
+            )
+            view = discord.ui.View(timeout=300)
+
+            async def induce_callback(inte):
+                await self.handle_awakened_white_wolf_induce(
+                    inte, player, int(select.values[0])
+                )
+
+            select.callback = induce_callback
+            view.add_item(select)
+            return await interaction.response.send_message(
+                "選擇要誘導自爆的玩家：", view=view, ephemeral=True
+            )
         if (
             action_type != "knight_duel"
             or not player
@@ -2056,14 +2591,166 @@ class WerewolfGame:
             "選擇騎士決鬥目標：", view=view, ephemeral=True
         )
 
+    async def handle_awakened_guard_day(self, interaction, guard, target_id):
+        target = self.get_player(target_id)
+        if (
+            self.phase != PHASE_DAY
+            or self.votes
+            or self.pending_awakened_white_wolf
+            or interaction.user.id != guard.id
+            or guard.status != "alive"
+            or not isinstance(guard.role, AwakenedGuard)
+            or guard.role.disabled
+            or guard.role.state.get("last_guard_round") == self.round_num
+            or target not in self.get_action_targets(guard, "awakened_guard")
+        ):
+            return await interaction.response.send_message(
+                "❌ 這個覺醒守護操作已失效。", ephemeral=True
+            )
+        guard.role.last_target = target.id
+        guard.role.state["last_guard_round"] = self.round_num
+        self.awakened_guard_target = target.id
+        self.awakened_guard_period = "day"
+        self.log_event(
+            "awakened_guard",
+            {"guard": guard.display_name, "target": target.display_name, "period": "day"},
+        )
+        await interaction.response.send_message(
+            f"🛡️ 已守護 **{target.display_name}**；本日結束前無法出局。",
+            ephemeral=True,
+        )
+        await self.channel.send("🛡️ 覺醒守衛已在白天發動技能。")
+
+    async def handle_awakened_white_wolf_induce(self, interaction, wolf, bomber_id):
+        bomber = self.get_player(bomber_id)
+        if (
+            self.phase != PHASE_DAY
+            or self.votes
+            or interaction.user.id != wolf.id
+            or wolf.status != "alive"
+            or not isinstance(wolf.role, AwakenedWhiteWolfKing)
+            or wolf.role.used_skill
+            or self.pending_awakened_white_wolf
+            or bomber is None
+            or bomber.status != "alive"
+        ):
+            return await interaction.response.send_message(
+                "❌ 這個引爆操作已失效。", ephemeral=True
+            )
+        wolf.role.used_skill = True
+        if self._is_awakened_guarded(bomber):
+            await interaction.response.send_message(
+                f"🛡️ **{bomber.display_name}** 受到覺醒守護，引爆未能使其出局。"
+            )
+            self.log_event(
+                "awakened_white_wolf",
+                {"wolf": wolf.display_name, "bomber": bomber.display_name, "blocked": True},
+            )
+            return
+
+        self.pending_awakened_white_wolf = {
+            "wolf_id": wolf.id,
+            "bomber_id": bomber.id,
+        }
+        await interaction.response.send_message(
+            f"🩸 覺醒白狼王發動！**{bomber.display_name}** 被誘導自爆，"
+            "請選擇一名玩家一同出局。"
+        )
+        companions = [
+            target for target in self.get_alive_players() if target.id != bomber.id
+        ]
+        if not companions:
+            return await self._finish_awakened_white_wolf(bomber, None)
+
+        select = discord.ui.Select(
+            placeholder="🩸 選擇一同出局的玩家...",
+            options=[
+                discord.SelectOption(label=target.display_name, value=str(target.id))
+                for target in companions
+            ],
+        )
+        view = discord.ui.View(timeout=45)
+
+        async def companion_callback(inte):
+            if inte.user.id != bomber.id:
+                return await inte.response.send_message(
+                    "❌ 只有被誘導自爆的玩家能選擇。", ephemeral=True
+                )
+            companion = self.get_player(int(select.values[0]))
+            await inte.response.defer()
+            view.stop()
+            await self._finish_awakened_white_wolf(bomber, companion)
+
+        select.callback = companion_callback
+        view.add_item(select)
+        await self.channel.send(
+            f"🩸 {bomber.mention} 請在 45 秒內選擇一名玩家一同出局。",
+            view=view,
+        )
+
+        async def auto_finish():
+            await asyncio.sleep(45)
+            pending = self.pending_awakened_white_wolf
+            if (
+                self.phase == PHASE_DAY
+                and pending
+                and pending.get("bomber_id") == bomber.id
+            ):
+                view.stop()
+                await self.channel.send("⌛ 被誘導者逾時，只有本人自爆出局。")
+                await self._finish_awakened_white_wolf(bomber, None)
+
+        asyncio.create_task(auto_finish())
+
+    async def _finish_awakened_white_wolf(self, bomber, companion):
+        pending = self.pending_awakened_white_wolf
+        if (
+            self.phase != PHASE_DAY
+            or not pending
+            or pending.get("bomber_id") != bomber.id
+        ):
+            return False
+        self.pending_awakened_white_wolf = None
+        deaths = self._mark_day_death(bomber, "覺醒白狼王誘導自爆")
+        if companion and companion.status == "alive":
+            deaths.extend(self._mark_day_death(companion, "引爆連帶出局"))
+
+        lines = ["🩸 **引爆結算**"]
+        for dead, cause in deaths:
+            role_text = (
+                "身分不翻牌"
+                if dead.id == bomber.id and dead.role.camp == CAMP_WOLF
+                else dead.role.name
+            )
+            lines.append(f"💀 **{dead.display_name}**（{role_text}）— {cause}")
+            self.log_event(
+                "awakened_white_wolf_death",
+                {"name": dead.display_name, "role": dead.role.name, "cause": cause},
+            )
+        if len(lines) == 1:
+            lines.append("所有出局效果都被覺醒守護擋下。")
+        await self.channel.send("\n".join(lines))
+        if self.pending_role_notices:
+            await self.channel.send("\n".join(self.pending_role_notices))
+            self.pending_role_notices.clear()
+        await self._apply_day_mutes()
+        winner = self.check_winner()
+        if winner:
+            await self.end_game(winner)
+        else:
+            await self.start_night()
+        return True
+
     async def handle_knight_duel(self, interaction, knight, target_id):
         target = self.get_player(target_id)
         if (
             self.phase != PHASE_DAY
             or self.votes
+            or self.pending_awakened_white_wolf
             or interaction.user.id != knight.id
             or knight.status != "alive"
             or not isinstance(knight.role, Knight)
+            or knight.role.disabled
             or knight.role.used_skill
             or target is None
             or target.status != "alive"
@@ -2074,7 +2761,18 @@ class WerewolfGame:
             )
         knight.role.used_skill = True
         if target.role.camp == CAMP_WOLF:
+            if self._is_awakened_guarded(target):
+                await interaction.response.send_message(
+                    f"🛡️ 決鬥確認 **{target.display_name}** 是狼人，"
+                    "但覺醒守護使其免於出局；立即入夜。"
+                )
+                self.log_event(
+                    "knight_duel",
+                    {"knight": knight.display_name, "target": target.display_name, "result": "狼人受守護"},
+                )
+                return await self.start_night()
             target.status = "dead"
+            self._resolve_awakened_lonely_idol(target, "騎士決鬥")
             await interaction.response.send_message(
                 f"⚔️ 騎士決鬥成功！**{target.display_name}**（{target.role.name}）出局，立即入夜。"
             )
@@ -2099,9 +2797,11 @@ class WerewolfGame:
         if (
             self.phase != PHASE_DAY
             or self.votes
+            or self.pending_awakened_white_wolf
             or not player
             or player.status != "alive"
             or not isinstance(player.role, CrimsonApostle)
+            or player.role.disabled
             or player.role.used_skill
         ):
             return await interaction.response.send_message(
@@ -2113,6 +2813,47 @@ class WerewolfGame:
             f"🌕 **{player.display_name}** 自曝赤月使徒！立即入夜，本夜所有好人技能封印。"
         )
         await self.start_night()
+
+    async def handle_wolf_self_destruct(self, interaction):
+        player = self.get_player(interaction.user.id)
+        if (
+            self.phase != PHASE_DAY
+            or self.votes
+            or self.pending_awakened_white_wolf
+            or not player
+            or player.status != "alive"
+            or not player.role.can_self_destruct
+            or player.role.state.get("self_destruct_attempted")
+        ):
+            return await interaction.response.send_message(
+                "❌ 你目前不能發動狼人自爆。", ephemeral=True
+            )
+        player.role.state["self_destruct_attempted"] = True
+        deaths = self._mark_day_death(player, "狼人自爆")
+        if any(dead.id == player.id for dead, _ in deaths):
+            await interaction.response.send_message(
+                f"💥 **{player.display_name}** 自爆並翻牌為 **{player.role.name}**，立即入夜！"
+            )
+            self.log_event(
+                "wolf_self_destruct",
+                {"player": player.display_name, "role": player.role.name, "blocked": False},
+            )
+        else:
+            await interaction.response.send_message(
+                f"🛡️ **{player.display_name}** 發動自爆，但覺醒守護使其免於出局；立即入夜。"
+            )
+            self.log_event(
+                "wolf_self_destruct",
+                {"player": player.display_name, "role": player.role.name, "blocked": True},
+            )
+        if self.pending_role_notices:
+            await self.channel.send("\n".join(self.pending_role_notices))
+            self.pending_role_notices.clear()
+        await self._apply_day_mutes()
+        winner = self.check_winner()
+        if winner:
+            return await self.end_game(winner)
+        return await self.start_night()
 
     # --- 開槍邏輯 ---
     async def handle_awakened_hunt(self, interaction, hunter, direction):
@@ -2144,15 +2885,22 @@ class WerewolfGame:
 
         if target:
             # 巡獵直接生效，覺醒狼美人的幻象不能替代這次出局。
-            target.status = "dead"
-            await interaction.response.send_message(
-                f"🏹 覺醒獵人向{'左' if direction == 'left' else '右'}巡獵，"
-                f"帶走了 **{target.display_name}**（{target.role.name}）！"
-            )
-            self.log_event(
-                "awakened_hunt",
-                {"hunter": hunter.display_name, "target": target.display_name, "role": target.role.name},
-            )
+            if self._is_awakened_guarded(target):
+                await interaction.response.send_message(
+                    f"🛡️ 覺醒獵人向{'左' if direction == 'left' else '右'}巡獵，"
+                    f"但 **{target.display_name}** 受到覺醒守護，免於出局。"
+                )
+            else:
+                target.status = "dead"
+                self._resolve_awakened_lonely_idol(target, "覺醒獵人巡獵")
+                await interaction.response.send_message(
+                    f"🏹 覺醒獵人向{'左' if direction == 'left' else '右'}巡獵，"
+                    f"帶走了 **{target.display_name}**（{target.role.name}）！"
+                )
+                self.log_event(
+                    "awakened_hunt",
+                    {"hunter": hunter.display_name, "target": target.display_name, "role": target.role.name},
+                )
         else:
             await interaction.response.send_message("🏹 該方向已沒有存活狼人，巡獵落空。")
         await self._apply_day_mutes()
@@ -2179,19 +2927,25 @@ class WerewolfGame:
         if shooter.id not in self.pending_shooters:
             self.shot_players.add(shooter.id)
         chained_deaths = self._mark_day_death(target, "獵人射擊")
-        await interaction.response.send_message(
-            f"💥 **{shooter.display_name}** 帶走了 "
-            f"**{target.display_name}**（{target.role.name}）"
-        )
-        self.log_event(
-            "shoot_death",
-            {
-                "shooter": shooter.display_name,
-                "name": target.display_name,
-                "role": target.role.name,
-                "cause": "開槍",
-            },
-        )
+        target_died = any(dead.id == target.id for dead, _ in chained_deaths)
+        if target_died:
+            await interaction.response.send_message(
+                f"💥 **{shooter.display_name}** 帶走了 "
+                f"**{target.display_name}**（{target.role.name}）"
+            )
+            self.log_event(
+                "shoot_death",
+                {
+                    "shooter": shooter.display_name,
+                    "name": target.display_name,
+                    "role": target.role.name,
+                    "cause": "開槍",
+                },
+            )
+        else:
+            await interaction.response.send_message(
+                f"🛡️ **{target.display_name}** 受到覺醒守護，擋下了射擊。"
+            )
         for dead, cause in chained_deaths:
             if dead.id == target.id:
                 continue
@@ -2202,6 +2956,9 @@ class WerewolfGame:
                 "shoot_death",
                 {"name": dead.display_name, "role": dead.role.name, "cause": cause},
             )
+        if self.pending_role_notices:
+            await self.channel.send("\n".join(self.pending_role_notices))
+            self.pending_role_notices.clear()
         new_shooters = [
             dead for dead, cause in chained_deaths
             if dead.id != shooter.id
@@ -2278,11 +3035,25 @@ class WerewolfGame:
         await self._restore_mutes()
         self._unregister()
         
-        text = "**遊戲結束！獲勝者：** " + winner + "\n\n**身分揭曉：**\n"
-        for p in self.players:
-            text += f"{p.display_name}: {p.role.name}\n"
-        
-        await self.channel.send(text)
+        result_lines = [
+            f"`{index:02}` **{p.display_name}**｜{p.role.name}｜{p.role.camp}"
+            for index, p in enumerate(self.players, start=1)
+        ]
+        result_embed = discord.Embed(
+            title="🏁 遊戲結束",
+            description=f"## {winner} 獲勝",
+            color=discord.Color.gold() if winner == "好人陣營" else discord.Color.dark_red(),
+        )
+        for chunk_index in range(0, len(result_lines), 10):
+            result_embed.add_field(
+                name="🎭 全員身分揭曉" if chunk_index == 0 else "🎭 身分揭曉（續）",
+                value="\n".join(result_lines[chunk_index:chunk_index + 10]),
+                inline=False,
+            )
+        result_embed.add_field(name="總回合", value=str(self.round_num), inline=True)
+        result_embed.add_field(name="復盤事件", value=str(len(self.game_log)), inline=True)
+        result_embed.set_footer(text="使用下方復盤選單查看每一夜與每一天的關鍵事件")
+        await self.channel.send(embed=result_embed)
         
         if self.wolf_thread:
             try:

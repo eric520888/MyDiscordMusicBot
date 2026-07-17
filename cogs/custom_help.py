@@ -53,6 +53,17 @@ class HelpSelect(Select):
                         ),
                         inline=False,
                     )
+                elif value == "Werewolf":
+                    embed.add_field(
+                        name="🐺 快速開始",
+                        value=(
+                            "1. `/ww_create` 建立互動大廳並選板\n"
+                            "2. 玩家按「加入」，12 人板人數到齊後由房主開始\n"
+                            "3. `/ww_status` 隨時查看階段與存活名單\n"
+                            "4. `/ww_rules` 開啟 23 套官方板型百科"
+                        ),
+                        inline=False,
+                    )
 
                 # 以名稱去重，避免 Hybrid 指令同時被當成文字與 Slash
                 # 指令加入兩次。

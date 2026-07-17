@@ -1,6 +1,6 @@
 """網易《狼人殺官方》角色與 12 人競技板型資料。
 
-板型池依 2025 官方賽事公告整理；角色說明以官方角色卡與板型公告為準。
+板型池依截至 2026 年 7 月已正式上線的官方板型整理；角色說明以官方角色卡與板型公告為準。
 這個模組只放不可變的規則資料，遊戲流程實作位於 game.py。
 """
 
@@ -72,6 +72,11 @@ ROLE_AWAKENED_HIDDEN_WOLF = "覺醒隱狼"
 ROLE_AWAKENED_WITCH = "覺醒女巫"
 ROLE_AWAKENED_WOLF_BEAUTY = "覺醒狼美人"
 ROLE_AWAKENED_HUNTER = "覺醒獵人"
+ROLE_AWAKENED_LONELY_GIRL = "覺醒孤獨少女"
+ROLE_AWAKENED_GARGOYLE = "覺醒石像鬼"
+ROLE_AWAKENED_GUARD = "覺醒守衛"
+ROLE_AWAKENED_WHITE_WOLF_KING = "覺醒白狼王"
+ROLE_AWAKENED_DREAMER = "覺醒攝夢人"
 
 # 舊版仍保留的朋友局角色。
 ROLE_MERCHANT = "奇跡商人"
@@ -123,12 +128,17 @@ ROLE_CATALOG: dict[str, RoleInfo] = {
     ROLE_AWAKENED_FOOL: RoleInfo(CAMP_GOD, "秘密之身可免疫一次放逐，或每晚保護一名玩家抵消一次傷害；成功後失去能力。"),
     ROLE_FRAGRANCE_PHANTOM: RoleInfo(CAMP_WOLF, "與狼隊隔離；每晚綁定兩人，其中一人出局時另一人殉死，全局觸發一次。"),
     ROLE_AWAKENED_SEER: RoleInfo(CAMP_GOD, "每晚同時查看兩名玩家，得知兩人之中是否至少有一名狼人。"),
-    ROLE_AWAKENED_WOLF_KING: RoleInfo(CAMP_WOLF, "持有兩枚狼王爪，可轉交存活狼隊友；爪的持有者出局時可開槍。"),
+    ROLE_AWAKENED_WOLF_KING: RoleInfo(CAMP_WOLF, "可自刀或自爆；持有兩枚狼王爪，可轉交存活狼隊友，爪的持有者出局時可開槍。"),
     ROLE_MIRROR_GIRL: RoleInfo(CAMP_GOD, "每晚查驗一名未查過玩家的具體身分。"),
-    ROLE_AWAKENED_HIDDEN_WOLF: RoleInfo(CAMP_WOLF, "與狼隊隔離；其餘狼人全滅後模仿一名玩家，取得身分與夜間技能。"),
+    ROLE_AWAKENED_HIDDEN_WOLF: RoleInfo(CAMP_WOLF, "與狼隊隔離；選擇一名玩家模仿，立即得知其身分，並在當夜結束後取得該角色技能。"),
     ROLE_AWAKENED_WITCH: RoleInfo(CAMP_GOD, "有一瓶解藥與三次調毒；調毒需由未協助過的玩家共同決定是否生效。"),
     ROLE_AWAKENED_WOLF_BEAUTY: RoleInfo(CAMP_WOLF, "每隔一晚施放挽歌幻象；首次面臨出局時由當夜魅惑者替代出局且無法被守護，全局生效一次。"),
     ROLE_AWAKENED_HUNTER: RoleInfo(CAMP_GOD, "因任何原因出局都可巡獵，選擇帶走自己左側或右側第一名存活狼人；夜間出局會令特殊狼人技能失效。"),
+    ROLE_AWAKENED_LONELY_GIRL: RoleInfo(CAMP_THIRD, "首夜選擇偶像；偶像被放逐時轉為狼人，偶像以其他方式出局時繼承其身分、技能與勝利目標。"),
+    ROLE_AWAKENED_GARGOYLE: RoleInfo(CAMP_WOLF, "可自刀或自爆；首夜參與狼隊行動後，將一名相鄰玩家轉化為狼人；轉化者失去原技能，下一夜才與狼隊相認。"),
+    ROLE_AWAKENED_GUARD: RoleInfo(CAMP_GOD, "每天可選擇在夜間或白天守護一人，使其在效果期間不會以任何方式出局；不能連續守護同一人。"),
+    ROLE_AWAKENED_WHITE_WOLF_KING: RoleInfo(CAMP_WOLF, "可自刀或自爆；全局一次在白天誘導一名存活玩家自爆，被誘導者再選擇另一人一同出局。"),
+    ROLE_AWAKENED_DREAMER: RoleInfo(CAMP_GOD, "每晚選擇夢語者，使其免疫夜間傷害並得知其是否行動；第二夜起可令夢語者出局，不能連續選同一人。"),
     ROLE_MERCHANT: RoleInfo(CAMP_GOD, "全局一次賜予玩家查驗、毒藥或守衛技能；選中狼人會遭反噬。"),
     ROLE_HIDDEN_WOLF: RoleInfo(CAMP_WOLF, "預言家查驗顯示為好人；知曉狼隊但在其他狼人全滅前不參與襲擊。"),
     ROLE_WHITE_WOLF_KING: RoleInfo(CAMP_WOLF, "白天可自曝並帶走一名玩家；以其他方式出局不能發動技能。"),
@@ -171,6 +181,10 @@ BOARD_AWAKENED_WOLF_KING = "awakened_wolf_king"
 BOARD_MIRROR_MAZE = "mirror_maze"
 BOARD_AWAKENED_WITCH = "awakened_witch"
 BOARD_DARK_NIGHT_STARS = "dark_night_stars"
+BOARD_AWAKENED_LONELY_GIRL = "awakened_lonely_girl"
+BOARD_AWAKENED_GARGOYLE = "awakened_gargoyle"
+BOARD_MOONFALL_ABYSS = "moonfall_abyss"
+BOARD_AWAKENED_DREAMER = "awakened_dreamer"
 
 # 相容舊設定名稱。
 BOARD_WOLF_KING = "wolf_king"
@@ -193,10 +207,14 @@ BOARD_SPECS: dict[str, BoardSpec] = {
     BOARD_HUNTER_SUN: BoardSpec("☀️ 獵日逐光", _roles((ROLE_WEREWOLF, 3), (ROLE_ECLIPSE_MAID, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_DREAMER, 1), (ROLE_LIGHT_EARL, 1)), "吞噬技能與全傷害庇護"),
     BOARD_AWAKENED_NIGHT: BoardSpec("🎪 覺醒之夜", _roles((ROLE_WEREWOLF, 3), (ROLE_NIGHT_NOBLE, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_DEMON_HUNTER, 1), (ROLE_AWAKENED_FOOL, 1)), "夜僕延時死亡與秘密之身"),
     BOARD_FRAGRANCE_FATE: BoardSpec("🦋 尋香識命", _roles((ROLE_WEREWOLF, 3), (ROLE_FRAGRANCE_PHANTOM, 1), (ROLE_VILLAGER, 4), (ROLE_AWAKENED_SEER, 1), (ROLE_WITCH, 1), (ROLE_HUNTER, 1), (ROLE_GUARD, 1)), "雙人查驗與命運綁定"),
-    BOARD_AWAKENED_WOLF_KING: BoardSpec("❄️ 覺醒狼王", _roles((ROLE_WEREWOLF, 3), (ROLE_AWAKENED_WOLF_KING, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_HUNTER, 1), (ROLE_DREAMER, 1)), "兩枚可轉移狼王爪"),
+    BOARD_AWAKENED_WOLF_KING: BoardSpec("❄️ 覺醒狼王", _roles((ROLE_WEREWOLF, 3), (ROLE_AWAKENED_WOLF_KING, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_MERCHANT, 1), (ROLE_DREAMER, 1)), "兩枚可轉移狼王爪與奇跡商人"),
     BOARD_MIRROR_MAZE: BoardSpec("🪞 鏡隱迷蹤", _roles((ROLE_WEREWOLF, 3), (ROLE_AWAKENED_HIDDEN_WOLF, 1), (ROLE_VILLAGER, 4), (ROLE_MIRROR_GIRL, 1), (ROLE_WITCH, 1), (ROLE_HUNTER, 1), (ROLE_GUARD, 1)), "具體查驗與模仿"),
     BOARD_AWAKENED_WITCH: BoardSpec("🧪 覺醒女巫", _roles((ROLE_WEREWOLF, 3), (ROLE_AWAKENED_WOLF_KING, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_AWAKENED_WITCH, 1), (ROLE_HUNTER, 1), (ROLE_GUARD, 1)), "協力調毒與狼王爪"),
     BOARD_DARK_NIGHT_STARS: BoardSpec("✨ 暗夜星辰", _roles((ROLE_WEREWOLF, 3), (ROLE_AWAKENED_WOLF_BEAUTY, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_GUARD, 1), (ROLE_AWAKENED_HUNTER, 1)), "覺醒魅惑與追獵"),
+    BOARD_AWAKENED_LONELY_GIRL: BoardSpec("💞 覺醒孤獨少女", _roles((ROLE_WEREWOLF, 4), (ROLE_VILLAGER, 3), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_DREAMER, 1), (ROLE_HUNTER, 1), (ROLE_AWAKENED_LONELY_GIRL, 1)), "偶像放逐轉狼與身分繼承"),
+    BOARD_AWAKENED_GARGOYLE: BoardSpec("🗿 覺醒石像鬼", _roles((ROLE_WEREWOLF, 2), (ROLE_AWAKENED_GARGOYLE, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_HUNTER, 1), (ROLE_GUARD, 1), (ROLE_GRAVEKEEPER, 1)), "首夜相鄰轉化與延遲相認"),
+    BOARD_MOONFALL_ABYSS: BoardSpec("🌘 月墜光淵", _roles((ROLE_WEREWOLF, 3), (ROLE_AWAKENED_WHITE_WOLF_KING, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_HUNTER, 1), (ROLE_AWAKENED_GUARD, 1)), "白天引爆與全方式守護"),
+    BOARD_AWAKENED_DREAMER: BoardSpec("🌌 覺醒攝夢人", _roles((ROLE_AWAKENED_GARGOYLE, 1), (ROLE_WOLF_KING, 1), (ROLE_WEREWOLF, 1), (ROLE_VILLAGER, 4), (ROLE_SEER, 1), (ROLE_WITCH, 1), (ROLE_HUNTER, 1), (ROLE_GRAVEKEEPER, 1), (ROLE_AWAKENED_DREAMER, 1)), "夢語判定與覺醒石像鬼轉化"),
 }
 
 

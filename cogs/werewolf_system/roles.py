@@ -30,6 +30,7 @@ class Role:
     shoot_count = 0
     joins_wolf_vote = False
     isolated_wolf = False
+    can_self_destruct = False
 
     def __init__(self):
         self.has_antidote = False
@@ -55,6 +56,7 @@ def _make_role_class(
     shoot_count=0,
     joins_wolf_vote=False,
     isolated_wolf=False,
+    can_self_destruct=False,
 ):
     info = ROLE_CATALOG[role_name]
     attrs = {
@@ -68,17 +70,18 @@ def _make_role_class(
         "shoot_count": shoot_count,
         "joins_wolf_vote": joins_wolf_vote,
         "isolated_wolf": isolated_wolf,
+        "can_self_destruct": can_self_destruct,
     }
     return type(class_name, (base,), attrs)
 
 
-Wolf = _make_role_class("Wolf", ROLE_WEREWOLF, joins_wolf_vote=True)
+Wolf = _make_role_class("Wolf", ROLE_WEREWOLF, joins_wolf_vote=True, can_self_destruct=True)
 Villager = _make_role_class("Villager", ROLE_VILLAGER)
 Seer = _make_role_class("Seer", ROLE_SEER, night_action="seer_check")
 Hunter = _make_role_class("Hunter", ROLE_HUNTER, can_shoot=True, shoot_count=1)
 Fool = _make_role_class("Fool", ROLE_FOOL)
 Guard = _make_role_class("Guard", ROLE_GUARD, night_action="guard")
-WolfKing = _make_role_class("WolfKing", ROLE_WOLF_KING, base=Wolf, can_shoot=True, shoot_count=1, joins_wolf_vote=True)
+WolfKing = _make_role_class("WolfKing", ROLE_WOLF_KING, base=Wolf, can_shoot=True, shoot_count=1, joins_wolf_vote=True, can_self_destruct=True)
 WolfBeauty = _make_role_class("WolfBeauty", ROLE_WOLF_BEAUTY, base=Wolf, night_action="charm", joins_wolf_vote=True)
 Knight = _make_role_class("Knight", ROLE_KNIGHT)
 Dreamer = _make_role_class("Dreamer", ROLE_DREAMER, night_action="dream")
@@ -105,13 +108,17 @@ NightNoble = _make_role_class("NightNoble", ROLE_NIGHT_NOBLE, base=Wolf, night_a
 AwakenedFool = _make_role_class("AwakenedFool", ROLE_AWAKENED_FOOL, night_action="secret_guard", optional_action=True)
 FragrancePhantom = _make_role_class("FragrancePhantom", ROLE_FRAGRANCE_PHANTOM, base=Wolf, night_action="fate_bind", isolated_wolf=True)
 AwakenedSeer = _make_role_class("AwakenedSeer", ROLE_AWAKENED_SEER, night_action="double_check")
-AwakenedWolfKing = _make_role_class("AwakenedWolfKing", ROLE_AWAKENED_WOLF_KING, base=Wolf, night_action="claw_pass", optional_action=True, can_shoot=True, shoot_count=2, joins_wolf_vote=True)
+AwakenedWolfKing = _make_role_class("AwakenedWolfKing", ROLE_AWAKENED_WOLF_KING, base=Wolf, night_action="claw_pass", optional_action=True, can_shoot=True, shoot_count=2, joins_wolf_vote=True, can_self_destruct=True)
 MirrorGirl = _make_role_class("MirrorGirl", ROLE_MIRROR_GIRL, night_action="mirror_check")
 AwakenedHiddenWolf = _make_role_class("AwakenedHiddenWolf", ROLE_AWAKENED_HIDDEN_WOLF, base=Wolf, night_action="mimic", optional_action=True, isolated_wolf=True)
 AwakenedWolfBeauty = _make_role_class("AwakenedWolfBeauty", ROLE_AWAKENED_WOLF_BEAUTY, base=Wolf, night_action="awakened_charm", optional_action=True, joins_wolf_vote=True)
 AwakenedHunter = _make_role_class("AwakenedHunter", ROLE_AWAKENED_HUNTER, can_shoot=True, shoot_count=1)
+AwakenedLonelyGirl = _make_role_class("AwakenedLonelyGirl", ROLE_AWAKENED_LONELY_GIRL, night_action="choose_idol")
+AwakenedGargoyle = _make_role_class("AwakenedGargoyle", ROLE_AWAKENED_GARGOYLE, base=Wolf, night_action="convert", joins_wolf_vote=True, can_self_destruct=True)
+AwakenedGuard = _make_role_class("AwakenedGuard", ROLE_AWAKENED_GUARD, night_action="awakened_guard", optional_action=True)
+AwakenedWhiteWolfKing = _make_role_class("AwakenedWhiteWolfKing", ROLE_AWAKENED_WHITE_WOLF_KING, base=Wolf, joins_wolf_vote=True, can_self_destruct=True)
+AwakenedDreamer = _make_role_class("AwakenedDreamer", ROLE_AWAKENED_DREAMER, night_action="dream_speech")
 Merchant = _make_role_class("Merchant", ROLE_MERCHANT, night_action="merchant_give", optional_action=True)
-
 
 class Witch(Role):
     name = ROLE_WITCH
@@ -143,7 +150,9 @@ ROLE_CLASSES = {
         YoungFox, Bear, Pufferfish, EclipseMaid, LightEarl, NightNoble,
         AwakenedFool, FragrancePhantom, AwakenedSeer, AwakenedWolfKing,
         MirrorGirl, AwakenedHiddenWolf, AwakenedWitch,
-        AwakenedWolfBeauty, AwakenedHunter, Merchant,
+        AwakenedWolfBeauty, AwakenedHunter, AwakenedLonelyGirl,
+        AwakenedGargoyle, AwakenedGuard, AwakenedWhiteWolfKing,
+        AwakenedDreamer, Merchant,
     )
 }
 

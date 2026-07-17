@@ -3,7 +3,12 @@ import logging
 from discord.ext import commands
 from .werewolf_system.game import WerewolfGame
 from .werewolf_system.const import BOARD_STANDARD
-from .werewolf_system.views import BoardRulesView, LobbyView, create_board_rules_embed
+from .werewolf_system.views import (
+    BoardRulesView,
+    LobbyView,
+    create_board_rules_embed,
+    create_game_status_embed,
+)
 
 
 log = logging.getLogger(__name__)
@@ -65,6 +70,18 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
             view=BoardRulesView(),
             ephemeral=True,
         )
+
+    @commands.hybrid_command(
+        name="ww_status",
+        description="[狼人殺] 查看目前板子、階段、回合與存活名單",
+    )
+    async def status(self, ctx):
+        if ctx.guild is None:
+            return await ctx.send("❌ 這個指令只能在伺服器內使用。", ephemeral=True)
+        game = self.games.get(ctx.guild.id)
+        if not game:
+            return await ctx.send("目前沒有狼人殺遊戲；使用 `/ww_create` 建立大廳。", ephemeral=True)
+        await ctx.send(embed=create_game_status_embed(game), ephemeral=True)
 
     @commands.hybrid_command(name='ww_force_stop', description='[管理員] 強制結束遊戲')
     @commands.has_permissions(administrator=True)
