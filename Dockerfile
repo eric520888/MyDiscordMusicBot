@@ -1,5 +1,13 @@
+# yt-dlp 需要 JavaScript runtime 解 YouTube challenge；從 Deno 官方
+# binary image 複製執行檔，避免只檢查版本卻沒有實際安裝。
+FROM denoland/deno:bin-2.8.0 AS deno
+
 # 使用一個標準的 Python 官方映像作為基礎
 FROM python:3.11-slim
+
+COPY --from=deno /deno /usr/local/bin/deno
+ENV DENO_NO_UPDATE_CHECK=1 \
+    DENO_NO_PROMPT=1
 
 # 【第一步：安裝系統工具】
 # 增加 ca-certificates 確保 HTTPS 連線正常
