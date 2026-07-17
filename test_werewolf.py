@@ -28,6 +28,7 @@ from cogs.werewolf_system.const import (
     ROLE_MERCHANT,
 )
 from cogs.werewolf_system.game import WerewolfGame
+from cogs.werewolf_bot import WerewolfBot
 from cogs.werewolf_system.replay import ReplayView
 from cogs.werewolf_system.roles import (
     Hunter,
@@ -131,6 +132,29 @@ class FakeFollowup:
         self.messages.append((content, kwargs))
 
 
+class FakeLobbyMessage:
+    def __init__(self, jump_url="https://discord.test/lobby"):
+        self.jump_url = jump_url
+        self.edits = []
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+
+
+class FakeContext:
+    def __init__(self, channel=None, author=None):
+        self.channel = channel or FakeChannel()
+        self.guild = self.channel.guild
+        self.author = author or FakeUser(1, "Host")
+        self.sent = []
+        self.messages = []
+
+    async def send(self, content=None, **kwargs):
+        message = FakeLobbyMessage()
+        self.sent.append((content, kwargs, message))
+        return message
+
+
 class FakeInteraction:
     def __init__(self, user):
         self.user = user
@@ -143,6 +167,39 @@ def make_game(player_count=0):
     game = WerewolfGame(FakeBot(), FakeChannel(), host)
     game.players = [Player(FakeUser(i + 10), None) for i in range(player_count)]
     return game
+
+
+class WerewolfCogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_create_recovers_deleted_waiting_lobby(self):
+        bot = FakeBot()
+        cog = WerewolfBot(bot)
+        ctx = FakeContext()
+        game = WerewolfGame(bot, ctx.channel, ctx.author)
+        game.players = [Player(FakeUser(10), None)]
+        game.lobby_message = None
+        cog.games[ctx.guild.id] = game
+
+        await cog.create_game.callback(cog, ctx)
+
+        self.assertIsNotNone(game.lobby_message)
+        self.assertIs(game.channel, ctx.channel)
+        self.assertIn("embed", ctx.sent[0][1])
+        self.assertIn("已保留玩家名單", ctx.sent[1][0])
+
+    async def test_create_refreshes_existing_waiting_lobby_with_link(self):
+        bot = FakeBot()
+        cog = WerewolfBot(bot)
+        ctx = FakeContext()
+        game = WerewolfGame(bot, ctx.channel, ctx.author)
+        message = FakeLobbyMessage()
+        game.lobby_message = message
+        cog.games[ctx.guild.id] = game
+
+        await cog.create_game.callback(cog, ctx)
+
+        self.assertTrue(message.edits)
+        self.assertEqual(len(ctx.sent), 1)
+        self.assertIn("前往大廳", ctx.sent[0][0])
 
 
 class WerewolfRulesTests(unittest.TestCase):

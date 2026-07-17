@@ -20,6 +20,46 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
         self.bot = bot
         self.games = {} # {guild_id: WerewolfGame}
 
+    async def _publish_lobby(self, ctx, game):
+        """在目前頻道送出可操作的大廳，並更新遊戲保存的訊息引用。"""
+        game.channel = ctx.channel
+        view = LobbyView(game)
+        message = await ctx.send(embed=view.update_embed(), view=view)
+        game.lobby_message = message
+        return message
+
+    async def _restore_waiting_lobby(self, ctx, game):
+        """刷新仍存在的大廳；原訊息遺失時保留玩家並在目前頻道重建。"""
+        message = game.lobby_message
+        if message is not None:
+            try:
+                view = LobbyView(game)
+                await message.edit(embed=view.update_embed(), view=view)
+            except (discord.HTTPException, AttributeError):
+                log.info("等待中的狼人殺大廳訊息已遺失，準備重建")
+            else:
+                jump_url = getattr(message, "jump_url", None)
+                text = "♻️ 已刷新等待中的狼人殺大廳。"
+                if jump_url:
+                    text += f" [前往大廳]({jump_url})"
+                await ctx.send(text, ephemeral=True)
+                return message
+
+        try:
+            restored = await self._publish_lobby(ctx, game)
+        except discord.HTTPException:
+            log.exception("重建狼人殺大廳訊息失敗")
+            await ctx.send(
+                "❌ 舊大廳訊息已遺失，但目前無法重建；請檢查機器人的傳送訊息權限。",
+                ephemeral=True,
+            )
+            return None
+        await ctx.send(
+            "♻️ 原本的大廳訊息已遺失，已保留玩家名單並在這裡重建。",
+            ephemeral=True,
+        )
+        return restored
+
     @commands.hybrid_command(name='ww_create', description='[狼人殺] 建立遊戲大廳')
     async def create_game(self, ctx):
         if ctx.guild is None:
@@ -28,10 +68,9 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
         # 檢查是否有舊遊戲
         if ctx.guild.id in self.games:
             old_game = self.games[ctx.guild.id]
-            # 如果舊遊戲已結束或在等待中，可以覆蓋
+            # 等待中的遊戲可能只是原大廳訊息被刪除；優先刷新或重建。
             if old_game.phase == "waiting":
-                await ctx.send("這裡已經有一個等待中的大廳了！", ephemeral=True)
-                return
+                return await self._restore_waiting_lobby(ctx, old_game)
             elif old_game.phase == "ended":
                 # 舊遊戲已結束，清除並建立新遊戲
                 del self.games[ctx.guild.id]
@@ -43,9 +82,8 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
         game = WerewolfGame(self.bot, ctx.channel, ctx.author)
         self.games[ctx.guild.id] = game
         
-        view = LobbyView(game)
         try:
-            msg = await ctx.send(embed=view.update_embed(), view=view)
+            await self._publish_lobby(ctx, game)
         except discord.HTTPException:
             self.games.pop(ctx.guild.id, None)
             log.exception("建立狼人殺大廳訊息失敗")
@@ -53,7 +91,6 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
                 "❌ 無法建立大廳，請檢查機器人的傳送訊息權限。",
                 ephemeral=True,
             )
-        game.lobby_message = msg
 
     # 取得遊戲實例 (給 Music 模組檢查用)
     def get_game(self, ctx):
