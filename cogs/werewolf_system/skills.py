@@ -1,7 +1,7 @@
 import discord
 from discord.ui import View, Select
 from .const import *
-from .roles import Witch
+from .roles import AwakenedWitch, Witch
 
 class SkillManager:
     def __init__(self, game):
@@ -98,22 +98,70 @@ class SkillManager:
             or self.game.get_player(player.id) is not player
             or player.status != "alive"
             or not isinstance(player.role, Witch)
-            or player.id in self.game.night_actions
+            or player.role.disabled
+            or self.game.is_phase_2_done(player)
         ):
             return await interaction.response.send_message(
                 "❌ 這個女巫操作已失效。", ephemeral=True
             )
-        if not player.role.has_antidote: return await interaction.response.send_message("❌ 解藥已用", ephemeral=True)
-        if self.game.wolf_target in {-1, None}: return await interaction.response.send_message("❌ 無人死亡", ephemeral=True)
-        
-        # [新增] 女巫不能自救
-        if self.game.wolf_target == player.id:
+        if not player.role.has_antidote:
+            return await interaction.response.send_message("❌ 解藥已用", ephemeral=True)
+        valid_targets = [
+            target_id for target_id in self.game.wolf_targets
+            if target_id not in {-1, None}
+        ] or ([self.game.wolf_target] if self.game.wolf_target not in {-1, None} else [])
+        if not valid_targets:
+            return await interaction.response.send_message("❌ 無人死亡", ephemeral=True)
+        saveable = [target_id for target_id in valid_targets if target_id != player.id]
+        if not saveable:
             return await interaction.response.send_message("❌ 女巫規則：不能自救！", ephemeral=True)
-        
+        if len(saveable) > 1:
+            select = Select(
+                placeholder="💊 選擇要救的狼襲目標...",
+                options=[
+                    discord.SelectOption(
+                        label=self.game.get_player(target_id).display_name,
+                        value=str(target_id),
+                    )
+                    for target_id in saveable
+                ],
+            )
+            view = View(timeout=300)
+
+            async def callback(inter):
+                await self._apply_witch_save(
+                    inter, player, int(select.values[0])
+                )
+
+            select.callback = callback
+            view.add_item(select)
+            return await interaction.response.send_message(
+                "本夜有多名狼襲目標，請選擇要救的人：",
+                view=view,
+                ephemeral=True,
+            )
+        await self._apply_witch_save(interaction, player, saveable[0])
+
+    async def _apply_witch_save(self, interaction, player, saved_id):
+        if (
+            self.game.phase != PHASE_NIGHT_2
+            or interaction.user.id != player.id
+            or self.game.is_phase_2_done(player)
+            or not player.role.has_antidote
+            or saved_id == player.id
+            or saved_id not in (self.game.wolf_targets or [self.game.wolf_target])
+        ):
+            return await interaction.response.send_message(
+                "❌ 這個解藥操作已失效。", ephemeral=True
+            )
         player.role.has_antidote = False
-        saved_name = self.game.get_player(self.game.wolf_target).display_name
-        self.game.wolf_target = -1 
-        self.game.night_actions.add(player.id)
+        saved_name = self.game.get_player(saved_id).display_name
+        if saved_id in self.game.wolf_targets:
+            self.game.wolf_targets.remove(saved_id)
+        self.game.wolf_target = (
+            self.game.wolf_targets[0] if self.game.wolf_targets else -1
+        )
+        self.game.record_phase_2_action(player)
         await interaction.response.send_message("💊 使用了解藥", ephemeral=True)
         # [新增] 記錄女巫救人
         self.game.log_event("witch_save", {"target": saved_name})
@@ -126,12 +174,17 @@ class SkillManager:
             or self.game.get_player(player.id) is not player
             or player.status != "alive"
             or not isinstance(player.role, Witch)
-            or player.id in self.game.night_actions
+            or player.role.disabled
+            or self.game.is_phase_2_done(player)
         ):
             return await interaction.response.send_message(
                 "❌ 這個女巫操作已失效。", ephemeral=True
             )
-        if not player.role.has_poison: return await interaction.response.send_message("❌ 毒藥已用", ephemeral=True)
+        if isinstance(player.role, AwakenedWitch):
+            if player.role.poison_recipes <= 0:
+                return await interaction.response.send_message("❌ 三次調毒都已用完", ephemeral=True)
+        elif not player.role.has_poison:
+            return await interaction.response.send_message("❌ 毒藥已用", ephemeral=True)
         
         view = View()
         options = [discord.SelectOption(label=p.display_name, value=str(p.id)) for p in self.game.get_alive_players()]
@@ -143,22 +196,140 @@ class SkillManager:
             if (
                 self.game.phase != PHASE_NIGHT_2
                 or inter.user.id != player.id
-                or player.id in self.game.night_actions
-                or not player.role.has_poison
+                or self.game.is_phase_2_done(player)
+                or (
+                    not isinstance(player.role, AwakenedWitch)
+                    and not player.role.has_poison
+                )
                 or target_p is None
                 or target_p.status != "alive"
             ):
                 return await inter.response.send_message(
                     "❌ 這個毒藥操作已失效。", ephemeral=True
                 )
+            if isinstance(player.role, AwakenedWitch):
+                return await self._select_awakened_witch_helpers(
+                    inter, player, target_p
+                )
             self.game.witch_poison_target = target
             player.role.has_poison = False
-            self.game.night_actions.add(player.id)
+            self.game.record_phase_2_action(player)
             await inter.response.send_message("☠️ 已下毒", ephemeral=True)
-            # [新增] 記錄女巫毒人
             self.game.log_event("witch_poison", {"target": target_p.display_name})
             await self.game.check_phase_2_end()
             
         select.callback = callback
         view.add_item(select)
         await interaction.response.send_message("選擇目標：", view=view, ephemeral=True)
+
+    async def _select_awakened_witch_helpers(self, interaction, witch, target):
+        used_helpers = witch.role.state.setdefault("helpers_used", set())
+        helper_count = 4 - witch.role.poison_recipes
+        candidates = [
+            player for player in self.game.get_alive_players()
+            if player.id != witch.id and player.id not in used_helpers
+        ]
+        if len(candidates) < helper_count:
+            return await interaction.response.send_message(
+                "❌ 未協助過的存活玩家不足，無法進行這次調毒。",
+                ephemeral=True,
+            )
+
+        select = Select(
+            placeholder=f"🧪 選擇 {helper_count} 名調毒協助者...",
+            min_values=helper_count,
+            max_values=helper_count,
+            options=[
+                discord.SelectOption(label=helper.display_name, value=str(helper.id))
+                for helper in candidates
+            ],
+        )
+        view = View(timeout=300)
+
+        async def helper_select_callback(inter):
+            if (
+                self.game.phase != PHASE_NIGHT_2
+                or inter.user.id != witch.id
+                or self.game.is_phase_2_done(witch)
+                or witch.role.poison_recipes <= 0
+            ):
+                return await inter.response.send_message(
+                    "❌ 這個調毒操作已失效。", ephemeral=True
+                )
+            helper_ids = {int(value) for value in select.values}
+            if len(helper_ids) != helper_count or helper_ids & used_helpers:
+                return await inter.response.send_message(
+                    "❌ 協助者人數錯誤或有人已協助過。", ephemeral=True
+                )
+            used_helpers.update(helper_ids)
+            await inter.response.send_message(
+                f"🧪 已邀請 {helper_count} 名玩家協助調毒，等待所有人表決。",
+                ephemeral=True,
+            )
+            await self._send_awakened_poison_vote(witch, target, helper_ids)
+
+        select.callback = helper_select_callback
+        view.add_item(select)
+        await interaction.response.send_message(
+            f"你選擇毒殺 **{target.display_name}**；請挑選協助者。",
+            view=view,
+            ephemeral=True,
+        )
+
+    async def _send_awakened_poison_vote(self, witch, target, helper_ids):
+        votes = {}
+        view = View(timeout=300)
+        poison_button = discord.ui.Button(
+            label="同意下毒", style=discord.ButtonStyle.danger, emoji="☠️"
+        )
+        refuse_button = discord.ui.Button(
+            label="拒絕下毒", style=discord.ButtonStyle.secondary, emoji="✋"
+        )
+
+        async def cast_vote(interaction, approve):
+            if (
+                self.game.phase != PHASE_NIGHT_2
+                or interaction.user.id not in helper_ids
+                or interaction.user.id in votes
+                or self.game.is_phase_2_done(witch)
+            ):
+                return await interaction.response.send_message(
+                    "❌ 你不是本次協助者、已表決，或面板已失效。",
+                    ephemeral=True,
+                )
+            votes[interaction.user.id] = approve
+            await interaction.response.send_message("✅ 已秘密提交決定。", ephemeral=True)
+            if len(votes) < len(helper_ids):
+                return
+            succeeded = all(votes.values())
+            if succeeded:
+                self.game.witch_poison_target = target.id
+            witch.role.poison_recipes -= 1
+            witch.role.has_poison = witch.role.poison_recipes > 0
+            self.game.record_phase_2_action(witch)
+            self.game.log_event(
+                "awakened_witch_poison",
+                {"target": target.display_name, "succeeded": succeeded},
+            )
+            await self.game.channel.send(
+                "🧪 覺醒女巫的調毒表決已完成，結果將於天亮結算。"
+            )
+            await self.game.check_phase_2_end()
+
+        async def approve_callback(interaction):
+            await cast_vote(interaction, True)
+
+        async def refuse_callback(interaction):
+            await cast_vote(interaction, False)
+
+        poison_button.callback = approve_callback
+        refuse_button.callback = refuse_callback
+        view.add_item(poison_button)
+        view.add_item(refuse_button)
+        mentions = " ".join(
+            self.game.get_player(helper_id).mention for helper_id in helper_ids
+        )
+        await self.game.channel.send(
+            f"🧪 {mentions} 你們是本夜調毒協助者，請秘密決定是否讓毒藥生效。",
+            view=view,
+        )

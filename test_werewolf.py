@@ -20,19 +20,37 @@ from cogs.werewolf_system.const import (
     PHASE_SHOOT,
     PHASE_STARTING,
     PHASE_WAITING,
+    BOARD_SPECS,
+    OFFICIAL_BOARD_IDS,
 )
 from cogs.werewolf_system.game import WerewolfGame
 from cogs.werewolf_system.replay import ReplayView
 from cogs.werewolf_system.roles import (
     Hunter,
+    AwakenedWolfKing,
+    AwakenedHunter,
+    AwakenedWolfBeauty,
+    DayScholar,
+    EclipseMaid,
+    EvilKnight,
+    Fool,
+    Gargoyle,
+    Guard,
     Merchant,
     Player,
     Seer,
+    PureWhite,
     Villager,
     Witch,
     Wolf,
+    WolfKing,
 )
-from cogs.werewolf_system.views import MerchantSkillSelect, ShooterView
+from cogs.werewolf_system.views import (
+    BoardRulesView,
+    BoardSelect,
+    MerchantSkillSelect,
+    ShooterView,
+)
 
 
 class FakeUser:
@@ -112,6 +130,49 @@ def make_game(player_count=0):
 
 
 class WerewolfRulesTests(unittest.TestCase):
+    def test_all_official_boards_are_fixed_twelve_player_compositions(self):
+        self.assertEqual(len(OFFICIAL_BOARD_IDS), 19)
+        for board_id, spec in BOARD_SPECS.items():
+            with self.subTest(board=board_id):
+                self.assertEqual(len(spec.roles), 12)
+                game = make_game(12)
+                game.board_id = board_id
+                self.assertTrue(game.assign_roles())
+                self.assertCountEqual(
+                    [player.role.name for player in game.players],
+                    spec.roles,
+                )
+
+    def test_official_board_rejects_non_twelve_player_lobby(self):
+        for count in (11, 13):
+            with self.subTest(count=count):
+                game = make_game(count)
+                game.board_id = OFFICIAL_BOARD_IDS[0]
+                self.assertFalse(game.assign_roles())
+
+    def test_official_board_selects_fit_discord_limit(self):
+        self.assertEqual(len(BoardSelect(make_game()).options), 20)
+        self.assertEqual(len(BoardRulesView().children[0].options), 19)
+
+    def test_wolf_cannot_target_wolf_teammate(self):
+        game = make_game()
+        wolf = Player(FakeUser(10), Wolf())
+        wolf_king = Player(FakeUser(11), WolfKing())
+        villager = Player(FakeUser(12), Villager())
+        game.players = [wolf, wolf_king, villager]
+        targets = game.get_action_targets(wolf, "wolf_kill")
+        self.assertEqual([target.id for target in targets], [villager.id])
+
+    def test_isolated_wolf_joins_kill_only_after_regular_wolves_die(self):
+        game = make_game()
+        wolf = Player(FakeUser(10), Wolf())
+        gargoyle = Player(FakeUser(11), Gargoyle())
+        villager = Player(FakeUser(12), Villager())
+        game.players = [wolf, gargoyle, villager]
+        self.assertEqual(game.get_active_wolves(), [wolf])
+        wolf.status = "dead"
+        self.assertEqual(game.get_active_wolves(), [gargoyle])
+
     def test_each_board_minimum_creates_all_three_camps(self):
         for board_id in (
             BOARD_AUTO,
@@ -153,6 +214,184 @@ class WerewolfRulesTests(unittest.TestCase):
 
 
 class WerewolfInteractionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_time_wave_boost_gives_wolves_second_kill(self):
+        game = make_game()
+        scholar = Player(FakeUser(10), DayScholar())
+        wolf_a = Player(FakeUser(11), Wolf())
+        wolf_b = Player(FakeUser(12), Wolf())
+        villager_a = Player(FakeUser(13), Villager())
+        villager_b = Player(FakeUser(14), Villager())
+        seer = Player(FakeUser(15), Seer())
+        game.players = [scholar, wolf_a, wolf_b, villager_a, villager_b, seer]
+        game.phase = PHASE_NIGHT_1
+        game.round_num = 2
+
+        await game.handle_night_action(
+            FakeInteraction(scholar.user),
+            scholar,
+            "time_wave",
+            wolf_a.id,
+            mode="boost",
+        )
+        for wolf in (wolf_a, wolf_b):
+            await game.handle_night_action(
+                FakeInteraction(wolf.user),
+                wolf,
+                "wolf_kill",
+                [villager_a.id, villager_b.id],
+            )
+        await game.handle_night_action(
+            FakeInteraction(seer.user), seer, "seer_check", wolf_a.id
+        )
+
+        self.assertEqual(villager_a.status, "dead")
+        self.assertEqual(villager_b.status, "dead")
+
+    async def test_awakened_wolf_beauty_illusion_substitutes_charmed_player(self):
+        game = make_game()
+        beauty = Player(FakeUser(10), AwakenedWolfBeauty())
+        wolf = Player(FakeUser(11), Wolf())
+        charmed = Player(FakeUser(12), Villager())
+        witch = Player(FakeUser(13), Witch())
+        villager = Player(FakeUser(14), Villager())
+        game.players = [beauty, wolf, charmed, witch, villager]
+        game.phase = PHASE_NIGHT_1
+        game.round_num = 1
+        game.wolf_target = -1
+        game.witch_poison_target = beauty.id
+        game.role_actions[(beauty.id, "awakened_charm")] = {
+            "type": "awakened_charm", "target": charmed.id, "mode": None
+        }
+
+        await game.start_day()
+
+        self.assertEqual(beauty.status, "alive")
+        self.assertEqual(charmed.status, "dead")
+        self.assertTrue(beauty.role.state["illusion_used"])
+
+    async def test_awakened_hunter_patrols_first_wolf_in_direction(self):
+        game = make_game()
+        hunter = Player(FakeUser(10), AwakenedHunter())
+        hunter.status = "dead"
+        villager = Player(FakeUser(11), Villager())
+        wolf = Player(FakeUser(12), Wolf())
+        other_wolf = Player(FakeUser(13), Wolf())
+        game.players = [hunter, villager, wolf, other_wolf]
+        game.phase = PHASE_SHOOT
+        game.pending_shooters = [hunter.id]
+        game.after_shoot = "night"
+        interaction = FakeInteraction(hunter.user)
+
+        with patch.object(game, "start_night", new=AsyncMock(return_value=True)):
+            await game.handle_awakened_hunt(interaction, hunter, "right")
+
+        self.assertEqual(wolf.status, "dead")
+        self.assertEqual(other_wolf.status, "alive")
+
+    async def test_eclipse_maid_devour_disables_victim_skill(self):
+        game = make_game()
+        maid = Player(FakeUser(10), EclipseMaid())
+        wolf = Player(FakeUser(11), Wolf())
+        seer = Player(FakeUser(12), Seer())
+        villager = Player(FakeUser(13), Villager())
+        game.players = [maid, wolf, seer, villager]
+        game.phase = PHASE_NIGHT_1
+        game.round_num = 2
+
+        await game._complete_devour(
+            FakeInteraction(maid.user), maid, seer, "seer_check", wolf.id
+        )
+
+        self.assertTrue(seer.role.disabled)
+        self.assertIn((maid.id, "devour"), game.role_actions)
+
+    async def test_guard_blocks_wolf_kill(self):
+        game = make_game()
+        wolf = Player(FakeUser(10), Wolf())
+        guard = Player(FakeUser(11), Guard())
+        villager = Player(FakeUser(12), Villager())
+        seer = Player(FakeUser(13), Seer())
+        game.players = [wolf, guard, villager, seer]
+        game.phase = PHASE_NIGHT_1
+        game.round_num = 1
+        game.wolf_target = villager.id
+        game.role_actions[(guard.id, "guard")] = {
+            "type": "guard", "target": villager.id, "mode": None
+        }
+
+        await game.start_day()
+
+        self.assertEqual(villager.status, "alive")
+        self.assertEqual(game.deaths_tonight, [])
+
+    async def test_pure_white_kills_checked_wolf_from_second_night(self):
+        game = make_game()
+        wolf = Player(FakeUser(10), Wolf())
+        pure_white = Player(FakeUser(11), PureWhite())
+        villager = Player(FakeUser(12), Villager())
+        game.players = [wolf, pure_white, villager]
+        game.phase = PHASE_NIGHT_1
+        game.round_num = 2
+        game.wolf_target = -1
+        game.role_actions[(pure_white.id, "pure_white_check")] = {
+            "type": "pure_white_check", "target": wolf.id, "mode": None
+        }
+
+        await game.start_day()
+
+        self.assertEqual(wolf.status, "dead")
+
+    async def test_evil_knight_reflects_first_seer_check(self):
+        game = make_game()
+        evil = Player(FakeUser(10), EvilKnight())
+        wolf = Player(FakeUser(11), Wolf())
+        seer = Player(FakeUser(12), Seer())
+        villager = Player(FakeUser(13), Villager())
+        game.players = [evil, wolf, seer, villager]
+        game.phase = PHASE_NIGHT_1
+        game.round_num = 1
+        game.wolf_target = -1
+        game.role_actions[(seer.id, "seer_check")] = {
+            "type": "seer_check", "target": evil.id, "mode": None
+        }
+
+        await game.start_day()
+
+        self.assertEqual(seer.status, "dead")
+        self.assertTrue(evil.role.used_skill)
+
+    async def test_fool_survives_first_exile_and_loses_vote(self):
+        game = make_game()
+        fool = Player(FakeUser(10), Fool())
+        wolf = Player(FakeUser(11), Wolf())
+        villager = Player(FakeUser(12), Villager())
+        game.players = [fool, wolf, villager]
+        game.phase = PHASE_DAY
+        game.votes = {wolf.id: fool.id, villager.id: fool.id, fool.id: fool.id}
+
+        with patch.object(game, "start_night", new=AsyncMock(return_value=True)):
+            await game._resolve_exile(fool)
+
+        self.assertEqual(fool.status, "alive")
+        self.assertTrue(fool.role.vote_disabled)
+
+    async def test_awakened_wolf_king_can_pass_one_claw(self):
+        game = make_game()
+        king = Player(FakeUser(10), AwakenedWolfKing())
+        wolf = Player(FakeUser(11), Wolf())
+        villager = Player(FakeUser(12), Villager())
+        game.players = [king, wolf, villager]
+        game.phase = PHASE_NIGHT_1
+        game.round_num = 1
+
+        await game.handle_night_action(
+            FakeInteraction(king.user), king, "claw_pass", wolf.id
+        )
+
+        self.assertEqual(king.role.shoot_count, 1)
+        self.assertEqual(wolf.role.shoot_count, 1)
+        self.assertTrue(wolf.role.can_shoot)
+
     async def test_non_host_cannot_force_night(self):
         game = make_game()
         game.phase = PHASE_STARTING

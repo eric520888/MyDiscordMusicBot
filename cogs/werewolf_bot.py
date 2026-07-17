@@ -2,7 +2,8 @@ import discord
 import logging
 from discord.ext import commands
 from .werewolf_system.game import WerewolfGame
-from .werewolf_system.views import LobbyView
+from .werewolf_system.const import BOARD_STANDARD
+from .werewolf_system.views import BoardRulesView, LobbyView, create_board_rules_embed
 
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,18 @@ class WerewolfBot(commands.Cog, name="Werewolf"):
     # 取得遊戲實例 (給 Music 模組檢查用)
     def get_game(self, ctx):
         return self.games.get(ctx.guild.id) if ctx.guild else None
+
+    @commands.hybrid_command(
+        name="ww_rules",
+        description="[狼人殺] 查看網易官方 12 人板型、配置與角色技能",
+    )
+    async def rules(self, ctx):
+        """顯示官方板型百科，不需要先建立遊戲。"""
+        await ctx.send(
+            embed=create_board_rules_embed(BOARD_STANDARD),
+            view=BoardRulesView(),
+            ephemeral=True,
+        )
 
     @commands.hybrid_command(name='ww_force_stop', description='[管理員] 強制結束遊戲')
     @commands.has_permissions(administrator=True)

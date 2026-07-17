@@ -68,11 +68,20 @@ class ReplaySelect(Select):
         )
         
         # 死亡順序
-        deaths = [e for e in self.game_log if e["event_type"] in ["night_death", "vote_death", "shoot_death"]]
+        deaths = [
+            event for event in self.game_log
+            if event["event_type"] in {
+                "night_death", "vote_death", "shoot_death", "awakened_hunt"
+            }
+        ]
         if deaths:
             death_list = ""
             for e in deaths:
-                death_list += f"• {e['data'].get('name', '未知')} ({e['data'].get('role', '?')}) - {e['data'].get('cause', '?')}\n"
+                name = e["data"].get("name") or e["data"].get("target", "未知")
+                cause = e["data"].get("cause") or (
+                    "覺醒獵人巡獵" if e["event_type"] == "awakened_hunt" else "?"
+                )
+                death_list += f"• {name} ({e['data'].get('role', '?')}) - {cause}\n"
             embed.add_field(name="💀 死亡順序", value=death_list[:1024] or "無", inline=False)
         
         embed.set_footer(text="使用下方選單查看更多詳情")
@@ -163,6 +172,24 @@ class ReplaySelect(Select):
             "vote_death": f"💀 **{data.get('name', '?')}** 被投票處決",
             "shoot_death": f"🔫 **{data.get('name', '?')}** 被開槍帶走",
             "merchant_gift": f"🎁 商人給予 **{data.get('target', '?')}** {data.get('skill', '?')} 技能",
+            "guard": f"🛡️ **{data.get('actor', '?')}** 守護 **{data.get('target', '?')}**",
+            "dream": f"🌙 **{data.get('actor', '?')}** 攝夢 **{data.get('target', '?')}**",
+            "charm": f"💋 **{data.get('actor', '?')}** 魅惑 **{data.get('target', '?')}**",
+            "awakened_charm": f"✨ **{data.get('actor', '?')}** 施放挽歌幻象於 **{data.get('target', '?')}**",
+            "fear": f"🌑 **{data.get('actor', '?')}** 恐懼 **{data.get('target', '?')}**",
+            "block": f"⏳ **{data.get('actor', '?')}** 封鎖 **{data.get('target', '?')}**",
+            "time_wave": f"🌓 **{data.get('actor', '?')}** 對 **{data.get('target', '?')}** 使用 {data.get('mode', '?')}",
+            "hunt": f"🏹 **{data.get('actor', '?')}** 狩獵 **{data.get('target', '?')}**",
+            "pure_white_check": f"⚪ 純白之女查驗 **{data.get('target', '?')}**：{data.get('result', '?')}",
+            "wolf_witch_check": f"🐺 狼巫查驗 **{data.get('target', '?')}**：{data.get('result', '?')}",
+            "exact_check": f"🗿 石像鬼查驗 **{data.get('target', '?')}**：{data.get('result', '?')}",
+            "mirror_check": f"🪞 魔鏡查驗 **{data.get('target', '?')}**：{data.get('result', '?')}",
+            "double_check": f"🔮 覺醒預言家查驗 **{'、'.join(data.get('targets', ['?']))}**：{data.get('result', '?')}",
+            "claw_pass": f"🐾 **{data.get('actor', '?')}** 將狼王爪交給 **{data.get('target', '?')}**",
+            "devour": f"🌘 **{data.get('actor', '?')}** 吞噬 **{data.get('victim', '?')}** 的技能",
+            "knight_duel": f"⚔️ **{data.get('knight', '?')}** 決鬥 **{data.get('target', '?')}**：{data.get('result', '?')}",
+            "awakened_witch_poison": f"🧪 覺醒女巫調毒 **{data.get('target', '?')}**（{'生效' if data.get('succeeded') else '未生效'}）",
+            "awakened_hunt": f"🏹 **{data.get('hunter', '?')}** 巡獵帶走 **{data.get('target', '?')}**",
         }
         
         return formats.get(event_type, f"📝 {event_type}: {data}")
