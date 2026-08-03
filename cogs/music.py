@@ -68,14 +68,29 @@ class TrackLookupError(Exception):
         failure: PlaybackFailure = PlaybackFailure.OTHER,
         *,
         user_safe: bool = False,
+        cookie_rejected: bool = False,
     ) -> None:
         super().__init__(message)
         self.failure = failure
         self.user_safe = user_safe
+        self.cookie_rejected = cookie_rejected
 
 
 class CookieConfigurationError(Exception):
     """Raised when a configured cookie source cannot be used safely."""
+
+
+def _auth_required_message(*, cookie_rejected: bool, icon: str) -> str:
+    if cookie_rejected:
+        return (
+            f"{icon} YouTube 已讀取 Cookie，但登入驗證仍被拒絕。\n"
+            "目前的 Cookie 可能已過期、被 YouTube 輪替或失效；請重新匯出 "
+            "cookies.txt，更新 `YTDLP_COOKIES_B64` 後重新部署。"
+        )
+    return (
+        f"{icon} YouTube 要求登入驗證，但目前沒有可用的 Cookie。\n"
+        "Railway 請設定 `YTDLP_COOKIES_B64` 後重新部署。"
+    )
 
 
 class VoiceChannelMismatch(Exception):
@@ -1272,6 +1287,7 @@ class Music(commands.Cog):
         retried: set[tuple[YTDLAuth | None, bool]] = set()
         auth_candidates_loaded = False
         auth_candidates: list[YTDLAuth] = []
+        cookie_rejected = False
         best_error: Exception | None = None
         best_failure = PlaybackFailure.OTHER
         failure_priority = {
@@ -1354,6 +1370,8 @@ class Music(commands.Cog):
                     part for part in (last_attempt_log, str(error)) if part
                 )
                 failure = _classify_ytdlp_error(diagnostic)
+                if failure is PlaybackFailure.AUTH_REQUIRED and auth is not None:
+                    cookie_rejected = True
                 remember_failure(error, failure)
 
                 if failure in {
@@ -1410,7 +1428,9 @@ class Music(commands.Cog):
                     user_safe=True,
                 ) from best_error
             raise TrackLookupError(
-                str(best_error), best_failure
+                str(best_error),
+                best_failure,
+                cookie_rejected=cookie_rejected,
             ) from best_error
 
         info = data
@@ -2614,6 +2634,7 @@ class Music(commands.Cog):
                     tuple[tuple[str, ...], str | None, tuple[str, ...]], int
                 ] = {}
                 challenge_failure_seen = False
+                cookie_auth_attempted = bool(track.auth_label)
                 playback_auth_config_error: str | None = None
                 if self._is_youtube_url(track.webpage_url):
                     try:
@@ -2702,6 +2723,7 @@ class Music(commands.Cog):
                         and playback_auth_fallbacks
                     ):
                         auth = playback_auth_fallbacks.pop(0)
+                        cookie_auth_attempted = True
                         attempt = replace(
                             attempt,
                             auth_args=(
@@ -2910,10 +2932,9 @@ class Music(commands.Cog):
                             "請確認主機有足夠記憶體，且 yt-dlp、yt-dlp-ejs 與 Deno 都是最新版。"
                         )
                     elif action.failure is PlaybackFailure.AUTH_REQUIRED:
-                        failure_message = (
-                            "⚠️ YouTube 要求登入驗證。Railway 請設定 "
-                            "`YTDLP_COOKIES_B64`，並刪除 "
-                            "`YTDLP_COOKIES_FROM_BROWSER` 後重新部署。"
+                        failure_message = _auth_required_message(
+                            cookie_rejected=cookie_auth_attempted,
+                            icon="⚠️",
                         )
                     elif action.failure is PlaybackFailure.COOKIE_CONFIG:
                         failure_message = (
@@ -3215,10 +3236,9 @@ class Music(commands.Cog):
                 _sanitize_ytdlp_message(str(error)),
             )
             if error.failure is PlaybackFailure.AUTH_REQUIRED:
-                result_message = (
-                    "❌ YouTube 要求登入驗證，但 Cookie 仍未通過。\n"
-                    "Railway 請設定 `YTDLP_COOKIES_B64`，刪除 "
-                    "`YTDLP_COOKIES_FROM_BROWSER`，再重新部署。"
+                result_message = _auth_required_message(
+                    cookie_rejected=error.cookie_rejected,
+                    icon="❌",
                 )
             elif error.failure is PlaybackFailure.COOKIE_CONFIG:
                 result_message = (
