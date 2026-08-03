@@ -3,6 +3,8 @@
 基準：`08735ea`
 判定原則：以實際程式與測試為準，不以 README 的宣稱代替實作證據。
 
+範圍補充：目標是獨立 Discord Activity 視覺化遊戲，只從此專案抽取狼人殺規則與資料；音樂、AI、Help、一般指令和舊 Bot UI 不搬入新系統。死亡是否公開角色由房間設定控制。
+
 ## 分類說明
 
 | 分類 | 意義 |
@@ -11,13 +13,13 @@
 | 需重構 | 規則存在且值得保留，但資料模型、事件或職責必須拆分 |
 | 需重寫 | Discord View／訊息／討論串等呈現或運輸層，Activity 不能直接使用 |
 | 尚未實作 | 只有說明、常數或需求，沒有可執行功能 |
-| 保留 Bot adapter | Activity 不使用，但原 Bot 仍需保留並改成消費核心事件 |
+| 來源保留 | 原專案不刪除，但該功能不搬入 Activity 成品 |
 
 ## 功能總表
 
 | 功能 | 實際位置與主要函式／類別 | Discord 依賴 | 現況 | 沿用判定 |
 |---|---|---|---|---|
-| 狼人殺 Cog 與遊戲登錄 | `cogs/werewolf_bot.py`：`WerewolfBot`、`create_game()`、`get_game()` | `commands.Cog`、hybrid command、`ctx.send` | 每 guild 只保存一個記憶體 `WerewolfGame` | 保留 Bot adapter；房間登錄需由後端重寫 |
+| 狼人殺 Cog 與遊戲登錄 | `cogs/werewolf_bot.py`：`WerewolfBot`、`create_game()`、`get_game()` | `commands.Cog`、hybrid command、`ctx.send` | 每 guild 只保存一個記憶體 `WerewolfGame` | 只作來源參考；Activity 房間登錄由後端重寫 |
 | 大廳建立／遺失後重建 | `werewolf_bot.py:23-93` | Message、Embed、View、HTTPException | 等待中的大廳訊息可刷新或重建，玩家清單保留在同一程序 | Discord 呈現需重寫；「重建同一房間」語意可保留 |
 | 加入／離開 | `game.py:425-450`：`player_join()`、`player_leave()` | `discord.Interaction`、`interaction.user`、`edit_message` | 僅等待階段；最多 20 人；沒有準備、座位、觀戰或轉移房主 | 狀態規則需重構；UI 需重寫 |
 | 房主切換板型／開始／關閉 | `game.py:403-552` | Interaction、Bot owner、VoiceClient、Message、Embed、View | 房主或 Bot owner 可操作；開始後不可切板 | 權限規則需抽離；Discord 回應與語音取得重寫 |
@@ -31,8 +33,8 @@
 | 行動目標合法性 | `game.py:118-188`：`get_active_wolves()`、`get_action_targets()`、`get_night_action_limit()` | 無直接 I/O，但依賴 Discord-coupled Player | 狼刀隊友、隔離狼、自刀例外、相鄰、不可連續等 | 高優先可抽離純規則 |
 | 夜晚必做工作 | `game.py:905-982`：`_role_action_available()`、`get_required_night_tasks()`、`get_pending_night_tasks()` | 無直接 I/O | 支援優先技能、封技、選擇性技能與額外行動 | 可抽離；資料結構需型別化 |
 | 夜晚 UI | `game.py:770-1058`、`views.py:151-286` | View、Button、Select、Embed、Interaction、Channel | 單一公開按鈕開啟私密面板；大量 300 秒 View timeout | 需重寫為 Activity UI／WebSocket action |
-| 狼隊共同擊殺 | `game.py:1126-1134`、`1361-1404` | 回應訊息與私人 Thread | 每名 active wolf 投票；平票候選以亂數決定；可空刀／雙刀 | 投票與結算需抽離；Thread 保留 Bot adapter |
-| 狼人私人討論 | `game.py:616-644`：`create_wolf_thread()` | private thread、`add_user`、`send`、`delete` | 每夜建立、天亮刪除；隔離狼不加入 | Activity 要改寫；舊 Bot 可保留 adapter |
+| 狼隊共同擊殺 | `game.py:1126-1134`、`1361-1404` | 回應訊息與私人 Thread | 每名 active wolf 投票；平票候選以亂數決定；可空刀／雙刀 | 投票與結算抽入核心；Thread 不搬入 Activity |
+| 狼人私人討論 | `game.py:616-644`：`create_wolf_thread()` | private thread、`add_user`、`send`、`delete` | 每夜建立、天亮刪除；隔離狼不加入 | 改成 Activity 的私密視覺化狼隊區域；舊 Thread 不搬移 |
 | 身分私密顯示 | `game.py:649-746`、`views.py:455-471` | ephemeral Embed、Discord display name | 顯示本人角色與專屬隊友／查驗／資源資訊 | 私密投影規則需抽離；畫面需重寫 |
 | 預言家與具體查驗 | `game.py:1135-1156` | Interaction 回應 | 陣營查驗、具體角色查驗、雙人查驗、已查目標 | 規則可抽離；結果改成私密 `GameEvent` |
 | 女巫 | `skills.py:94-223`、`game.py:1487-1535` | View、Select、Interaction、Channel | 解藥、毒藥、不能自救、每夜配額；下半夜顯示狼刀 | 規則需抽離；UI 重寫；板型規則待確認 |
@@ -45,14 +47,14 @@
 | 放逐投票 | `game.py:2101-2219`、`views.py:328-405` | Button、Interaction、Channel、Embed | 存活且有票權者一票；全部完成即結算；公開每人投向；平票無人出局 | 計票可抽離；UI／公開策略重寫；平票規則待確認 |
 | 白天特殊技能 | `game.py:2224-2856` | 多個臨時 View、Select、Button、sleep、Channel | 定序回溯、河豚、騎士、赤月、自爆、覺醒守護／白狼引爆 | 規則需按技能拆 service；互動全面重寫 |
 | 獵人／狼王／覺醒獵人 | `game.py:2046-2064`、`2859-3009`；`views.py:288-326` | Shooter View、Select、Interaction、Channel | 依死亡原因排除部分開槍；支援多槍與連鎖槍手 | 規則需抽離；觸發條件待確認；UI 重寫 |
-| 死亡連鎖 | `game.py:1709-1970`、`2354-2400` | 產生公告字串 | 魅惑、攝夢、命運綁定、白貓、孤獨少女、守護等 | 抽離為確定性 damage/death resolver |
+| 死亡連鎖與翻牌 | `game.py:1709-1970`、`2354-2400` | 產生公告字串 | 魅惑、攝夢、命運綁定、白貓、孤獨少女、守護等；目前不同死因的翻牌行為不一致 | 抽離為確定性 damage/death resolver；一般死亡角色公開由房間設定控制 |
 | 勝負判定 | `game.py:3014-3024`：`check_winner()` | 無直接 I/O | 無狼＝好人；神或民任一全滅，或狼數達其餘好人數＝狼人 | 可抽離；板型化與第三方規則待確認 |
 | 結算與再開 | `game.py:3026-3068` | Embed、Channel、ReplayView、音訊／靜音 | 公布全部身分並顯示復盤；沒有「再來一局」狀態操作 | 結果資料可抽離；畫面重寫；再開尚未實作 |
 | 遊戲紀錄／復盤 | `game.py:3097-3104`、`replay.py` | 事件 payload 含顯示名稱；復盤是 Discord UI | 記憶體 list；事件沒有 schema/version；部分事件格式化 | 事件語意需重構；Discord Replay UI 重寫 |
 | 強制停止／玩家結束票 | `werewolf_bot.py:125-149`、`game.py:3070-3132` | command、Interaction、Channel | 管理員可 abort；白天過半數可結束 | 核心 command 可保留；transport 重寫；勝者語意待確認 |
-| 夜晚靜音／白天恢復 | `game.py:343-398`、`audio.py:25-48` | Guild、Member.voice、`member.edit(mute=...)` | 保存原伺服器靜音；夜晚全靜音；白天死者靜音、活人回原狀；結束恢復 | 保留 Bot voice adapter；核心只發 voice command event |
-| 遊戲音效 | `audio.py:50-116`、`game.py:359-369` | VoiceClient、FFmpegOpusAudio | 播放循環 `night.mp3`；可混 `voice_night_start.mp3`（目前檔案不存在） | 保留 Bot adapter；核心改發固定 audio key |
-| 音樂系統互斥 | `music.py:1496-1501`、`2992-3050` | Cog lookup、Guild、VoiceClient | 狼人殺開始接管語音，清空音樂佇列；結束後釋放 | 需保留相容 adapter，改用明確 integration event |
+| 夜晚靜音／白天恢復 | `game.py:343-398`、`audio.py:25-48` | Guild、Member.voice、`member.edit(mute=...)` | 保存原伺服器靜音；夜晚全靜音；白天死者靜音、活人回原狀；結束恢復 | 不進 Activity 核心；需要時另做可選 companion Bot，不搬舊音樂 Bot |
+| 遊戲音效 | `audio.py:50-116`、`game.py:359-369` | VoiceClient、FFmpegOpusAudio | 播放循環 `night.mp3`；可混 `voice_night_start.mp3`（目前檔案不存在） | Activity 前端使用合法授權音效／TTS；舊 VoiceClient 程式不搬移 |
+| 音樂系統互斥 | `music.py:1496-1501`、`2992-3050` | Cog lookup、Guild、VoiceClient | 狼人殺開始接管語音，清空音樂佇列；結束後釋放 | 來源保留但不屬於視覺化遊戲；不搬入、不安裝 |
 | 多語言 | 字串散落於 `catalog.py`、`game.py`、`skills.py`、`views.py`、`replay.py`、Cog | 所有 UI 都是中文硬編碼 | 尚未實作；角色 ID 也使用中文 | 需建立 key-based i18n；不可直接沿用文字作 ID |
 | 斷線重連 | 無 | 無 | 只支援「等待中大廳訊息遺失後重建」；不支援玩家／WebSocket／程序重啟恢復 | 尚未實作 |
 | 狀態序列化與持久化 | 無 | `Player.user` 等反而阻礙序列化 | 所有房間與復盤只在記憶體 | 尚未實作，階段 2 必須先補模型 |
@@ -201,7 +203,7 @@
   - `check_winner()`。
   - `log_event()` 的概念，但 payload 必須改用 ID/key，不保存可見名稱或中文句子。
 
-不能整段直接搬移的高價值規則包括 `handle_night_action()`、`check_phase_1_end()`、`start_day()`、`tally_votes()`、`_resolve_exile()` 與射擊流程；它們必須拆成「純 command handler／resolver」和「Discord adapter」。
+不能整段直接搬移的高價值規則包括 `handle_night_action()`、`check_phase_1_end()`、`start_day()`、`tally_votes()`、`_resolve_exile()` 與射擊流程；它們必須拆成「純 command handler／resolver」和「Activity 後端 transport」。
 
 ## 必須重寫的 Discord UI
 
@@ -209,6 +211,6 @@
 - `replay.py` 的 Discord View／Select／Embed；事件資料本身另行抽離。
 - `skills.py` 的所有互動回應、選單、協助者投票面板與 mention。
 - `game.py` 中動態建立的 View／Button／Select、ephemeral 回應、頻道公告、DM 與私人 Thread。
-- `werewolf_bot.py` 的大廳／狀態／規則呈現；保留指令入口作為舊 Bot adapter。
+- `werewolf_bot.py` 的大廳／狀態／規則呈現不搬入成品；由 Activity React 畫面取代，原檔保持不動。
 
 Activity 前端不得複製這些方法內的規則；它只呈現後端給該玩家的可見投影並送出 command。

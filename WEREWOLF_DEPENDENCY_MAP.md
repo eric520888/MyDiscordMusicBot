@@ -1,7 +1,7 @@
 # 狼人殺相依關係圖（階段 1）
 
 基準：`08735ea`
-目的：標出現有模組責任、所有 Discord 耦合類型、可抽離邊界與後續 adapter 位置。
+目的：標出現有模組責任、所有 Discord 耦合類型，以及抽成獨立 Discord Activity 視覺化遊戲的邊界。
 
 ## 現有模組圖
 
@@ -110,8 +110,8 @@ flowchart TD
 | `channel` | Discord TextChannel／Thread parent | transport routing metadata 存外層 session |
 | `host` | Discord Member/User | 核心只存 host player/user ID |
 | `Player.user` | Discord Member/User | 只存字串／整數識別與顯示 snapshot |
-| `lobby_message` | Discord Message | Bot adapter 的 message reference |
-| `wolf_thread` | Discord Thread | Bot adapter 的 thread reference |
+| `lobby_message` | Discord Message | 舊版來源專屬欄位；不搬入新 Activity |
+| `wolf_thread` | Discord Thread | 舊版來源專屬欄位；Activity 改用私密視角 UI |
 | `_state_lock` | `asyncio.Lock` | room runtime/service 管理，不序列化 |
 | View、Button、Select、Future | Discord UI／async runtime | transport session；核心只產生 command/result/event |
 
@@ -121,7 +121,7 @@ flowchart TD
 
 | 行／方法 | Discord API／物件 | 判定 |
 |---|---|---|
-| 1–18 | `discord`、`commands.Cog` | Bot adapter 保留 |
+| 1–18 | `discord`、`commands.Cog` | 舊版 transport；只作行為比對，不搬入 Activity |
 | 23–61 `_publish_lobby()`／`_restore_waiting_lobby()` | `ctx.channel`、`ctx.send`、Message.edit、HTTPException | UI 重寫；Activity 不直接使用 |
 | 63–93 `create_game()` | hybrid command、guild、ctx author/channel | command adapter；房間 service 後移 |
 | 96–122 `get_game()`／rules／status | guild、Embed、View、ephemeral | adapter；查詢改讀 service projection |
@@ -201,16 +201,16 @@ flowchart TD
 - 50–105：使用 Guild VoiceClient、`discord.FFmpegOpusAudio`。
 - 107–116：停止 VoiceClient。
 
-此檔不能進 engine。後續由 Bot integration 消費 `MUTE_*`、`PLAY_AUDIO`、`RESTORE_VOICE_STATE` 事件。
+此檔不能進 engine，也不搬入 Activity。Activity 音效由前端播放；若未來確定需要伺服器語音靜音，再由獨立且最小化的 companion Bot 消費 `MUTE_*`、`RESTORE_VOICE_STATE` 事件。
 
 ## 音樂系統的跨模組依賴
 
 | 位置 | 行為 | 遷移風險 |
 |---|---|---|
 | `music.py:1496-1501` | 查 Werewolf Cog 與 `game.phase`，阻擋音樂操作 | 新後端若不在同程序，不能再直接讀 game 物件 |
-| `music.py:2992-3031` | `prepare_external_audio()` 清佇列、停止播放、交出 VoiceClient | 必須由 Bot integration 明確接管；注意不可誤清新歌 |
-| `music.py:3033-3050` | `release_external_audio()` 歸還 VoiceClient | 所有結束、abort、例外路徑必須 exactly-once 或冪等 |
-| 多個音樂指令 | `external_audio` 或 active game 時拒絕控制 | 遷移後需有可查詢的 voice lease 狀態，不能依 Activity 前端 |
+| `music.py:2992-3031` | `prepare_external_audio()` 清佇列、停止播放、交出 VoiceClient | 舊系統耦合證據；新 Activity 不依賴或搬移此流程 |
+| `music.py:3033-3050` | `release_external_audio()` 歸還 VoiceClient | 舊系統耦合證據；新 Activity 不接管音樂 VoiceClient |
+| 多個音樂指令 | `external_audio` 或 active game 時拒絕控制 | 不納入新專案；若日後新增 companion Bot，必須另訂獨立語音租約 |
 
 ## 現有測試相依
 
@@ -221,20 +221,27 @@ flowchart TD
 
 ## 建議的目標邊界
 
+### 抽離範圍
+
+- 搬出：`cogs/werewolf_system/` 中的純規則、狀態、板型、事件與復盤資料。
+- 重做：大廳、身分、夜晚、白天、投票與結算，成為 Discord Activity 視覺化前端。
+- 新建：只服務狼人殺的 Activity 後端，負責房間、驗證、WebSocket、計時與私密投影。
+- 來源保留但不搬出：`cogs/werewolf_bot.py` 的指令／View，以及 `cogs/music.py`、`cogs/chat.py`、`cogs/custom_help.py`、`cogs/General.py`。
+- 不共用整套 `requirements.txt`：engine、Activity backend、frontend 各自宣告最小相依。
+- 語音伺服器靜音不是首要抽離內容；若之後需要 Discord 權限操作，再新增獨立、可選的最小 companion Bot。
+
 ```mermaid
 flowchart LR
     FE["Activity Frontend"] -->|"typed command"| BE["Activity Backend<br/>auth / rooms / websocket / timers"]
-    BC["Discord Bot Commands"] --> BA["Bot Adapter"]
     BE --> APP["Werewolf Application Service<br/>authorization / idempotency / projections"]
-    BA --> APP
     APP --> EN["werewolf_engine<br/>models / rules / actions / phases / events"]
-    EN -->|"GameEvent / VoiceCommand"| APP
+    EN -->|"GameEvent"| APP
     APP -->|"public/private projection"| BE
-    APP -->|"voice command"| VI["Bot Voice Integration"]
-    VI --> MU2["Existing Music / VoiceClient"]
     APP --> REPO["Room Repository Port"]
     REPO --> MEM["In-memory v1"]
     REPO -.-> REDIS["Redis later"]
+    SRC["Existing werewolf_system<br/>rules source only"] -. "extract + parity tests" .-> EN
+    BE -. "optional later" .-> CB["Minimal companion Bot<br/>voice permissions only"]
 ```
 
 ### 核心不得依賴
@@ -251,7 +258,8 @@ flowchart LR
 - `GameCommand`：actor ID、action ID、target ID、request ID、expected revision。
 - `GameEvent`：event key、recipient scope、payload IDs、sequence/revision。
 - `GameState` 與針對單一玩家的 `PlayerProjection`。
-- `VoiceCommand`：固定 key 與玩家 ID，不包含 Discord member。
+- 若未來加入 companion Bot，可額外輸出固定 voice command key 與玩家 ID；這不屬於第一版視覺化遊戲核心依賴。
+- 公開投影依房間的 `reveal_roles_on_death` 設定決定一般死亡是否帶 `role_id`；私密核心狀態本身不因此丟失角色資料。
 
 ## 現有程式到目標模組的映射
 
@@ -269,8 +277,8 @@ flowchart LR
 | vote／exile／shoot | `phases/day.py`、`rules/voting.py`、`rules/death.py` | 平票與技能規則板型化 |
 | `check_winner()` | `rules/victory.py` | 板型化並處理第三方 |
 | `log_event()` | `events/models.py`、`replay/service.py` | schema version、sequence、ID/key payload |
-| `views.py` | `bot/integrations/werewolf_views.py` + Activity React | 不進 engine |
-| `audio.py` | `bot/voice/werewolf_voice.py` | 消費 voice command，保證 restore |
-| `replay.py` | Bot replay presenter + backend replay query | 共用事件，不共用 UI |
+| `views.py` | `activity_frontend/src/` 的 React 視覺化介面 | 舊 Discord View 不搬入新專案 |
+| `audio.py` | Activity 前端音效服務；可選 companion voice 介面 | 舊音樂／語音實作不搬入新專案 |
+| `replay.py` | backend replay query + Activity replay 畫面 | 沿用事件語意，重做視覺化 UI |
 
-此依賴圖支援「同一套規則、兩個 transport」：舊 Discord Bot UI 與 Activity 後端都只能呼叫 application/core，不再各自維護規則。
+此依賴圖只服務獨立 Discord Activity：舊 Discord Bot 是規則與相容性比對來源，不是新核心的 consumer，也不在本次修改範圍內。

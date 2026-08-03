@@ -3,6 +3,12 @@
 基準：`08735ea`
 原則：下列項目若未確認，抽離核心時先保持舊程式行為，並以明確 compatibility setting 表示；除非測試證明是程式錯誤，否則不擅自更改。
 
+## 已確認決策
+
+- 目標成品是獨立 Discord Activity 視覺化狼人殺，只從原專案抽取狼人殺規則與資料；舊 Bot UI、音樂、AI、Help、一般指令及整套 Bot 相依都不搬入。
+- 一般死亡是否翻牌由房主在房間設定中調整，開始遊戲後鎖定。
+- 完整角色資料始終只保存在伺服器權威狀態；房間設定只控制公開死亡事件是否顯示角色。
+
 ## 高優先：會影響核心模型或勝負
 
 | 規則名稱 | 目前程式行為 | 可能選項 | 影響範圍 | 建議選項 |
@@ -41,16 +47,16 @@
 | 警長／警徽 | 只有 catalog 說明；沒有上警、退水、投票、警徽流、移交／撕毀、1.5 票實作 | A. MVP 不含；B. MVP 含完整警長；C. 房間可選 | phase graph、vote weight、speech、UI | MVP 明確排除並在 capability 中標 unavailable；後續以獨立 phase/role modifier 實作 |
 | 白天發言順序 | 只送討論提示後立即顯示投票面板；沒有順序、發言者或倒數 | A. 自由討論；B. 固定座位順序；C. 警長指定方向；D. 房間設定 | timers、voice commands、UI | MVP 可先自由討論 + 房主開始投票；若要自動主持需新增 discussion/speech/vote 子階段 |
 | 投票公開程度 | 投票時公開「某人已投票」但不公開目標；全員投完後公布每人投向 | A. 全公開；B. 匿名只公布票數；C. 即時公開投向；D. 板型／房間設定 | event visibility、replay、UI | 建立 `vote_visibility` 設定；legacy profile 為結算後公開明票 |
-| 死亡是否翻牌 | 夜晚公告只顯示死亡姓名；白天放逐、射擊等多處會顯示角色；部分特殊角色又刻意不翻牌 | A. 一律翻；B. 一律不翻；C. 依死因／角色／板型 | public projection、replay | 不能由 presenter 猜；BoardConfiguration + role override 明確設定，legacy 行為先逐死因鎖定 |
+| 特殊角色強制翻牌 | 一般死亡翻牌已確認由房間設定控制；但愚者、白貓、河豚等角色的技能本身包含翻牌，現有程式也以翻牌觸發能力 | A. 技能翻牌永遠覆蓋房間設定；B. 房間關閉翻牌時技能改為秘密觸發；C. 每角色設定 | role event、public projection、技能可理解性 | 先維持特殊角色舊行為，即技能所需翻牌仍公開；請再確認是否要允許房間設定覆蓋 |
 | 死亡玩家資訊權限 | 現在 Discord Bot 沒有持久私密 projection；死者仍可按查看本人身分，遊戲結束公開全部 | A. 死者只看原資訊；B. 死後看全局；C. 房間設定；D. 觀戰另計 | projection security、spectator | 預設死者不看額外秘密；房間設定可於結束後公開 |
-| 狼人討論方式 | 每夜建立 Discord 私人 Thread、天亮刪除 | A. Activity 私密聊天室；B. 保留 Discord Thread；C. 只靠語音；D. 混合 | Bot integration、Activity chat、安全 | Activity MVP 可保留 Bot Thread 作 adapter；若做 Activity chat，訊息必須 server-authorized wolf-team scope |
+| 狼人討論方式 | 每夜建立 Discord 私人 Thread、天亮刪除 | A. Activity 私密聊天室；B. 只顯示狼隊操作區、不含聊天；C. 只靠語音；D. 混合 | Activity chat、安全、MVP 範圍 | 不搬舊 Thread；MVP 先做私密狼隊操作與隊友資訊，若增加文字聊天必須由後端驗證 wolf-team scope |
 | 玩家提議強制結束 | 只在白天，過半數存活玩家同意即 `end_game("無 (強制結束)")` 並公開全部身分 | A. 保留並公開；B. 房主／管理員確認；C. 不公開；D. 任意階段 | ended reason、privacy、voice cleanup | 核心用 `ended_reason=player_vote_abort`，不要偽裝 winner；是否公開依房間規則 |
 
 ## 房間、計時與連線
 
 | 規則名稱 | 目前程式行為 | 可能選項 | 影響範圍 | 建議選項 |
 |---|---|---|---|---|
-| 房間唯一鍵 | Cog 以 `guild_id` 索引，一個 guild 只能一局 | A. guild；B. voice channel；C. Activity instance；D. guild+channel+instance | RoomState、auth、Bot integration | Activity 以驗證後的 instance/channel/guild binding 產生 opaque room ID；不要信任前端自填 |
+| 房間唯一鍵 | Cog 以 `guild_id` 索引，一個 guild 只能一局 | A. guild；B. voice channel；C. Activity instance；D. guild+channel+instance | RoomState、Activity auth、backend routing | Activity 以驗證後的 instance/channel/guild binding 產生 opaque room ID；不要信任前端自填 |
 | 房主離開／斷線 | 等待中可退出，但 host 本人退出不會轉移房主；遊戲中不能離開，沒有 reconnect model | A. 自動轉移；B. 關房；C. 保留 host 一段時間；D. co-host | room service、timer、UI | 等待中轉移給最早加入者；遊戲中保留 host 權限並允許 reconnect，逾時再依設定處理 |
 | 準備與觀戰 | 沒有 ready、spectator、seat claim | A. 全部加入即算準備；B. 顯式 ready；C. 觀戰；D. 房主可強制 | RoomState、開始驗證、UI | Activity 使用顯式 ready；觀戰第一版可禁用但 schema 預留 |
 | 身分確認倒數 | 發牌後固定 `asyncio.sleep(10)`，程序重啟即遺失 | A. 固定 10 秒；B. 全員確認即提前；C. 房間設定 | server timer、reconnect | 後端保存 deadline；全員確認可提前，但 deadline 到仍前進 |
@@ -65,7 +71,7 @@
 | 規則名稱 | 目前程式行為 | 可能選項 | 影響範圍 | 建議選項 |
 |---|---|---|---|---|
 | 白天語音控制 | 天亮後存活玩家恢復遊戲開始前各自 mute 狀態，死亡玩家保持 server mute；沒有逐一發言控制 | A. 自由發言；B. 只解鎖當前發言者；C. 房間設定 | voice command、speech phase | legacy 為自由發言；自動主持模式新增 speaker queue，不改核心勝負規則 |
-| 原始 mute 狀態 | 只在找到 guild member 且有 voice state 時保存；結束／abort 時嘗試恢復 | A. 保存 server mute；B. 同時保存 self mute/deaf（Bot 無法改 self）；C. 只恢復被 Bot 改動者 | Bot adapter cleanup | 保存並恢復 Bot 可控制的 server mute，使用 voice lease 與冪等 restore；記錄失敗但不吞例外 |
+| 是否需要 companion Bot 控制語音 | 舊系統會透過 Bot 管理 server mute；Discord Activity 網頁本身不能直接取代所有 Bot 權限操作 | A. 第一版不控 server mute；B. 另做最小 companion Bot；C. 只顯示發言提示 | Activity 範圍、部署、Discord 權限 | 第一版視覺化遊戲不搬舊音樂 Bot；若確定需要自動靜音，再獨立做只含狼人殺語音權限的最小 companion |
 | 音效 key 與素材 | 規則直接要求 `night.mp3`、`voice_night_start.mp3`；後者目前不存在，前者授權不明 | A. 固定 key + locale asset；B. TTS；C. 無語音 | event schema、assets、license | 核心只發 `night_start` 等 key；先更換有授權素材，缺檔時安全退化成文字 |
 
 ## 資料來源與本地化

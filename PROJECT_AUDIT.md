@@ -7,6 +7,7 @@
 
 ## 結論摘要
 
+- 目標成品是獨立的 Discord Activity 視覺化狼人殺。現有專案只作為狼人殺規則與功能來源；音樂、AI、Help、一般指令及其套件不搬入新遊戲。
 - 專案可以在 Windows、Python 3.12.2 的隔離環境中完整安裝；`pip check` 回報沒有相依衝突。
 - `discord.py[voice]` 實際安裝版本為 2.7.1，與 `requirements.txt` 和 README 一致。
 - 所有 Python 檔案均可編譯；目前 48 項測試全部通過。
@@ -229,7 +230,7 @@ Activity 目標需要但目前尚未存在的鍵（例如 Discord Client ID／Se
 
 ## 階段 0 結論
 
-基準版本目前可安裝、可匯入、可通過所有現有測試，適合採「保留舊 Bot、逐步抽離核心」策略。不得直接把 `WerewolfGame` 搬到 FastAPI；應先建立可序列化模型與純規則服務，再以 Discord adapter 維持舊行為。詳細功能去留、相依關係與遷移順序分別見：
+基準版本目前可安裝、可匯入、可通過所有現有測試，適合作為 Discord Activity 的規則來源。不得直接把 `WerewolfGame` 搬到 FastAPI；應先抽出可序列化模型與純規則服務，再由 Activity 後端呼叫。原 Bot 保持不動，不是新視覺化遊戲的執行相依。詳細功能去留、相依關係與遷移順序分別見：
 
 - `WEREWOLF_FEATURE_MATRIX.md`
 - `WEREWOLF_DEPENDENCY_MAP.md`
@@ -237,3 +238,5 @@ Activity 目標需要但目前尚未存在的鍵（例如 Discord Client ID／Se
 - `OPEN_RULE_QUESTIONS.md`
 
 本階段沒有修改任何狼人殺實際行為、沒有建立前端或 FastAPI，也沒有刪除檔案。
+
+後續不會搬移或重新安裝整套多功能 Bot。完整 `requirements.txt` 的安裝只用於本次基準稽核；正式成品只包含狼人殺核心、Activity 後端與視覺化前端，並使用各自最小化的相依清單。

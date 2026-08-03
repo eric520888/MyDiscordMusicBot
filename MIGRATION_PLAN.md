@@ -9,10 +9,29 @@
 
 1. 把現有 48 項測試當成不可任意破壞的基準。
 2. 先建立不依賴 Discord 的核心模型與純規則。
-3. 舊 `WerewolfGame` 保持可運行，逐個功能改成呼叫核心。
-4. 核心規則只保留一份；Bot 與 Activity 是兩個 adapter／transport。
-5. Activity 後端完成伺服器權威與私密投影後，才接 Activity 前端。
+3. 舊 `WerewolfGame` 保持不動，只作規則來源與 parity 對照；不要求舊 Bot 改用新核心。
+4. 新核心只服務獨立 Discord Activity 視覺化遊戲。
+5. Activity 後端完成伺服器權威與私密投影後，再接 Activity 前端。
 6. 每一小步都同時跑新核心測試與現有回歸測試，不能以刪測試換取通過。
+
+## 明確抽離範圍
+
+本工作的交付物是獨立 Discord Activity 視覺化狼人殺，不是重構整個多功能 Bot：
+
+- 抽離 `cogs/werewolf_system/` 中的狼人殺資料、規則、狀態機、事件與復盤資料。
+- `cogs/werewolf_bot.py` 和舊 Discord View 只作行為參考，保持原狀，不搬入成品，也不要求改呼叫新核心。
+- 第一版不搬既有語音／音樂整合；若之後確定需要 server mute，另做只含狼人殺權限操作的可選 companion Bot。
+- 不搬移音樂播放、YouTube、Gemini、Google Sheets、Help 或一般指令功能。
+- 不把原本整份 `requirements.txt` 帶進新核心或 Activity 後端。
+
+相依套件分離原則：
+
+- `werewolf_engine`：優先只用 Python 標準函式庫；若採 Pydantic，只宣告 Pydantic，不依賴 `discord.py`、`yt-dlp`、Gemini、gspread 或 oauth2client。
+- `activity_backend`：只安裝 FastAPI、ASGI/WebSocket、模型與實際使用的 auth/storage 套件。
+- 原 Bot：維持原專案現況，不是 Activity 的執行或部署相依。
+- `activity_frontend`：獨立 Node 套件，不與 Python Bot requirements 混用。
+
+本次階段 0 為了驗證原始專案可安裝，曾在被 Git 忽略的 `venv/` 安裝完整既有 requirements；這不是未來狼人殺系統的部署依賴，也沒有被提交。
 
 本計畫不採取以下做法：
 
@@ -22,15 +41,14 @@
 - 不同時維護一套 Bot 規則和另一套 Activity 規則。
 - 不在規則尚未確認前「修正」舊行為。
 
-## 相容性契約
+## 來源保護與抽離契約
 
 抽離期間必須持續成立：
 
-- `/ww_create`、`/ww_rules`、`/ww_status`、`/ww_force_stop` 仍可註冊。
+- 不刪除或修改原專案 `/ww_create`、`/ww_rules`、`/ww_status`、`/ww_force_stop`。
 - 現有 23 套固定板型與 3 個彈性板型 ID 不消失。
 - 現有 46 個可建立角色不因搬移而遺失。
-- 舊 Discord 大廳、身分查看、夜間操作、投票、開槍、復盤與語音清理仍能運作。
-- 遊戲結束、中止或例外後，語音所有權與原始靜音狀態必須恢復。
+- 新 Activity 以獨立測試重現大廳、身分、夜間、投票、開槍與復盤；不共用舊 Discord View。
 - 現有 48 項測試始終通過；若測試需要更換 import，只能保持同等或更強的行為斷言。
 - `LICENSE`、README 的作者／授權說明與 Git 歷史保留。
 
@@ -80,20 +98,19 @@ werewolf_engine/
 └── tests/
 ```
 
-在階段 4 才加入或整理：
+Activity 成品新增自己的 application/backend/frontend，不新增舊 Bot adapter：
 
 ```text
-bot/
-├── cogs/
-├── voice/
-└── integrations/
+werewolf_engine/                      純規則與可序列化狀態
+activity_backend/                     Discord 驗證、房間、WebSocket、計時
+activity_frontend/                    Discord Activity 視覺化介面
 ```
 
-若直接移動現有 `cogs/` 會影響 extension 載入，先建立 adapter 檔並保留舊 import shim；待測試與部署都切換後才改目錄。
+不移動或複製 `werewolf_bot.py`、`music.py`、`chat.py`、`General.py` 或其他 Cog。Activity 直接使用自己的後端 transport，不為了目錄外觀改寫無關功能。
 
 ## 穩定角色 ID 遷移
 
-目前中文名稱同時作為邏輯 ID、字典 key 與顯示字串。第一個核心提交必須建立 ASCII ID，並提供舊值 alias；不得一次修改舊 Bot 所有判斷。
+目前中文名稱同時作為邏輯 ID、字典 key 與顯示字串。第一個核心提交必須建立 ASCII ID；抽取器／parity fixture 可接受舊中文值，但不修改舊 Bot 的判斷。
 
 | 現有值 | 新 ID | 現有值 | 新 ID |
 |---|---|---|---|
@@ -130,7 +147,7 @@ bot/
 遷移規則：
 
 - 序列化只輸出新 ID。
-- 讀取舊資料或 legacy adapter 時接受中文 alias。
+- 抽取舊規則資料與建立 parity fixtures 時接受中文 alias；新 Activity API 不輸出舊中文 ID。
 - UI 只使用 `role.<id>.name`、`role.<id>.description` key。
 - Python 類別名不能當持久化 ID。
 - 覺醒隱狼模仿後不可再把 `role.name` 改成動態中文；應保留 `role_id=awakened_hidden_wolf`，另存 `mimicked_role_id`。
@@ -173,6 +190,14 @@ bot/
 - `pending_effects`、`pending_decisions`
 - `winner`、`ended_reason`
 - `event_sequence`
+
+### 死亡翻牌房間設定
+
+- `GameSettings.reveal_roles_on_death: bool` 由房主在大廳設定。
+- 開始遊戲後鎖定設定，避免中途改變公開資訊規則。
+- 一般死亡公開事件只有在設定開啟時才包含 `role_id`；關閉時只包含玩家與死因等允許公開的資料。
+- 完整角色仍保存在伺服器權威狀態，且遊戲結算是否全員公開可另設獨立設定。
+- 愚者、白貓、河豚等「翻牌本身就是技能」的角色是否覆蓋房間設定，尚待確認，先保持舊角色行為。
 
 ### 其他必要模型
 
@@ -276,47 +301,24 @@ bot/
 
 提交建議：`test: add werewolf engine tests`
 
-## 階段 4：舊 Bot 改用新核心
+## 階段 4：Activity application service
 
-### adapter 模式
+在 FastAPI transport 前先建立只服務視覺化遊戲的 application layer：
 
-建立 `LegacyDiscordWerewolfAdapter`：
+- `create_room`、`join_room`、`leave_room`、`set_ready`、`start_game`。
+- `submit_action`、`submit_vote`、`advance_phase`、`abort_game`。
+- 房主與玩家授權、request ID 冪等、expected revision。
+- 依 event visibility 建立公開、狼隊與單一玩家投影。
+- 依 `reveal_roles_on_death` 過濾公開死亡事件。
+- repository 與 timer port；第一版使用 in-memory fake 寫測試。
 
-- 把 Interaction 轉成 typed command。
-- 呼叫 application service。
-- 依 event visibility 只向正確的 Discord 使用者／群組送訊息。
-- 將 public event 轉成原本 Embed／View。
-- 將 voice command 交給 Bot voice integration。
+這一層不得 import `discord.py`、FastAPI 或舊 `werewolf_bot.py`。它讓 WebSocket transport 保持很薄，也方便在沒有 Discord 連線時完成整局測試。
 
-遷移順序：
-
-1. rules/status query。
-2. 大廳與 board selection。
-3. 發牌與身分 projection。
-4. MVP 夜間 action。
-5. 投票／死亡／勝負。
-6. 射擊與復盤。
-7. 逐套特殊板型。
-
-每一步保留舊方法作 fallback，直到 parity tests 與 Discord staging 測試通過；切換後刪除的是「重複規則」，不是功能。
-
-### 語音整合
-
-核心只發：
-
-- `MUTE_ALL_LIVING_PLAYERS`
-- `APPLY_DAY_VOICE_STATE`
-- `MUTE_DEAD_PLAYER`
-- `PLAY_AUDIO`（audio key）
-- `RESTORE_VOICE_STATE`
-
-Bot adapter 保存 Discord 原始 mute 狀態與 VoiceClient lease。所有 `end_game`、abort、Cog unload、exception、process shutdown 都走同一個冪等 cleanup。
-
-提交建議：`refactor: use werewolf engine from discord bot`
+提交建議：`feat: add werewolf activity application service`
 
 ## 階段 5：Activity 後端
 
-前提：MVP 核心與舊 Bot adapter 已通過測試。
+前提：MVP 核心與 Activity application service 已通過測試。
 
 ### 最小元件
 
@@ -365,12 +367,14 @@ Bot adapter 保存 Discord 原始 mute 狀態與 VoiceClient lease。所有 `end
 - fallback：玩家設定 → Discord locale → 房間預設 → `en-US`。
 - CI 檢查三個 locale key 集合一致、無 UI literal 漏網。
 
-## 階段 8：Bot 語音控制
+## 階段 8：可選的 Discord 語音 companion
 
-- 後端/application event 送至 Bot integration。
-- 明確 voice lease，避免 Activity 後端假設有 Discord 語音權限。
-- 測試正常結束、強制結束、socket 全斷、後端 exception、Bot reload、process shutdown。
-- 每條路徑都斷言恢復原始 mute state，且 Music 可重新接管。
+這不是第一版視覺化 Activity 的必要條件，也不使用原音樂 Bot。只有確認需要自動 server mute 時才建立：
+
+- 最小 Discord Bot，只接受後端簽署的狼人殺 voice command。
+- 不含音樂、AI、Help 或一般指令。
+- 保存並冪等恢復原始 server mute state。
+- 測試正常結束、強制結束、socket 全斷、後端例外與 companion 重啟。
 
 ## 階段 9：部署準備
 
@@ -383,17 +387,19 @@ Bot adapter 保存 Discord 原始 mute 狀態與 VoiceClient lease。所有 `end
 - `.env.example` 加 Activity 所需鍵，但不放真值。
 - production security tests 與備份／復原演練。
 
+部署產物只包含狼人殺 engine、Activity backend/frontend；可選語音 companion 使用獨立映像。不把舊 Bot、音樂、AI 或其他 Cog 打包進狼人殺服務。
+
 ## 每階段測試閘門
 
 | 階段 | 必跑檢查 | 必須結果 |
 |---|---|---|
 | 2 每個提交 | compileall、engine unit、legacy unittest | 全通過；無 Discord import 進 engine |
 | 3 | serialization、property/boundary、private projection、legacy parity | 全通過；未確認規則維持 legacy |
-| 4 | engine + legacy + adapter + Discord staging checklist | 舊 Bot 功能與語音 cleanup 不退化 |
+| 4 | application service、authorization、projection、repository/timer fakes | 可離線完成整局且不 import Discord/FastAPI |
 | 5 | API/WebSocket auth、room、idempotency、reconnect、privacy、timer | 非法／重播／越權操作全部拒絕 |
 | 6 | TypeScript typecheck、component、responsive、socket reconnect | strict 無錯；秘密不進其他玩家 store |
 | 7 | locale key parity、fallback、三語 UI | 無硬編碼可見文字 |
-| 8 | voice failure matrix | 所有終止路徑恢復語音 |
+| 8（可選） | companion auth、voice failure matrix | 所有終止路徑恢復語音 |
 | 9 | Docker build、compose smoke、health、security、deployment runbook | 可由乾淨環境重現 |
 
 ## 建議提交順序
@@ -409,23 +415,23 @@ Bot adapter 保存 Discord 原始 mute 狀態與 VoiceClient lease。所有 `end
 4. `refactor: extract core werewolf rules`
 5. `refactor: add werewolf events and private projections`
 6. `test: add werewolf engine tests`
-7. `refactor: use werewolf engine from discord bot`
+7. `feat: add werewolf activity application service`
 8. `feat: create activity backend foundation`
 9. `feat: add websocket room synchronization`
 10. `feat: add reconnect and idempotent actions`
 11. `feat: create activity frontend`
 12. `feat: add discord embedded app sdk`
 13. `feat: add localization system`
-14. `feat: integrate bot voice controls`
+14. `feat: add optional werewolf voice companion`
 15. `docs: add local development and deployment guide`
 
 每個提交只做一個可驗證責任，不混入音樂 Bot 的無關格式化或重寫，不 force push。
 
 ## 回滾策略
 
-- 新 engine 在階段 2–3 是 additive，舊 Bot 不切換即可回滾。
-- 階段 4 每個功能以 adapter feature flag／單一路由切換；不要在同一提交刪舊規則。
-- 只有當新路徑 parity、Discord staging、語音 cleanup 全通過後，下一個獨立提交才移除該段重複 legacy 規則。
+- 新 engine 與 Activity 目錄是 additive；原 Bot 完全不切換，回滾只需停用新服務。
+- parity fixtures 以舊系統輸出作比較，但不從舊檔刪除規則或 View。
+- Activity 功能以獨立 feature flag／room capability 漸進開放，不改動原 Bot 的部署。
 - 狀態 schema 必須有版本；任何不相容變更提供 migration function 與 fixture。
 - backend room repository 先以 interface 包裝，in-memory 與 Redis 可替換，不讓 engine 知道儲存實作。
 
@@ -436,7 +442,7 @@ Bot adapter 保存 Discord 原始 mute 狀態與 VoiceClient lease。所有 `end
 - 各板型的勝利條件與第三方勝利。
 - 女巫自救、同守同救、狼刀／技能優先序。
 - 狼票與白天票平票處理。
-- 死亡翻牌、死亡玩家資訊、觀戰資訊。
+- 特殊角色的強制翻牌是否覆蓋房間的死亡翻牌設定，以及死亡玩家／觀戰資訊。
 - 獵人／狼王各死因是否可開槍。
 - 警長、發言與語音主持規則。
 - Activity MVP 是否只開 `standard`，以及實際 6–12 人板型組合。
