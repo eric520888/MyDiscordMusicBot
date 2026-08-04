@@ -10,6 +10,7 @@ from .ids import (
     PlayerStatus,
     RoleId,
     VoteVisibility,
+    WinnerId,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "PlayerStatus",
     "RoleId",
     "VoteVisibility",
+    "WinnerId",
 ]

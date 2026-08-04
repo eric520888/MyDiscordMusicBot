@@ -14,6 +14,12 @@ class CampId(StrEnum):
     THIRD_PARTY = "third_party"
 
 
+class WinnerId(StrEnum):
+    GOOD = "good"
+    WOLF = "wolf"
+    THIRD_PARTY = "third_party"
+
+
 class RoleId(StrEnum):
     WEREWOLF = "werewolf"
     VILLAGER = "villager"

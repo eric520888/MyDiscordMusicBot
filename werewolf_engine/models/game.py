@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping, Self
 
-from ..ids import BoardId, CampId, GamePhase
+from ..ids import BoardId, GamePhase, WinnerId
 from .action import NightAction
 from .common import (
     JsonModel,
@@ -42,7 +42,7 @@ class GameState(JsonModel):
     vote_state: VoteState | None = None
     pending_effects: list[EffectState] = field(default_factory=list)
     pending_decisions: list[dict[str, JsonValue]] = field(default_factory=list)
-    winner: CampId | None = None
+    winner: WinnerId | None = None
     ended_reason: str | None = None
     event_sequence: int = 0
 
@@ -87,7 +87,7 @@ class GameState(JsonModel):
             self.vote_state = VoteState.from_dict(self.vote_state)
         self.pending_effects = [effect if isinstance(effect, EffectState) else EffectState.from_dict(effect) for effect in self.pending_effects]
         self.pending_decisions = [require_json_object(decision, "pending_decision") for decision in self.pending_decisions]
-        self.winner = CampId(self.winner) if self.winner is not None else None
+        self.winner = WinnerId(self.winner) if self.winner is not None else None
         if self.ended_reason is not None:
             self.ended_reason = require_string(self.ended_reason, "ended_reason", max_length=128)
         self.event_sequence = require_int(self.event_sequence, "event_sequence")
@@ -137,7 +137,7 @@ class GameState(JsonModel):
             vote_state=VoteState.from_dict(data["vote_state"]) if data.get("vote_state") is not None else None,
             pending_effects=[EffectState.from_dict(effect) for effect in data.get("pending_effects", [])],
             pending_decisions=list(data.get("pending_decisions", [])),
-            winner=CampId(data["winner"]) if data.get("winner") is not None else None,
+            winner=WinnerId(data["winner"]) if data.get("winner") is not None else None,
             ended_reason=data.get("ended_reason"),
             event_sequence=data.get("event_sequence", 0),
         )
