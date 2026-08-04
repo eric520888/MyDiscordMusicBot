@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: moonlit-werewolf-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile.activity
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: off
+    envVars:
+      - key: DISCORD_CLIENT_ID
+        value: "1534122599225884702"
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
