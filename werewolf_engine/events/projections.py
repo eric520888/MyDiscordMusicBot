@@ -101,6 +101,8 @@ def project_state_for_player(
         revision=game.revision,
         settings=game.settings,
         players=projected_players,
+        phase_started_at=game.phase_started_at,
+        phase_ends_at=game.phase_ends_at,
         self_role_state=self_role_state,
         wolf_team_player_ids=_known_wolf_team(game, viewer_player_id),
         pending_decisions=tuple(
@@ -109,4 +111,6 @@ def project_state_for_player(
             if decision.get("player_id") == viewer_player_id
         ),
         events=projected_events,
+        winner=game.winner,
+        ended_reason=game.ended_reason,
     )

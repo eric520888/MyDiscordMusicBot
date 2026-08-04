@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Self
 
 from werewolf_engine.models import GameEvent, GameState, PlayerState, RoomState
@@ -43,6 +43,7 @@ class RoomAggregate(JsonModel):
     room: RoomState
     players: dict[str, PlayerState]
     game: GameState | None = None
+    events: list[GameEvent] = field(default_factory=list)
     revision: int = 0
 
     def __post_init__(self) -> None:
@@ -56,6 +57,10 @@ class RoomAggregate(JsonModel):
             raise ValueError("room members must match aggregate players")
         if self.game is not None and not isinstance(self.game, GameState):
             self.game = GameState.from_dict(self.game)
+        self.events = [
+            event if isinstance(event, GameEvent) else GameEvent.from_dict(event)
+            for event in self.events
+        ]
         self.revision = require_int(self.revision, "revision")
 
     def player_for_discord_user(self, discord_user_id: str) -> PlayerState | None:
@@ -66,7 +71,7 @@ class RoomAggregate(JsonModel):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
-        allowed = {"room", "players", "game", "revision"}
+        allowed = {"room", "players", "game", "events", "revision"}
         assert_allowed_keys(data, allowed, required={"room", "players"})
         players = data["players"]
         if not isinstance(players, Mapping):
@@ -75,6 +80,7 @@ class RoomAggregate(JsonModel):
             room=RoomState.from_dict(data["room"]),
             players={player_id: PlayerState.from_dict(player) for player_id, player in players.items()},
             game=GameState.from_dict(data["game"]) if data.get("game") is not None else None,
+            events=[GameEvent.from_dict(event) for event in data.get("events", [])],
             revision=data.get("revision", 0),
         )
 

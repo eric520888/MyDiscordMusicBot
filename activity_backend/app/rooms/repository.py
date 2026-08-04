@@ -22,6 +22,8 @@ class RoomRepository(Protocol):
 
     def delete(self, room_id: str, *, expected_revision: int) -> None: ...
 
+    def list_rooms(self) -> tuple[RoomAggregate, ...]: ...
+
 
 def _clone(aggregate: RoomAggregate) -> RoomAggregate:
     return RoomAggregate.from_dict(aggregate.to_dict())
@@ -75,3 +77,6 @@ class InMemoryRoomRepository:
         )
         del self._rooms[room_id]
         self._binding_index.pop(binding, None)
+
+    def list_rooms(self) -> tuple[RoomAggregate, ...]:
+        return tuple(_clone(aggregate) for aggregate in self._rooms.values())

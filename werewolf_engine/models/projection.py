@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping, Self
 
-from ..ids import BoardId, EventType, GamePhase, PlayerStatus, RoleId
+from ..ids import BoardId, EventType, GamePhase, PlayerStatus, RoleId, WinnerId
 from .common import (
     JsonModel,
     JsonValue,
@@ -110,10 +110,14 @@ class PlayerProjection(JsonModel):
     revision: int
     settings: GameSettings
     players: tuple[ProjectedPlayer, ...]
+    phase_started_at: datetime | None = None
+    phase_ends_at: datetime | None = None
     self_role_state: RoleState | None = None
     wolf_team_player_ids: tuple[str, ...] = ()
     pending_decisions: tuple[dict[str, JsonValue], ...] = ()
     events: tuple[ProjectedEvent, ...] = ()
+    winner: WinnerId | None = None
+    ended_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "game_id", require_identifier(self.game_id, "game_id"))
@@ -122,6 +126,18 @@ class PlayerProjection(JsonModel):
         object.__setattr__(self, "phase", GamePhase(self.phase))
         object.__setattr__(self, "round_number", require_int(self.round_number, "round_number"))
         object.__setattr__(self, "revision", require_int(self.revision, "revision"))
+        if self.phase_started_at is not None:
+            object.__setattr__(
+                self,
+                "phase_started_at",
+                normalize_timestamp(self.phase_started_at, "phase_started_at"),
+            )
+        if self.phase_ends_at is not None:
+            object.__setattr__(
+                self,
+                "phase_ends_at",
+                normalize_timestamp(self.phase_ends_at, "phase_ends_at"),
+            )
         if not isinstance(self.settings, GameSettings):
             object.__setattr__(self, "settings", GameSettings.from_dict(self.settings))
         players = tuple(
@@ -146,6 +162,13 @@ class PlayerProjection(JsonModel):
             "events",
             tuple(event if isinstance(event, ProjectedEvent) else ProjectedEvent.from_dict(event) for event in self.events),
         )
+        object.__setattr__(self, "winner", WinnerId(self.winner) if self.winner is not None else None)
+        if self.ended_reason is not None:
+            object.__setattr__(
+                self,
+                "ended_reason",
+                require_string(self.ended_reason, "ended_reason", max_length=128),
+            )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
@@ -158,12 +181,25 @@ class PlayerProjection(JsonModel):
             "revision",
             "settings",
             "players",
+            "phase_started_at",
+            "phase_ends_at",
             "self_role_state",
             "wolf_team_player_ids",
             "pending_decisions",
             "events",
+            "winner",
+            "ended_reason",
         }
-        required = allowed - {"self_role_state", "wolf_team_player_ids", "pending_decisions", "events"}
+        required = allowed - {
+            "self_role_state",
+            "phase_started_at",
+            "phase_ends_at",
+            "wolf_team_player_ids",
+            "pending_decisions",
+            "events",
+            "winner",
+            "ended_reason",
+        }
         assert_allowed_keys(data, allowed, required=required)
         return cls(
             game_id=data["game_id"],
@@ -174,8 +210,20 @@ class PlayerProjection(JsonModel):
             revision=data["revision"],
             settings=GameSettings.from_dict(data["settings"]),
             players=tuple(ProjectedPlayer.from_dict(player) for player in data["players"]),
+            phase_started_at=(
+                parse_timestamp(data["phase_started_at"], "phase_started_at")
+                if data.get("phase_started_at") is not None
+                else None
+            ),
+            phase_ends_at=(
+                parse_timestamp(data["phase_ends_at"], "phase_ends_at")
+                if data.get("phase_ends_at") is not None
+                else None
+            ),
             self_role_state=RoleState.from_dict(data["self_role_state"]) if data.get("self_role_state") else None,
             wolf_team_player_ids=tuple(data.get("wolf_team_player_ids", [])),
             pending_decisions=tuple(data.get("pending_decisions", [])),
             events=tuple(ProjectedEvent.from_dict(event) for event in data.get("events", [])),
+            winner=WinnerId(data["winner"]) if data.get("winner") is not None else None,
+            ended_reason=data.get("ended_reason"),
         )

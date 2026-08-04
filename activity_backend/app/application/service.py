@@ -6,7 +6,16 @@ import random
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
-from werewolf_engine.ids import EventType, EventVisibility, GamePhase, PlayerStatus
+from werewolf_engine.ids import ActionId, EventType, EventVisibility, GamePhase, PlayerStatus
+from werewolf_engine.actions import (
+    GameRuleError,
+    resolve_day_vote,
+    resolve_night_actions,
+    submit_day_vote,
+    submit_hunter_decision,
+    submit_night_action,
+    submit_witch_action,
+)
 from werewolf_engine.models import (
     BoardConfiguration,
     GameEvent,
@@ -46,6 +55,12 @@ class WerewolfApplicationService:
         aggregate = self._repository.get(room_id)
         if aggregate is None:
             raise ApplicationError("ROOM_NOT_FOUND", "room does not exist")
+        return aggregate
+
+    def get_room_for_context(self, room_id: str, context: ActivityContext) -> RoomAggregate:
+        aggregate = self._get_room(room_id)
+        self._assert_binding(aggregate, context)
+        self._actor(aggregate, context)
         return aggregate
 
     @staticmethod
@@ -133,6 +148,9 @@ class WerewolfApplicationService:
             raise ApplicationError("GAME_ALREADY_STARTED", "new players cannot join an active game")
         if spectator and not aggregate.room.settings.allow_spectators:
             raise ApplicationError("SPECTATORS_DISABLED", "spectators are disabled for this room")
+        seated_count = sum(not player.spectator for player in aggregate.players.values())
+        if not spectator and seated_count >= 12:
+            raise ApplicationError("ROOM_FULL", "the Activity supports at most 12 seated players")
         expected_revision = aggregate.revision
         seat = max((player.seat for player in aggregate.players.values()), default=0) + 1
         player_id = self._id_factory("player")
@@ -279,6 +297,7 @@ class WerewolfApplicationService:
                 )
             )
         aggregate.game = game
+        aggregate.events.extend(events)
         aggregate.room.game_id = game_id
         aggregate.room.settings = settings
         self._save(aggregate, expected_revision)
@@ -299,8 +318,201 @@ class WerewolfApplicationService:
             event_id_prefix="game-event",
         )
         aggregate.game = transition.game
+        aggregate.events.append(transition.event)
         self._save(aggregate, expected_revision)
         return RoomCommandResult(self._get_room(room_id), (transition.event,))
+
+    def submit_game_action(
+        self,
+        room_id: str,
+        context: ActivityContext,
+        *,
+        action_id: str,
+        target_player_ids: tuple[str, ...],
+        request_id: str,
+        expected_revision: int,
+        rng: random.Random,
+    ) -> RoomCommandResult:
+        aggregate = self._get_room(room_id)
+        self._assert_binding(aggregate, context)
+        actor = self._actor(aggregate, context)
+        if aggregate.game is None:
+            raise ApplicationError("GAME_NOT_STARTED", "room has no active game")
+        if request_id in aggregate.game.processed_request_ids:
+            return RoomCommandResult(aggregate)
+        if expected_revision != aggregate.game.revision:
+            raise ApplicationError("REVISION_CONFLICT", "game state revision does not match")
+
+        game = aggregate.game
+        now = self._now()
+        try:
+            if game.phase is GamePhase.NIGHT_ACTIONS:
+                result = submit_night_action(
+                    game,
+                    actor_player_id=actor.player_id,
+                    action_id=action_id,
+                    target_player_ids=target_player_ids,
+                    request_id=request_id,
+                    expected_revision=expected_revision,
+                    submitted_at=now,
+                    event_id_prefix="game-event",
+                )
+                if not result.duplicate:
+                    try:
+                        resolved = resolve_night_actions(
+                            result.game,
+                            rng=rng,
+                            occurred_at=now,
+                            event_id_prefix="game-event",
+                        )
+                    except GameRuleError as exc:
+                        if exc.code != "ACTIONS_PENDING":
+                            raise
+                    else:
+                        result = type(result)(
+                            resolved.game,
+                            result.events + resolved.events,
+                        )
+            elif game.phase is GamePhase.NIGHT_WITCH:
+                result = submit_witch_action(
+                    game,
+                    actor_player_id=actor.player_id,
+                    action_id=action_id,
+                    target_player_ids=target_player_ids,
+                    request_id=request_id,
+                    expected_revision=expected_revision,
+                    submitted_at=now,
+                    event_id_prefix="game-event",
+                )
+            elif game.phase is GamePhase.DAY:
+                if len(target_player_ids) > 1:
+                    raise ApplicationError("INVALID_TARGET_COUNT", "day vote accepts at most one target")
+                result = submit_day_vote(
+                    game,
+                    voter_player_id=actor.player_id,
+                    target_player_id=target_player_ids[0] if target_player_ids else None,
+                    request_id=request_id,
+                    expected_revision=expected_revision,
+                    submitted_at=now,
+                    event_id_prefix="game-event",
+                )
+                if not result.duplicate:
+                    try:
+                        resolved = resolve_day_vote(
+                            result.game,
+                            occurred_at=now,
+                            event_id_prefix="game-event",
+                        )
+                    except GameRuleError as exc:
+                        if exc.code != "VOTES_PENDING":
+                            raise
+                    else:
+                        result = type(result)(
+                            resolved.game,
+                            result.events + resolved.events,
+                        )
+            elif game.phase is GamePhase.ROLE_SHOOT:
+                if len(target_player_ids) > 1:
+                    raise ApplicationError("INVALID_TARGET_COUNT", "hunter accepts at most one target")
+                result = submit_hunter_decision(
+                    game,
+                    actor_player_id=actor.player_id,
+                    target_player_id=target_player_ids[0] if target_player_ids else None,
+                    request_id=request_id,
+                    expected_revision=expected_revision,
+                    submitted_at=now,
+                    event_id_prefix="game-event",
+                )
+            else:
+                raise ApplicationError("WRONG_PHASE", "no player action is available in this phase")
+        except GameRuleError as exc:
+            raise ApplicationError(exc.code, str(exc)) from exc
+        except ValueError as exc:
+            raise ApplicationError("INVALID_ACTION", str(exc)) from exc
+
+        if result.duplicate:
+            return RoomCommandResult(aggregate)
+
+        aggregate_revision = aggregate.revision
+        aggregate.game = result.game
+        aggregate.players = {
+            player.player_id: player
+            for player in result.game.players
+        }
+        aggregate.events.extend(result.events)
+        if len(aggregate.events) > 200:
+            aggregate.events = aggregate.events[-200:]
+        self._save(aggregate, aggregate_revision)
+        return RoomCommandResult(self._get_room(room_id), result.events)
+
+    def resolve_expired_phase(self, room_id: str, *, rng: random.Random) -> RoomCommandResult | None:
+        aggregate = self._get_room(room_id)
+        game = aggregate.game
+        now = self._now()
+        if game is None or game.phase_ends_at is None or game.phase_ends_at > now:
+            return None
+        try:
+            if game.phase is GamePhase.NIGHT_ACTIONS:
+                result = resolve_night_actions(
+                    game,
+                    rng=rng,
+                    occurred_at=now,
+                    event_id_prefix="game-event",
+                    allow_incomplete=True,
+                )
+            elif game.phase is GamePhase.NIGHT_WITCH:
+                decision = next(
+                    (item for item in game.pending_decisions if item.get("action_id") == "witch_action"),
+                    None,
+                )
+                if decision is None:
+                    return None
+                result = submit_witch_action(
+                    game,
+                    actor_player_id=str(decision["player_id"]),
+                    action_id=ActionId.ABSTAIN,
+                    target_player_ids=(),
+                    request_id=self._id_factory("timeout"),
+                    expected_revision=game.revision,
+                    submitted_at=now,
+                    event_id_prefix="game-event",
+                )
+            elif game.phase is GamePhase.DAY:
+                result = resolve_day_vote(
+                    game,
+                    occurred_at=now,
+                    event_id_prefix="game-event",
+                    allow_incomplete=True,
+                )
+            elif game.phase is GamePhase.ROLE_SHOOT:
+                decision = next(
+                    (item for item in game.pending_decisions if item.get("action_id") == ActionId.HUNTER_SHOOT.value),
+                    None,
+                )
+                if decision is None:
+                    return None
+                result = submit_hunter_decision(
+                    game,
+                    actor_player_id=str(decision["player_id"]),
+                    target_player_id=None,
+                    request_id=self._id_factory("timeout"),
+                    expected_revision=game.revision,
+                    submitted_at=now,
+                    event_id_prefix="game-event",
+                )
+            else:
+                return None
+        except GameRuleError as exc:
+            raise ApplicationError(exc.code, str(exc)) from exc
+
+        aggregate_revision = aggregate.revision
+        aggregate.game = result.game
+        aggregate.players = {player.player_id: player for player in result.game.players}
+        aggregate.events.extend(result.events)
+        if len(aggregate.events) > 200:
+            aggregate.events = aggregate.events[-200:]
+        self._save(aggregate, aggregate_revision)
+        return RoomCommandResult(self._get_room(room_id), result.events)
 
     def get_player_projection(self, room_id: str, context: ActivityContext) -> PlayerProjection:
         aggregate = self._get_room(room_id)
@@ -308,4 +520,8 @@ class WerewolfApplicationService:
         actor = self._actor(aggregate, context)
         if aggregate.game is None:
             raise ApplicationError("GAME_NOT_STARTED", "room has no active game")
-        return project_state_for_player(aggregate.game, actor.player_id)
+        return project_state_for_player(
+            aggregate.game,
+            actor.player_id,
+            events=aggregate.events,
+        )
