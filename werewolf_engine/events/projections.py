@@ -103,5 +103,10 @@ def project_state_for_player(
         players=projected_players,
         self_role_state=self_role_state,
         wolf_team_player_ids=_known_wolf_team(game, viewer_player_id),
+        pending_decisions=tuple(
+            decision
+            for decision in game.pending_decisions
+            if decision.get("player_id") == viewer_player_id
+        ),
         events=projected_events,
     )

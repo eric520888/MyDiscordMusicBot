@@ -112,6 +112,7 @@ class PlayerProjection(JsonModel):
     players: tuple[ProjectedPlayer, ...]
     self_role_state: RoleState | None = None
     wolf_team_player_ids: tuple[str, ...] = ()
+    pending_decisions: tuple[dict[str, JsonValue], ...] = ()
     events: tuple[ProjectedEvent, ...] = ()
 
     def __post_init__(self) -> None:
@@ -137,6 +138,11 @@ class PlayerProjection(JsonModel):
         )
         object.__setattr__(
             self,
+            "pending_decisions",
+            tuple(require_json_object(decision, "pending_decision") for decision in self.pending_decisions),
+        )
+        object.__setattr__(
+            self,
             "events",
             tuple(event if isinstance(event, ProjectedEvent) else ProjectedEvent.from_dict(event) for event in self.events),
         )
@@ -154,9 +160,10 @@ class PlayerProjection(JsonModel):
             "players",
             "self_role_state",
             "wolf_team_player_ids",
+            "pending_decisions",
             "events",
         }
-        required = allowed - {"self_role_state", "wolf_team_player_ids", "events"}
+        required = allowed - {"self_role_state", "wolf_team_player_ids", "pending_decisions", "events"}
         assert_allowed_keys(data, allowed, required=required)
         return cls(
             game_id=data["game_id"],
@@ -169,5 +176,6 @@ class PlayerProjection(JsonModel):
             players=tuple(ProjectedPlayer.from_dict(player) for player in data["players"]),
             self_role_state=RoleState.from_dict(data["self_role_state"]) if data.get("self_role_state") else None,
             wolf_team_player_ids=tuple(data.get("wolf_team_player_ids", [])),
+            pending_decisions=tuple(data.get("pending_decisions", [])),
             events=tuple(ProjectedEvent.from_dict(event) for event in data.get("events", [])),
         )

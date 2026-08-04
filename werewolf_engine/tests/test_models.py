@@ -101,6 +101,7 @@ class ModelRoundTripTests(unittest.TestCase):
             vote_state=vote_state,
             pending_effects=[EffectState("pending-poison", "p1", "p2", 1)],
             pending_decisions=[{"decision_id": "witch", "player_id": "p1"}],
+            processed_request_ids={"request-0"},
             event_sequence=9,
         )
 
