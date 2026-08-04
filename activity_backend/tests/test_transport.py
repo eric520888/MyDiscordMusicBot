@@ -6,6 +6,7 @@ import uuid
 from fastapi.testclient import TestClient
 
 from activity_backend.app.auth import AuthError, DiscordAuth, DiscordIdentity
+from activity_backend.app.application import ActivityBoardId
 from activity_backend.app.main import app, auth
 from activity_backend.app.services import build_mvp_board
 
@@ -17,20 +18,27 @@ class DiscordSessionTests(unittest.TestCase):
         token = service.issue_session(identity)
 
         self.assertEqual(service.verify_session(token), identity)
+        payload, signature = token.rsplit(".", 1)
+        tampered_signature = ("a" if signature[0] != "a" else "b") + signature[1:]
         with self.assertRaises(AuthError):
-            service.verify_session(token[:-1] + ("a" if token[-1] != "a" else "b"))
+            service.verify_session(f"{payload}.{tampered_signature}")
 
 
 class BoardCompositionTests(unittest.TestCase):
-    def test_mvp_boards_cover_six_to_twelve_players(self) -> None:
-        for player_count in range(6, 13):
-            board = build_mvp_board(player_count)
-            self.assertEqual(len(board.role_ids), player_count)
-            self.assertTrue(board.engine_enabled)
-            self.assertGreaterEqual(sum(role.value == "werewolf" for role in board.role_ids), 2)
+    def test_selectable_boards_cover_three_to_twelve_players(self) -> None:
+        for board_id in ActivityBoardId:
+            for player_count in range(3, 13):
+                board = build_mvp_board(player_count, board_id)
+                self.assertEqual(len(board.role_ids), player_count)
+                self.assertTrue(board.engine_enabled)
+                self.assertGreaterEqual(sum(role.value == "werewolf" for role in board.role_ids), 1)
 
         with self.assertRaises(ValueError):
-            build_mvp_board(5)
+            build_mvp_board(2)
+        with self.assertRaises(ValueError):
+            build_mvp_board(13)
+        with self.assertRaises(ValueError):
+            build_mvp_board(6, "unknown")
 
 
 class ActivityTransportTests(unittest.TestCase):
@@ -67,6 +75,19 @@ class ActivityTransportTests(unittest.TestCase):
         with client.websocket_connect(f"/ws/rooms/{room_id}?{query}") as socket:
             initial = socket.receive_json()
             self.assertEqual(initial["type"], "state")
+            self.assertEqual(initial["payload"]["room"]["selected_board_id"], "classic")
+            self.assertEqual(len(initial["payload"]["room"]["board_options"]), 3)
+            socket.send_json(
+                {
+                    "type": "set_board",
+                    "request_id": f"board-{suffix}",
+                    "payload": {"board_id": "power"},
+                }
+            )
+            board_result = socket.receive_json()
+            board_updated = socket.receive_json()
+            self.assertTrue(board_result["success"])
+            self.assertEqual(board_updated["payload"]["room"]["selected_board_id"], "power")
             socket.send_json(
                 {
                     "type": "set_ready",

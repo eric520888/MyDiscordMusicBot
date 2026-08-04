@@ -30,7 +30,7 @@ from werewolf_engine.phases import start_night
 from werewolf_engine.rules import assign_configured_role_ids, create_initial_role_state
 
 from ..rooms.repository import RepositoryConflict, RoomRepository
-from .models import ActivityContext, IdFactory, RoomAggregate, RoomCommandResult
+from .models import ActivityBoardId, ActivityContext, IdFactory, RoomAggregate, RoomCommandResult
 
 
 class ApplicationError(ValueError):
@@ -221,6 +221,34 @@ class WerewolfApplicationService:
         self._save(aggregate, expected_revision)
         return self._get_room(room_id)
 
+    def set_board(
+        self,
+        room_id: str,
+        context: ActivityContext,
+        *,
+        board_id: ActivityBoardId | str,
+    ) -> RoomAggregate:
+        aggregate = self._get_room(room_id)
+        self._assert_binding(aggregate, context)
+        actor = self._actor(aggregate, context)
+        if actor.player_id != aggregate.room.host_player_id:
+            raise ApplicationError("HOST_ONLY", "only the host can change the board")
+        if aggregate.game is not None or aggregate.room.settings.locked:
+            raise ApplicationError("SETTINGS_LOCKED", "room settings are locked after game start")
+        try:
+            selected_board_id = ActivityBoardId(board_id)
+        except ValueError as exc:
+            raise ApplicationError("INVALID_BOARD", "unknown Activity board") from exc
+        if selected_board_id is aggregate.selected_board_id:
+            return aggregate
+        expected_revision = aggregate.revision
+        aggregate.selected_board_id = selected_board_id
+        for player in aggregate.players.values():
+            if not player.spectator:
+                player.ready = False
+        self._save(aggregate, expected_revision)
+        return self._get_room(room_id)
+
     def start_game(
         self,
         room_id: str,
@@ -280,7 +308,7 @@ class WerewolfApplicationService:
                 event_type=EventType.GAME_STARTED,
                 visibility=EventVisibility.PUBLIC,
                 occurred_at=now,
-                payload={"board_id": configuration.board_id.value},
+                payload={"board_id": aggregate.selected_board_id.value},
             )
         )
         for player in seated:

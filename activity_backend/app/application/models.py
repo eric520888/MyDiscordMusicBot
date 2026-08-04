@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Callable, Mapping, Self
 
 from werewolf_engine.models import GameEvent, GameState, PlayerState, RoomState
@@ -13,6 +14,12 @@ from werewolf_engine.models.common import (
     require_int,
     require_string,
 )
+
+
+class ActivityBoardId(StrEnum):
+    CLASSIC = "classic"
+    BEGINNER = "beginner"
+    POWER = "power"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +49,7 @@ class ActivityContext:
 class RoomAggregate(JsonModel):
     room: RoomState
     players: dict[str, PlayerState]
+    selected_board_id: ActivityBoardId = ActivityBoardId.CLASSIC
     game: GameState | None = None
     events: list[GameEvent] = field(default_factory=list)
     revision: int = 0
@@ -55,6 +63,7 @@ class RoomAggregate(JsonModel):
         }
         if set(self.players) != set(self.room.member_player_ids):
             raise ValueError("room members must match aggregate players")
+        self.selected_board_id = ActivityBoardId(self.selected_board_id)
         if self.game is not None and not isinstance(self.game, GameState):
             self.game = GameState.from_dict(self.game)
         self.events = [
@@ -71,7 +80,7 @@ class RoomAggregate(JsonModel):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
-        allowed = {"room", "players", "game", "events", "revision"}
+        allowed = {"room", "players", "selected_board_id", "game", "events", "revision"}
         assert_allowed_keys(data, allowed, required={"room", "players"})
         players = data["players"]
         if not isinstance(players, Mapping):
@@ -79,6 +88,7 @@ class RoomAggregate(JsonModel):
         return cls(
             room=RoomState.from_dict(data["room"]),
             players={player_id: PlayerState.from_dict(player) for player_id, player in players.items()},
+            selected_board_id=ActivityBoardId(data.get("selected_board_id", ActivityBoardId.CLASSIC)),
             game=GameState.from_dict(data["game"]) if data.get("game") is not None else None,
             events=[GameEvent.from_dict(event) for event in data.get("events", [])],
             revision=data.get("revision", 0),

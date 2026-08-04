@@ -22,6 +22,12 @@ export type ProjectedEvent = {
   payload: Record<string, unknown>;
 };
 
+export type ActivityBoardOption = {
+  board_id: "classic" | "beginner" | "power";
+  preview_player_count: number;
+  role_ids: string[];
+};
+
 export type GameProjection = {
   game_id: string;
   viewer_player_id: string;
@@ -49,6 +55,8 @@ export type Snapshot = {
     room_id: string;
     revision: number;
     host_player_id: string;
+    selected_board_id: ActivityBoardOption["board_id"];
+    board_options: ActivityBoardOption[];
     settings: {
       reveal_roles_on_death: boolean;
       locked: boolean;

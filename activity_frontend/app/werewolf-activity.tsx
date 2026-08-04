@@ -3,7 +3,15 @@
 import { DiscordSDK } from "@discord/embedded-app-sdk";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { chooseLocale, translate } from "./i18n";
-import type { GameProjection, Locale, LobbyPlayer, ProjectedEvent, ProjectedPlayer, Snapshot } from "./types";
+import type {
+  ActivityBoardOption,
+  GameProjection,
+  Locale,
+  LobbyPlayer,
+  ProjectedEvent,
+  ProjectedPlayer,
+  Snapshot,
+} from "./types";
 
 type ConnectionStage = "connecting" | "connected" | "error";
 type SocketCommand = {
@@ -19,6 +27,14 @@ const roleMarks: Record<string, string> = {
   witch: "巫",
   hunter: "獵",
 };
+
+const guideRoles = [
+  { roleId: "werewolf", camp: "wolf" },
+  { roleId: "villager", camp: "villager" },
+  { roleId: "seer", camp: "good" },
+  { roleId: "witch", camp: "good" },
+  { roleId: "hunter", camp: "good" },
+] as const;
 
 function roleName(locale: Locale, roleId?: string | null) {
   return roleId ? translate(locale, `role.${roleId}`) : "—";
@@ -79,7 +95,15 @@ function LocaleSelect({ locale, onChange }: { locale: Locale; onChange: (value: 
   );
 }
 
-function BrandHeader({ locale, connection }: { locale: Locale; connection: ConnectionStage }) {
+function BrandHeader({
+  locale,
+  connection,
+  onOpenGuide,
+}: {
+  locale: Locale;
+  connection: ConnectionStage;
+  onOpenGuide: () => void;
+}) {
   return (
     <header className="brand-header">
       <div className="brand-header__identity">
@@ -89,7 +113,12 @@ function BrandHeader({ locale, connection }: { locale: Locale; connection: Conne
           <strong>{translate(locale, "brand.title")}</strong>
         </div>
       </div>
-      <span className={`connection-dot connection-dot--${connection}`} aria-label={connection} />
+      <div className="brand-header__actions">
+        <button type="button" className="guide-button" onClick={onOpenGuide}>
+          {translate(locale, "guide.open")}
+        </button>
+        <span className={`connection-dot connection-dot--${connection}`} aria-label={connection} />
+      </div>
     </header>
   );
 }
@@ -121,6 +150,129 @@ function LobbySeat({ player, snapshot, locale }: { player: LobbyPlayer | null; s
   );
 }
 
+function BoardComposition({ option, locale }: { option: ActivityBoardOption; locale: Locale }) {
+  const counts = option.role_ids.reduce<Record<string, number>>((result, roleId) => {
+    result[roleId] = (result[roleId] ?? 0) + 1;
+    return result;
+  }, {});
+  return (
+    <div className="board-composition" aria-label={translate(locale, "guide.composition")}>
+      {Object.entries(counts).map(([roleId, count]) => (
+        <span key={roleId} className={`composition-chip composition-chip--${roleId}`}>
+          <b>{roleMarks[roleId] ?? "?"}</b>
+          {roleName(locale, roleId)} × {count}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function BoardOptionButton({
+  option,
+  locale,
+  selected,
+  disabled,
+  onSelect,
+}: {
+  option: ActivityBoardOption;
+  locale: Locale;
+  selected: boolean;
+  disabled: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`board-option ${selected ? "board-option--selected" : ""}`}
+      disabled={disabled}
+      aria-pressed={selected}
+      onClick={onSelect}
+    >
+      <span className="board-option__heading">
+        <strong>{translate(locale, `board.${option.board_id}.name`)}</strong>
+        {selected && <em>{translate(locale, "guide.selected")}</em>}
+      </span>
+      <small>{translate(locale, `board.${option.board_id}.style`)}</small>
+      <p>{translate(locale, `board.${option.board_id}.desc`)}</p>
+      <BoardComposition option={option} locale={locale} />
+    </button>
+  );
+}
+
+function GameGuide({
+  locale,
+  boardOptions,
+  onClose,
+}: {
+  locale: Locale;
+  boardOptions: ActivityBoardOption[];
+  onClose: () => void;
+}) {
+  const [tab, setTab] = useState<"boards" | "roles">(boardOptions.length ? "boards" : "roles");
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => event.key === "Escape" && onClose();
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div className="guide-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="guide-dialog" role="dialog" aria-modal="true" aria-labelledby="guide-title">
+        <header className="guide-dialog__header">
+          <div>
+            <span className="eyebrow">{translate(locale, "guide.eyebrow")}</span>
+            <h2 id="guide-title">{translate(locale, "guide.title")}</h2>
+          </div>
+          <button type="button" className="guide-dialog__close" onClick={onClose} aria-label={translate(locale, "guide.close")}>
+            ×
+          </button>
+        </header>
+        <div className="guide-tabs" role="tablist" aria-label={translate(locale, "guide.title")}>
+          <button type="button" role="tab" aria-selected={tab === "boards"} disabled={!boardOptions.length} onClick={() => setTab("boards")}>
+            {translate(locale, "guide.boards")}
+          </button>
+          <button type="button" role="tab" aria-selected={tab === "roles"} onClick={() => setTab("roles")}>
+            {translate(locale, "guide.roles")}
+          </button>
+        </div>
+
+        {tab === "boards" ? (
+          <div className="guide-board-grid">
+            {boardOptions.map((option) => (
+              <article key={option.board_id} className="guide-board-card">
+                <span className="eyebrow">{translate(locale, `board.${option.board_id}.style`)}</span>
+                <h3>{translate(locale, `board.${option.board_id}.name`)}</h3>
+                <p>{translate(locale, `board.${option.board_id}.long`)}</p>
+                <small>{translate(locale, "guide.previewPlayers", { count: option.preview_player_count })}</small>
+                <BoardComposition option={option} locale={locale} />
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="guide-role-grid">
+            {guideRoles.map(({ roleId, camp }) => (
+              <article key={roleId} className={`guide-role-card guide-role-card--${roleId}`}>
+                <div className="guide-role-card__title">
+                  <span>{roleMarks[roleId] ?? "?"}</span>
+                  <div>
+                    <small>{translate(locale, `guide.camp.${camp}`)}</small>
+                    <h3>{roleName(locale, roleId)}</h3>
+                  </div>
+                </div>
+                <p>{roleDescription(locale, roleId)}</p>
+                <dl>
+                  <div><dt>{translate(locale, "guide.timing")}</dt><dd>{translate(locale, `role.${roleId}.timing`)}</dd></div>
+                  <div><dt>{translate(locale, "guide.goal")}</dt><dd>{translate(locale, `role.${roleId}.goal`)}</dd></div>
+                </dl>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function LobbyScreen({
   snapshot,
   locale,
@@ -132,8 +284,14 @@ function LobbyScreen({
 }) {
   const self = snapshot.room.players.find((player) => player.player_id === snapshot.self_player_id);
   const seated = snapshot.room.players.filter((player) => !player.spectator);
-  const everyoneReady = seated.length >= 6 && seated.every((player) => player.ready);
+  const hasEnoughPlayers = seated.length >= 3;
+  const everyoneReady = hasEnoughPlayers && seated.every((player) => player.ready);
   const seats = Array.from({ length: 12 }, (_, index) => seated.find((player) => player.seat === index + 1) ?? null);
+  const startLabel = !hasEnoughPlayers
+    ? "lobby.needPlayers"
+    : everyoneReady
+      ? "lobby.start"
+      : "lobby.waitingReady";
 
   return (
     <main className="lobby-layout">
@@ -165,7 +323,32 @@ function LobbyScreen({
       </section>
 
       <aside className="lobby-controls panel">
-        <div>
+        <section className="board-picker">
+          <div className="board-picker__heading">
+            <div>
+              <span className="eyebrow">{translate(locale, "settings.board")}</span>
+              <h2>{translate(locale, "settings.chooseBoard")}</h2>
+            </div>
+            {!snapshot.is_host && <small>{translate(locale, "guide.hostOnly")}</small>}
+          </div>
+          <div className="board-options">
+            {snapshot.room.board_options.map((option) => (
+              <BoardOptionButton
+                key={option.board_id}
+                option={option}
+                locale={locale}
+                selected={option.board_id === snapshot.room.selected_board_id}
+                disabled={!snapshot.is_host}
+                onSelect={() => send("set_board", { board_id: option.board_id })}
+              />
+            ))}
+          </div>
+          <small className="board-picker__note">
+            {translate(locale, "settings.boardReadyReset")}
+          </small>
+        </section>
+
+        <div className="death-reveal-heading">
           <span className="eyebrow">{translate(locale, "settings.title")}</span>
           <h2>{translate(locale, "settings.deathReveal")}</h2>
         </div>
@@ -208,7 +391,7 @@ function LobbyScreen({
               disabled={!everyoneReady}
               onClick={() => send("start_game")}
             >
-              {translate(locale, everyoneReady ? "lobby.start" : "lobby.needPlayers")}
+              {translate(locale, startLabel)}
             </button>
           )}
         </div>
@@ -467,6 +650,7 @@ export function WerewolfActivity() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [fatalError, setFatalError] = useState("");
   const [toast, setToast] = useState("");
+  const [guideOpen, setGuideOpen] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const socketRef = useRef<WebSocket | null>(null);
 
@@ -605,7 +789,7 @@ export function WerewolfActivity() {
   return (
     <div className="app-shell">
       <div className="ambient-lines" aria-hidden="true"><span /><span /><span /></div>
-      <BrandHeader locale={locale} connection={stage} />
+      <BrandHeader locale={locale} connection={stage} onOpenGuide={() => setGuideOpen(true)} />
       <LocaleSelect locale={locale} onChange={setLocale} />
 
       {!snapshot && stage === "connecting" && (
@@ -638,6 +822,13 @@ export function WerewolfActivity() {
       )}
 
       {content}
+      {guideOpen && (
+        <GameGuide
+          locale={locale}
+          boardOptions={snapshot?.room.board_options ?? []}
+          onClose={() => setGuideOpen(false)}
+        />
+      )}
       {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );

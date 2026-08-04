@@ -20,7 +20,7 @@ from .application.models import ActivityContext, RoomAggregate
 from .application.service import ApplicationError, WerewolfApplicationService
 from .auth import AuthError, DiscordAuth, DiscordIdentity
 from .rooms.repository import InMemoryRoomRepository
-from .services import build_mvp_board
+from .services import build_mvp_board, preview_mvp_boards
 from .websocket.hub import RoomSocketHub, SocketPeer
 
 
@@ -114,6 +114,7 @@ def snapshot_for(aggregate: RoomAggregate, context: ActivityContext) -> dict[str
     game = None
     if aggregate.game is not None:
         game = service.get_player_projection(aggregate.room.room_id, context).to_dict()
+    seated_count = sum(not player.spectator for player in players)
     return {
         "server_time": _now().isoformat().replace("+00:00", "Z"),
         "self_player_id": actor.player_id,
@@ -122,6 +123,8 @@ def snapshot_for(aggregate: RoomAggregate, context: ActivityContext) -> dict[str
             "room_id": aggregate.room.room_id,
             "revision": aggregate.revision,
             "host_player_id": aggregate.room.host_player_id,
+            "selected_board_id": aggregate.selected_board_id.value,
+            "board_options": preview_mvp_boards(seated_count),
             "settings": aggregate.room.settings.to_dict(),
             "players": [_safe_lobby_player(player) for player in sorted(players, key=lambda item: item.seat)],
         },
@@ -222,12 +225,17 @@ async def _handle_socket_command(room_id: str, context: ActivityContext, envelop
             context,
             reveal_roles_on_death=reveal,
         )
+    elif envelope.type == "set_board":
+        board_id = payload.get("board_id")
+        if not isinstance(board_id, str):
+            raise ApplicationError("INVALID_BOARD", "board_id must be a string")
+        service.set_board(room_id, context, board_id=board_id)
     elif envelope.type == "start_game":
         seated_count = sum(not player.spectator for player in aggregate.players.values())
         service.start_game(
             room_id,
             context,
-            configuration=build_mvp_board(seated_count),
+            configuration=build_mvp_board(seated_count, aggregate.selected_board_id),
             rng=random.SystemRandom(),
         )
     elif envelope.type == "advance_first_night":

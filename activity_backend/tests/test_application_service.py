@@ -8,11 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from activity_backend.app.application import (
+    ActivityBoardId,
     ActivityContext,
     ApplicationError,
     WerewolfApplicationService,
 )
 from activity_backend.app.rooms import InMemoryRoomRepository
+from activity_backend.app.services import build_mvp_board
 from werewolf_engine.ids import BoardId, EventType, GamePhase, RoleId
 from werewolf_engine.models import BoardConfiguration
 
@@ -108,6 +110,29 @@ class ApplicationServiceTests(unittest.TestCase):
         )
         self.assertTrue(updated.room.settings.reveal_roles_on_death)
 
+    def test_host_selects_board_and_resets_ready_players(self) -> None:
+        guest = self.join_players(1)[0]
+        self.ready_all([guest])
+        with self.assertRaises(ApplicationError) as forbidden:
+            self.service.set_board(
+                self.room.room.room_id,
+                guest,
+                board_id=ActivityBoardId.POWER,
+            )
+        self.assertEqual(forbidden.exception.code, "HOST_ONLY")
+
+        updated = self.service.set_board(
+            self.room.room.room_id,
+            self.host,
+            board_id=ActivityBoardId.POWER,
+        )
+        self.assertIs(updated.selected_board_id, ActivityBoardId.POWER)
+        self.assertTrue(all(not player.ready for player in updated.players.values()))
+
+        with self.assertRaises(ApplicationError) as invalid:
+            self.service.set_board(self.room.room.room_id, self.host, board_id="unknown")
+        self.assertEqual(invalid.exception.code, "INVALID_BOARD")
+
     def test_host_transfer_uses_earliest_remaining_seat(self) -> None:
         guests = self.join_players(2)
         updated = self.service.leave_room(self.room.room.room_id, self.host)
@@ -160,6 +185,29 @@ class ApplicationServiceTests(unittest.TestCase):
                 reveal_roles_on_death=True,
             )
         self.assertEqual(locked.exception.code, "SETTINGS_LOCKED")
+
+    def test_three_ready_players_can_start_the_selected_board(self) -> None:
+        guests = self.join_players(2)
+        self.service.set_board(
+            self.room.room.room_id,
+            self.host,
+            board_id=ActivityBoardId.POWER,
+        )
+        self.ready_all(guests)
+
+        result = self.service.start_game(
+            self.room.room.room_id,
+            self.host,
+            configuration=build_mvp_board(3, ActivityBoardId.POWER),
+            rng=random.Random(3),
+        )
+
+        self.assertEqual(len(result.aggregate.game.players), 3)
+        self.assertCountEqual(
+            [player.role_id for player in result.aggregate.game.players],
+            (RoleId.WEREWOLF, RoleId.WITCH, RoleId.HUNTER),
+        )
+        self.assertEqual(result.events[0].payload["board_id"], "power")
 
     def test_first_night_and_projection_keep_other_roles_private(self) -> None:
         guests = self.join_players()
