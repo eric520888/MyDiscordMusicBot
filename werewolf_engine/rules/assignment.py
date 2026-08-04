@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 from ..boards import get_board_definition
 from ..ids import BoardId, RoleId
-from ..models import RoleState
+from ..models import BoardConfiguration, RoleState
 from ..roles import get_role_definition
 from .validation import is_player_count_valid
 
@@ -66,6 +66,29 @@ def assign_role_ids(
 
     board = get_board_definition(parsed_board_id)
     role_ids = list(board.roles) if board.fixed_composition else _flexible_roles(parsed_board_id, len(player_ids))
+    rng.shuffle(role_ids)
+    return dict(zip(player_ids, role_ids, strict=True))
+
+
+def assign_configured_role_ids(
+    configuration: BoardConfiguration,
+    player_ids: Sequence[str],
+    *,
+    rng: random.Random,
+) -> dict[str, RoleId]:
+    """Assign an explicit Activity board without inventing flexible compositions."""
+
+    if not configuration.engine_enabled:
+        raise ValueError("board configuration is not enabled for the Activity engine")
+    if not configuration.fixed_composition:
+        raise ValueError("Activity start requires an explicit fixed role composition")
+    if len(player_ids) != len(configuration.role_ids):
+        raise InvalidPlayerCount(
+            f"board {configuration.board_id.value} requires {len(configuration.role_ids)} players"
+        )
+    if len(set(player_ids)) != len(player_ids):
+        raise ValueError("player_ids must be unique")
+    role_ids = list(configuration.role_ids)
     rng.shuffle(role_ids)
     return dict(zip(player_ids, role_ids, strict=True))
 

@@ -24,11 +24,12 @@ from cogs.werewolf_system.roles import (
 
 from test_werewolf import FakeBot, FakeChannel, FakeUser
 from werewolf_engine.ids import BoardId, PlayerStatus, RoleId, WinnerId, parse_role_id
-from werewolf_engine.models import GameSettings, GameState, PlayerState
+from werewolf_engine.models import BoardConfiguration, GameSettings, GameState, PlayerState
 from werewolf_engine.rules import (
     InvalidPlayerCount,
     active_wolves,
     assign_role_ids,
+    assign_configured_role_ids,
     create_initial_role_state,
     determine_winner,
     get_action_targets,
@@ -125,6 +126,24 @@ class AssignmentParityTests(unittest.TestCase):
         self.assertFalse(is_player_count_valid(BoardId.AUTO, 21))
         with self.assertRaises(InvalidPlayerCount):
             assign_role_ids(BoardId.STANDARD, [str(index) for index in range(11)], rng=random.Random(1))
+
+    def test_explicit_activity_configuration_requires_engine_flag_and_exact_count(self) -> None:
+        configuration = BoardConfiguration(
+            BoardId.STANDARD,
+            (RoleId.WEREWOLF, RoleId.SEER, RoleId.VILLAGER),
+            3,
+            3,
+            True,
+            engine_enabled=True,
+        )
+        assigned = assign_configured_role_ids(
+            configuration,
+            ("p1", "p2", "p3"),
+            rng=random.Random(3),
+        )
+        self.assertCountEqual(assigned.values(), configuration.role_ids)
+        with self.assertRaises(InvalidPlayerCount):
+            assign_configured_role_ids(configuration, ("p1", "p2"), rng=random.Random(3))
 
 
 class TargetingParityTests(unittest.TestCase):
