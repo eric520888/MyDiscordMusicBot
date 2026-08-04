@@ -41,7 +41,11 @@ class GameEvent(JsonModel):
         recipients = frozenset(require_identifier_list(self.recipient_player_ids, "recipient_player_ids"))
         object.__setattr__(self, "recipient_player_ids", recipients)
         object.__setattr__(self, "schema_version", require_int(self.schema_version, "schema_version", minimum=1))
-        if self.visibility in {EventVisibility.PLAYER_ONLY, EventVisibility.HOST_ONLY} and not recipients:
+        if self.visibility in {
+            EventVisibility.PLAYER_ONLY,
+            EventVisibility.WOLF_TEAM,
+            EventVisibility.HOST_ONLY,
+        } and not recipients:
             raise ValueError("private events require at least one recipient")
 
     @classmethod

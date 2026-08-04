@@ -124,6 +124,16 @@ class PlayerStatus(StrEnum):
     DEAD = "dead"
 
 
+class DeathCause(StrEnum):
+    WOLF_ATTACK = "wolf_attack"
+    POISON = "poison"
+    EXILE = "exile"
+    SHOT = "shot"
+    ABILITY = "ability"
+    SUICIDE = "suicide"
+    CHAIN = "chain"
+
+
 class ActionId(StrEnum):
     WOLF_KILL = "wolf_kill"
     SEER_CHECK = "seer_check"
