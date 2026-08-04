@@ -67,11 +67,15 @@ def resolve_deaths(
     occurred_at: datetime,
     event_id_prefix: str,
     continue_phase: GamePhase,
+    after_shoot: str | None = None,
 ) -> DeathResolution:
     """Apply simultaneous deaths to a clone, preserving the caller's state."""
 
     if game.phase in {GamePhase.WAITING, GamePhase.STARTING, GamePhase.ENDED}:
         raise ValueError(f"cannot resolve deaths during {game.phase.value}")
+    shoot_destination = after_shoot or ("day" if continue_phase is GamePhase.DAY else "night")
+    if shoot_destination not in {"day", "night"}:
+        raise ValueError("after_shoot must be 'day' or 'night'")
     death_ids = [death.player_id for death in deaths]
     if len(set(death_ids)) != len(death_ids):
         raise ValueError("a player cannot appear twice in one death batch")
@@ -117,9 +121,18 @@ def resolve_deaths(
                 "decision_id": f"shoot-{player_id}-{index}",
                 "player_id": player_id,
                 "action_id": ActionId.HUNTER_SHOOT.value,
+                "continue_phase": GamePhase(continue_phase).value,
+                "after_shoot": shoot_destination,
             }
             for index, player_id in enumerate(pending_shooters, start=1)
         )
+    all_pending_shooters = tuple(
+        str(decision["player_id"])
+        for decision in updated.pending_decisions
+        if decision.get("action_id") == ActionId.HUNTER_SHOOT.value
+    )
+    if all_pending_shooters:
+        updated.phase = GamePhase.ROLE_SHOOT
     else:
         winner = determine_winner(updated)
         if winner is not None:
@@ -127,4 +140,4 @@ def resolve_deaths(
         else:
             updated.phase = GamePhase(continue_phase)
 
-    return DeathResolution(updated, tuple(events), tuple(pending_shooters))
+    return DeathResolution(updated, tuple(events), all_pending_shooters)
