@@ -1,0 +1,9 @@
+# Primary maintainer ownership
+* @eric520888
+
+# Security- and deployment-sensitive areas
+/.github/ @eric520888
+/Dockerfile @eric520888
+/requirements.txt @eric520888
+/.env.example @eric520888
+/cogs/music.py @eric520888
