@@ -36,6 +36,20 @@ LOW_RESOURCE_YOUTUBE_ARGS = (
     "--extractor-args",
     "youtube:player_client=android_vr",
 )
+POT_PROVIDER_HOME = os.getenv(
+    "YTDLP_POT_PROVIDER_HOME",
+    "/opt/bgutil-ytdlp-pot-provider/server",
+)
+COOKIE_POT_YOUTUBE_ARGS = (
+    (
+        "--extractor-args",
+        "youtube:player_client=mweb",
+        "--extractor-args",
+        f"youtubepot-bgutilscript:server_home={POT_PROVIDER_HOME}",
+    )
+    if Path(POT_PROVIDER_HOME).is_dir()
+    else ()
+)
 
 YDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -1261,6 +1275,16 @@ class Music(commands.Cog):
                 options["extractor_args"] = {
                     "youtube": {"player_client": ["android_vr"]}
                 }
+            elif auth is not None and COOKIE_POT_YOUTUBE_ARGS:
+                # Railway/datacenter IPs are frequently challenged even with
+                # valid cookies. mweb plus the local provider supplies the
+                # per-video PO token currently required by YouTube.
+                options["extractor_args"] = {
+                    "youtube": {"player_client": ["mweb"]},
+                    "youtubepot-bgutilscript": {
+                        "server_home": [POT_PROVIDER_HOME]
+                    },
+                }
             cookie_snapshot: str | None = None
             operation_auth = auth
             if auth and auth.cookiefile:
@@ -1490,7 +1514,7 @@ class Music(commands.Cog):
             auth_label=selected_auth.label if selected_auth else None,
             ytdlp_extra_args=(
                 LOW_RESOURCE_YOUTUBE_ARGS if used_low_resource else ()
-            ),
+            ) if selected_auth is None else COOKIE_POT_YOUTUBE_ARGS,
         )
 
     def _game_is_active(self, ctx: commands.Context) -> bool:
@@ -2731,7 +2755,7 @@ class Music(commands.Cog):
                             ),
                             auth_cookiefile=auth.cookiefile,
                             auth_label=auth.label,
-                            ytdlp_extra_args=(),
+                            ytdlp_extra_args=COOKIE_POT_YOUTUBE_ARGS,
                         )
                         start_paused = retry_paused
                         seeking = attempt.start_at > 0

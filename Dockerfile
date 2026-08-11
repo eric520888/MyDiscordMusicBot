@@ -2,6 +2,7 @@
 FROM python:3.11-slim
 
 ARG DENO_VERSION=2.9.4
+ARG BGUTIL_VERSION=1.3.1
 ARG TARGETARCH
 ENV DENO_NO_UPDATE_CHECK=1 \
     DENO_NO_PROMPT=1 \
@@ -35,6 +36,19 @@ RUN apt-get update && apt-get install -y \
     && rm -f "/tmp/${deno_asset}" "/tmp/${deno_asset}.sha256sum" \
     && rm -rf /var/lib/apt/lists/*
 
+# Install the yt-dlp PO-token generator used for YouTube requests from
+# datacenter IPs. The matching Python plugin is pinned in requirements.txt.
+RUN mkdir -p /opt/bgutil-ytdlp-pot-provider \
+    && curl -fsSL \
+        "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${BGUTIL_VERSION}.tar.gz" \
+        -o /tmp/bgutil-ytdlp-pot-provider.tar.gz \
+    && tar -xzf /tmp/bgutil-ytdlp-pot-provider.tar.gz \
+        --strip-components=1 \
+        -C /opt/bgutil-ytdlp-pot-provider \
+    && cd /opt/bgutil-ytdlp-pot-provider/server \
+    && deno install --allow-scripts=npm:canvas --frozen \
+    && rm -f /tmp/bgutil-ytdlp-pot-provider.tar.gz
+
 # 設定工作目錄
 WORKDIR /app
 
@@ -44,7 +58,7 @@ COPY requirements.txt .
 # 【第二步：依 requirements 安裝 Python 函式庫】
 # requirements 會一併安裝 Discord DAVE 與 yt-dlp 的 Deno/EJS 支援。
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -c "import yt_dlp, yt_dlp_ejs; print(yt_dlp.version.__version__)" \
+RUN python -c "import importlib, yt_dlp, yt_dlp_ejs; importlib.import_module('yt_dlp_plugins.extractor.getpot_bgutil_script'); print(yt_dlp.version.__version__)" \
     && deno --version
 
 # 【第三步：複製所有程式碼】
