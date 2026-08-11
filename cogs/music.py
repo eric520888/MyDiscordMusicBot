@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import discord
 import yt_dlp
@@ -36,6 +37,11 @@ LOW_RESOURCE_YOUTUBE_ARGS = (
     "--extractor-args",
     "youtube:player_client=android_vr",
 )
+NODE_YOUTUBE_ARGS = (
+    ("--no-js-runtimes", "--js-runtimes", "node")
+    if shutil.which("node")
+    else ()
+)
 POT_PROVIDER_HOME = os.getenv(
     "YTDLP_POT_PROVIDER_HOME",
     "/opt/bgutil-ytdlp-pot-provider/server",
@@ -46,6 +52,9 @@ COOKIE_POT_YOUTUBE_ARGS = (
         "youtube:player_client=mweb",
         "--extractor-args",
         f"youtubepot-bgutilscript:server_home={POT_PROVIDER_HOME}",
+        "--no-js-runtimes",
+        "--js-runtimes",
+        "node",
     )
     if Path(POT_PROVIDER_HOME).is_dir()
     else ()
@@ -172,6 +181,9 @@ class Track:
     auth_cookiefile: str | None = None
     auth_label: str | None = None
     ytdlp_extra_args: tuple[str, ...] = ()
+    stream_url: str | None = None
+    stream_headers: tuple[tuple[str, str], ...] = ()
+    stream_expires_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,9 +275,6 @@ def _prefer_low_resource_youtube() -> bool:
 
 
 def _configure_deno_memory_limit() -> None:
-    if os.getenv("DENO_V8_FLAGS"):
-        return
-    configured = os.getenv("YTDLP_DENO_V8_FLAGS", "").strip()
     on_railway = any(
         os.getenv(name)
         for name in (
@@ -274,10 +283,78 @@ def _configure_deno_memory_limit() -> None:
             "RAILWAY_ENVIRONMENT_ID",
         )
     )
-    if not configured and on_railway:
-        configured = "--max-old-space-size=64"
-    if configured:
-        os.environ.setdefault("DENO_V8_FLAGS", configured)
+    if not os.getenv("DENO_V8_FLAGS"):
+        configured = os.getenv("YTDLP_DENO_V8_FLAGS", "").strip()
+        if not configured and on_railway:
+            # The PO-token provider fits within this cap. YouTube's larger EJS
+            # challenge is routed through Node below so both runtimes do not
+            # compete for the whole 512 MB container.
+            configured = "--max-old-space-size=64"
+        if configured:
+            os.environ.setdefault("DENO_V8_FLAGS", configured)
+
+    if not os.getenv("NODE_OPTIONS"):
+        configured = os.getenv("YTDLP_NODE_OPTIONS", "").strip()
+        if not configured and on_railway:
+            configured = "--max-old-space-size=192"
+        if configured:
+            os.environ.setdefault("NODE_OPTIONS", configured)
+
+
+_STREAM_HOST_SUFFIXES = (
+    ".googlevideo.com",
+    ".googleusercontent.com",
+)
+_STREAM_HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+_SENSITIVE_STREAM_HEADERS = {"authorization", "cookie", "proxy-authorization"}
+
+
+def _stream_transport_from_info(
+    info: dict[str, Any],
+) -> tuple[str | None, tuple[tuple[str, str], ...], float | None]:
+    """Return a short-lived, validated media URL and its non-secret headers."""
+    raw_url = info.get("url")
+    if not isinstance(raw_url, str):
+        return None, (), None
+
+    parsed = urlparse(raw_url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or not any(hostname.endswith(suffix) for suffix in _STREAM_HOST_SUFFIXES)
+    ):
+        return None, (), None
+
+    headers: list[tuple[str, str]] = []
+    raw_headers = info.get("http_headers")
+    if isinstance(raw_headers, dict):
+        for raw_name, raw_value in raw_headers.items():
+            name = str(raw_name).strip()
+            value = str(raw_value).strip()
+            if (
+                not _STREAM_HEADER_NAME.fullmatch(name)
+                or name.lower() in _SENSITIVE_STREAM_HEADERS
+                or not value
+                or len(value) > 2048
+                or "\r" in value
+                or "\n" in value
+            ):
+                continue
+            headers.append((name, value))
+
+    expires_at: float | None = None
+    raw_expiry = parse_qs(parsed.query).get("expire", [None])[0]
+    if raw_expiry is not None:
+        try:
+            parsed_expiry = float(raw_expiry)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(parsed_expiry) and parsed_expiry > 0:
+                expires_at = parsed_expiry
+
+    return raw_url, tuple(headers), expires_at
 
 
 def _classify_ytdlp_error(message: str) -> PlaybackFailure:
@@ -679,11 +756,11 @@ class _YTDLLogger:
 
 
 class YTDLPipeAudio(discord.AudioSource):
-    """Stream through yt-dlp's downloader, then transcode to Opus with FFmpeg.
+    """Transcode a validated yt-dlp media URL to Opus with FFmpeg.
 
-    Letting yt-dlp perform the HTTP download avoids handing FFmpeg a temporary
-    Google Video URL that may require ranged requests, a PO token, or refreshed
-    request data. The subprocess is recreated for every playback and loop.
+    Reusing the URL from metadata extraction keeps its cookie/PO-token session
+    intact and avoids a second YouTube player request. The older yt-dlp pipe is
+    retained as a bounded fallback for expired or unavailable direct URLs.
     """
 
     def __init__(self, track: Track):
@@ -698,6 +775,7 @@ class YTDLPipeAudio(discord.AudioSource):
         self._current_error: Exception | None = None
         self.cleanup_done = threading.Event()
         self._audio: discord.FFmpegOpusAudio | None = None
+        self._ytdl_process: subprocess.Popen[bytes] | None = None
         self._cookie_snapshot: str | None = None
         self._ytdl_stderr = tempfile.TemporaryFile()
         self._ffmpeg_stderr = tempfile.TemporaryFile()
@@ -714,68 +792,98 @@ class YTDLPipeAudio(discord.AudioSource):
         ):
             raise ValueError("track URL must be an allowed YouTube URL")
 
+        direct_stream = track.stream_url
+        if (
+            direct_stream
+            and track.stream_expires_at is not None
+            and track.stream_expires_at <= time.time() + 30
+        ):
+            direct_stream = None
+        if direct_stream:
+            validated_url, _, _ = _stream_transport_from_info(
+                {"url": direct_stream}
+            )
+            if validated_url is None:
+                direct_stream = None
+
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        command = [
-            sys.executable,
-            "-m",
-            "yt_dlp",
-            "--ignore-config",
-            "--format",
-            "bestaudio/best",
-            "--no-playlist",
-            "--no-progress",
-            "--no-part",
-            "--retries",
-            "3",
-            "--fragment-retries",
-            "3",
-            "--extractor-retries",
-            "3",
-            "--socket-timeout",
-            "20",
-            "--output",
-            "-",
-        ]
-        if track.auth_cookiefile:
-            try:
-                self._cookie_snapshot = _create_cookie_snapshot(
-                    track.auth_cookiefile
-                )
-            except Exception:
-                self._close_logs()
-                raise
-            command.extend(("--cookies", self._cookie_snapshot))
-        else:
-            command.extend(track.auth_args)
-        command.extend(track.ytdlp_extra_args)
-        if track.start_at > 0:
-            command.extend(
-                ["--download-sections", f"*{track.start_at:.3f}-inf"]
-            )
-        command.extend(("--", track.webpage_url))
-
         try:
-            self._ytdl_process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=self._ytdl_stderr,
-                creationflags=creation_flags,
-            )
-            if self._ytdl_process.stdout is None:
-                raise RuntimeError("yt-dlp did not create an audio pipe")
+            if direct_stream:
+                before_options = (
+                    "-reconnect 1 -reconnect_streamed 1 "
+                    "-reconnect_delay_max 5"
+                )
+                if track.start_at > 0:
+                    before_options += f" -ss {track.start_at:.3f}"
+                if track.stream_headers:
+                    header_blob = "".join(
+                        f"{name}: {value}\r\n"
+                        for name, value in track.stream_headers
+                    )
+                    before_options += f" -headers {shlex.quote(header_blob)}"
+                self._audio = discord.FFmpegOpusAudio(
+                    direct_stream,
+                    pipe=False,
+                    codec=None,
+                    bitrate=128,
+                    stderr=self._ffmpeg_stderr,
+                    before_options=before_options,
+                    options="-vn",
+                )
+            else:
+                command = [
+                    sys.executable,
+                    "-m",
+                    "yt_dlp",
+                    "--ignore-config",
+                    "--format",
+                    "bestaudio/best",
+                    "--no-playlist",
+                    "--no-progress",
+                    "--no-part",
+                    "--retries",
+                    "3",
+                    "--fragment-retries",
+                    "3",
+                    "--extractor-retries",
+                    "3",
+                    "--socket-timeout",
+                    "20",
+                    "--output",
+                    "-",
+                ]
+                if track.auth_cookiefile:
+                    self._cookie_snapshot = _create_cookie_snapshot(
+                        track.auth_cookiefile
+                    )
+                    command.extend(("--cookies", self._cookie_snapshot))
+                else:
+                    command.extend(track.auth_args)
+                command.extend(track.ytdlp_extra_args)
+                if track.start_at > 0:
+                    command.extend(
+                        ["--download-sections", f"*{track.start_at:.3f}-inf"]
+                    )
+                command.extend(("--", track.webpage_url))
 
-            # codec=None makes FFmpeg encode to Opus. Discord can send this
-            # directly, so the Python process does not need a platform-specific
-            # libopus path.
-            self._audio = discord.FFmpegOpusAudio(
-                self._ytdl_process.stdout,
-                pipe=True,
-                codec=None,
-                bitrate=128,
-                stderr=self._ffmpeg_stderr,
-                options="-vn",
-            )
+                self._ytdl_process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=self._ytdl_stderr,
+                    creationflags=creation_flags,
+                )
+                if self._ytdl_process.stdout is None:
+                    raise RuntimeError("yt-dlp did not create an audio pipe")
+
+                self._audio = discord.FFmpegOpusAudio(
+                    self._ytdl_process.stdout,
+                    pipe=True,
+                    codec=None,
+                    bitrate=128,
+                    stderr=self._ffmpeg_stderr,
+                    options="-vn",
+                )
         except Exception:
             self._terminate_ytdl()
             _remove_cookie_snapshot(self._cookie_snapshot)
@@ -871,6 +979,10 @@ class YTDLPipeAudio(discord.AudioSource):
                 process = getattr(self._audio, "_process", None)
                 if process is not None:
                     ffmpeg_rc = process.poll()
+                    if ffmpeg_rc is None:
+                        # stop/skip/seek can clean up a healthy direct FFmpeg
+                        # stream before it exits naturally.
+                        self._terminated_early = True
                 try:
                     self._audio.cleanup()
                 except Exception:
@@ -1285,6 +1397,9 @@ class Music(commands.Cog):
                         "server_home": [POT_PROVIDER_HOME]
                     },
                 }
+                options["js_runtimes"] = {"node": {"path": None}}
+            elif NODE_YOUTUBE_ARGS:
+                options["js_runtimes"] = {"node": {"path": None}}
             cookie_snapshot: str | None = None
             operation_auth = auth
             if auth and auth.cookiefile:
@@ -1479,6 +1594,10 @@ class Music(commands.Cog):
                 user_safe=True,
             )
 
+        stream_url, stream_headers, stream_expires_at = (
+            _stream_transport_from_info(info)
+        )
+
         duration = info.get("duration")
         if not isinstance(duration, int):
             duration = int(duration) if isinstance(duration, float) else None
@@ -1513,8 +1632,13 @@ class Music(commands.Cog):
             ),
             auth_label=selected_auth.label if selected_auth else None,
             ytdlp_extra_args=(
-                LOW_RESOURCE_YOUTUBE_ARGS if used_low_resource else ()
+                LOW_RESOURCE_YOUTUBE_ARGS
+                if used_low_resource
+                else NODE_YOUTUBE_ARGS
             ) if selected_auth is None else COOKIE_POT_YOUTUBE_ARGS,
+            stream_url=stream_url,
+            stream_headers=stream_headers,
+            stream_expires_at=stream_expires_at,
         )
 
     def _game_is_active(self, ctx: commands.Context) -> bool:
@@ -2659,6 +2783,7 @@ class Music(commands.Cog):
                 ] = {}
                 challenge_failure_seen = False
                 cookie_auth_attempted = bool(track.auth_label)
+                direct_stream_refreshes = 0
                 playback_auth_config_error: str | None = None
                 if self._is_youtube_url(track.webpage_url):
                     try:
@@ -2738,6 +2863,41 @@ class Music(commands.Cog):
 
                     if (
                         action.reason is EndReason.ERROR
+                        and action.safe_to_retry
+                        and attempt.stream_url
+                        and direct_stream_refreshes < 1
+                    ):
+                        direct_stream_refreshes += 1
+                        try:
+                            refreshed = await asyncio.to_thread(
+                                self._extract_track_sync,
+                                attempt.webpage_url,
+                                attempt.text_channel_id,
+                                attempt.requester_id,
+                                attempt.start_at,
+                            )
+                        except TrackLookupError as error:
+                            log.warning(
+                                "Could not refresh direct stream for %r in "
+                                "guild %s: %s",
+                                track.title,
+                                guild_id,
+                                _sanitize_ytdlp_message(str(error)),
+                            )
+                        else:
+                            attempt = refreshed
+                            start_paused = retry_paused
+                            seeking = attempt.start_at > 0
+                            log.info(
+                                "Refreshed direct YouTube stream for %r in "
+                                "guild %s",
+                                track.title,
+                                guild_id,
+                            )
+                            continue
+
+                    if (
+                        action.reason is EndReason.ERROR
                         and action.failure
                         in {
                             PlaybackFailure.AUTH_REQUIRED,
@@ -2756,6 +2916,9 @@ class Music(commands.Cog):
                             auth_cookiefile=auth.cookiefile,
                             auth_label=auth.label,
                             ytdlp_extra_args=COOKIE_POT_YOUTUBE_ARGS,
+                            stream_url=None,
+                            stream_headers=(),
+                            stream_expires_at=None,
                         )
                         start_paused = retry_paused
                         seeking = attempt.start_at > 0
@@ -2806,7 +2969,10 @@ class Music(commands.Cog):
                         if using_low_resource:
                             alternate = replace(
                                 attempt,
-                                ytdlp_extra_args=(),
+                                ytdlp_extra_args=NODE_YOUTUBE_ARGS,
+                                stream_url=None,
+                                stream_headers=(),
+                                stream_expires_at=None,
                             )
                             alternate_label = "default YouTube client"
                         else:
@@ -2816,6 +2982,9 @@ class Music(commands.Cog):
                                 auth_cookiefile=None,
                                 auth_label=None,
                                 ytdlp_extra_args=LOW_RESOURCE_YOUTUBE_ARGS,
+                                stream_url=None,
+                                stream_headers=(),
+                                stream_expires_at=None,
                             )
                             alternate_label = "low-resource YouTube client"
                         alternate_key = (

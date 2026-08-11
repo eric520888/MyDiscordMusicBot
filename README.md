@@ -107,6 +107,9 @@ YTDLP_LOW_RESOURCE=auto
 
 # 選填；Railway 未設定時會自動使用 --max-old-space-size=64。
 YTDLP_DENO_V8_FLAGS=
+
+# 選填；Railway 未設定時會自動使用 --max-old-space-size=192。
+YTDLP_NODE_OPTIONS=
 ```
 
 ### 4. 執行機器人
