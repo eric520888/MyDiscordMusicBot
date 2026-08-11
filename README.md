@@ -1,148 +1,190 @@
-# 🤖 Discord 多功能機器人 (Music + Werewolf + AI)
+# MyDiscordMusicBot
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
-![Discord.py](https://img.shields.io/badge/Discord.py-2.7.1-5865F2?logo=discord&logoColor=white)
-![Gemini AI](https://img.shields.io/badge/AI-Gemini%201.5%20Flash-4285F4?logo=google&logoColor=white)
+**A modular open-source Discord entertainment bot combining music playback, a fully hosted Werewolf game, and AI chat.**
 
-這是一個基於 `discord.py` 開發的模組化 Discord 機器人，整合了 **音樂播放**、**狼人殺遊戲** 以及 **Google Gemini AI 對話** 功能。旨在為伺服器提供全方位的娛樂體驗。
+[![CI](https://github.com/eric520888/MyDiscordMusicBot/actions/workflows/ci.yml/badge.svg)](https://github.com/eric520888/MyDiscordMusicBot/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/github/license/eric520888/MyDiscordMusicBot)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/eric520888/MyDiscordMusicBot)](https://github.com/eric520888/MyDiscordMusicBot/stargazers)
+[![Forks](https://img.shields.io/github/forks/eric520888/MyDiscordMusicBot)](https://github.com/eric520888/MyDiscordMusicBot/network/members)
+[![Last commit](https://img.shields.io/github/last-commit/eric520888/MyDiscordMusicBot)](https://github.com/eric520888/MyDiscordMusicBot/commits/main)
 
----
+> 繁體中文摘要：這是一個以 `discord.py` 開發、持續維護的模組化 Discord Bot。核心功能包含 YouTube 音樂播放、完整自動主持的狼人殺遊戲，以及 AI 對話。專案以 AGPL-3.0 開源，歡迎提交 Issue、Pull Request、文件、翻譯與測試貢獻。
 
-## ✨ 主要功能
+## Why this project exists
 
-### 🎵 音樂系統 (Music)
-支援從 YouTube 播放音樂，具備播放器面板、封面與進度條、按鈕控制、指定時間播放、佇列管理與多種循環模式。
+Many Discord bots focus on a single command or depend on an external human host for social games. This project explores a reusable, self-hostable entertainment stack where voice playback, interactive Discord UI, game state, role logic, and AI features can coexist in one modular bot.
 
-| 指令 | 說明 | 範例 |
-| :--- | :--- | :--- |
-| `/play <關鍵字/網址>` | 搜尋並播放音樂 | `/play Never Gonna Give You Up` |
-| `/play_at <時間> <關鍵字/網址>` | 從指定時間開始播放 | `/play_at 1:30 Never Gonna Give You Up` |
-| `/seek <時間>` | 跳轉目前歌曲；也可按播放器的「跳轉」 | `/seek 1:30` |
-| `!pause` / `!resume` | 暫停 / 恢復播放 | |
-| `!skip` | 跳過目前歌曲 | |
-| `!stop` | 停止播放並清空佇列 | |
-| `!queue` | 查看目前的播放清單 | |
-| `!loop` | 切換循環模式 | 關閉 ➡ 單曲 ➡ 佇列 |
+The most substantial subsystem is the **Werewolf engine**: it automates lobby creation, role assignment, night actions, voting, win-condition checks, and post-game review through Discord interactions instead of requiring a human game master.
 
-### 🐺 狼人殺 (Werewolf)
-內建互動式按鈕介面的狼人殺遊戲，全自動化主持流程，無需人工上帝。
+## Features
 
-* **大廳系統**：使用 `/ww_create` 建立圖形化大廳，提供人數進度、陣容預覽與 **23 套正式 12 人板型**。
-* **身分分配**：
-    * 🐺 **狼人陣營**：狼人、狼王、狼美人、覺醒石像鬼、覺醒白狼王等
-    * 🔮 **神職陣營**：預言家、女巫、獵人、奇跡商人、覺醒守衛、覺醒攝夢人等
-    * 🌾 **村民／第三方**：平民、覺醒孤獨少女等
-* **全按鈕操作**：
-    * 🌑 **夜晚**：狼人透過按鈕討論戰術與殺人；神職透過下拉選單發動技能 (查驗、救藥/毒藥、給予技能)。
-    * ☀️ **白天**：公開頻道討論，使用按鈕介面進行投票，支援平票處理與遺言/開槍環節。
-    * 🏆 **復盤系統**：遊戲結束後自動顯示復盤介面，可查看 **遊戲總覽**、**身分揭曉** 以及 **每一回合的詳細過程**。
-* **自動判定**：系統即時判斷陣營勝利條件。
-* **板型百科與戰況卡**：使用 `/ww_rules` 查看配置與技能，使用 `/ww_status` 查看目前階段、回合與存活名單。
-* **完整主線覺醒系列**：收錄截至 2026 年 7 月已正式上線的 10 套覺醒板型與 12 個覺醒角色；未上線角色不會提前加入。
+### Music / voice
 
-### 未來更新
+- YouTube search and playback with `yt-dlp`
+- interactive player controls, cover art and progress display
+- queue management and loop modes
+- seek and play-from-timestamp support
+- Docker/Railway deployment path
+- fallback handling for YouTube authentication, PO-token, JavaScript challenge, and datacenter playback issues
 
-* **遊戲優化** : 狼人殺警徽制。
-* **多語言系統** : 未來會加入多語言系統請耐心等候。
-## 若對狼人殺系統有興趣，可以協助貢獻開發或聯絡狐狸鬆餅ovo
+Common commands:
 
+| Command | Description |
+| --- | --- |
+| `/play <query or URL>` | Search and play audio |
+| `/play_at <time> <query or URL>` | Start playback from a timestamp |
+| `/seek <time>` | Seek within the current track |
+| `!pause` / `!resume` | Pause or resume |
+| `!skip` | Skip current track |
+| `!stop` | Stop and clear queue |
+| `!queue` | Show queue |
+| `!loop` | Cycle loop mode |
 
-### 🧠 AI 對話 (Chat)
-整合 Google Gemini API，讓機器人擁有智慧對話能力。
+### Werewolf game engine
 
-* **Tag 即回**：在任何頻道 `@機器人` 並輸入文字，即可觸發回應。
-* **智慧模型**：採用 **Google Gemini 2.5 Flash** 模型，反應快速且支援繁體中文語意理解。
+- graphical lobby with `/ww_create`
+- **23 supported 12-player board configurations**
+- automated role assignment and hidden-information flow
+- interactive night actions for wolves and special roles
+- daytime voting, ties, last words and role-triggered actions
+- automatic win-condition evaluation
+- `/ww_rules` rules/configuration reference
+- `/ww_status` round, phase and alive-player status
+- post-game review with role reveal and round history
 
----
+The game code is separated into `cogs/werewolf_system/` so gameplay rules, state, UI, roles, and round flow can evolve independently from Discord command entry points.
 
-## 🛠️ 安裝與執行
+### AI chat
 
-### 1. 環境需求
-* [Python 3.10](https://www.python.org/) 或以上
-* **FFmpeg** (由系統環境變數呼叫，用於音樂播放)
+- mention-based conversational responses
+- Google Gemini integration
+- optional feature: the bot can run without exposing API credentials in source control
 
-### 2. 安裝依賴套件
-請確保目錄下有 `requirements.txt`，然後執行：
-### 🛠️ 安裝與執行
+## Architecture
 
-```bash
-├── main.py              # 主程式 (負責載入 Cogs 與啟動)
-├── requirements.txt     # 套件清單
-├── .env                 # 環境變數 (請勿上傳到 GitHub)
-└── cogs/                # 功能模組資料夾
-    ├── music.py         # 音樂功能
-    ├── werewolf_bot.py  # 狼人殺主程式
-    ├── werewolf_system/ # 狼人殺核心系統 (遊戲邏輯/身分/技能/UI)
-    ├── chat.py          # AI 對話功能
-    ├── custom_help.py   # 自定義 Help 指令
-    └── General.py       # 一般指令 (Ping, Info 等)
+```text
+.
+├── main.py                  # startup, intents, extension loading, command sync
+├── cogs/
+│   ├── music.py             # voice/music + yt-dlp integration
+│   ├── werewolf_bot.py      # Werewolf Discord commands
+│   ├── werewolf_system/     # game state, rules, roles, UI, round flow
+│   ├── chat.py              # AI chat integration
+│   ├── custom_help.py
+│   └── General.py
+├── .env.example             # documented configuration without secrets
+├── Dockerfile               # container / Railway deployment
+├── requirements.txt
+├── CONTRIBUTING.md
+├── SECURITY.md
+└── LICENSE
 ```
 
+## Quick start
+
+### Requirements
+
+- Python 3.11+
+- FFmpeg
+- a Discord application/bot token
+- optional Gemini API key for AI chat
+
+### Install
+
 ```bash
- python -m pip install -r requirements.txt
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-### 3. 設定環境變數
-先複製 `.env.example` 為 `.env`，再填入新的環境變數。`.env` 不可提交到 Git 或打包進 Docker image：
-```bash
-# Discord 機器人 Token (從 Discord Developer Portal 取得)
-DISCORD_BOT_TOKEN=你的_Discord_Bot_Token
+Copy `.env.example` to `.env`, then fill in the credentials needed for your deployment.
 
-# Google Gemini API Key (從 Google AI Studio 取得)
-GEMINI_API_KEY=你的_Gemini_API_Key
-
-# YouTube 出現「請登入以確認不是機器人」時使用。
-# auto 會在 Windows 偵測本機瀏覽器；Firefox 通常最穩定。
-YTDLP_COOKIES_FROM_BROWSER=auto
-
-# 伺服器或 Docker 建議改用放在專案外的 Netscape cookies.txt。
-# 設定此值時會優先於瀏覽器 cookie。
-YTDLP_COOKIE_FILE=
-
-# Railway 可把 Netscape cookies.txt 做 Base64 後存為 Secret。
-YTDLP_COOKIES_B64=
-
-# auto 會在 Railway 優先使用低資源 YouTube client，避開 Deno OOM/SIGKILL。
-YTDLP_LOW_RESOURCE=auto
-
-# 選填；Railway 未設定時會自動使用 --max-old-space-size=64。
-YTDLP_DENO_V8_FLAGS=
-
-# 選填；Railway 未設定時會自動使用 --max-old-space-size=192。
-YTDLP_NODE_OPTIONS=
-```
-
-### 4. 執行機器人
 ```bash
 python main.py
 ```
 
----
+**Never commit `.env`, Discord tokens, API keys, cookies, or private logs.** The repository's `.gitignore` excludes the common secret-bearing files used by this project.
 
+## Configuration
 
-## 📚 文件
-* [Discord.py 官方文件](https://discordpy.readthedocs.io/)
-* [Google Gemini API 文件](https://cloud.google.com/ai-platform/gemini)
+The canonical configuration reference is [`.env.example`](.env.example). Important variables include:
 
-### Owner / 開發者指令
+- `DISCORD_BOT_TOKEN`
+- `GEMINI_API_KEY`
+- `OWNER_IDS`
+- `LOG_LEVEL`
+- `YTDLP_COOKIES_FROM_BROWSER`
+- `YTDLP_COOKIE_FILE`
+- `YTDLP_COOKIES_B64`
+- `YTDLP_LOW_RESOURCE`
+- `YTDLP_DENO_V8_FLAGS`
+- `YTDLP_NODE_OPTIONS`
 
-* 本機器人包含少量僅供 bot 擁有者使用的開發與維護指令（例如遊戲強制結束、重載配置、同步指令樹等）。
-* 這些指令只會影響狼人殺遊戲本身的狀態，不會進行伺服器層級的管理操作（如 ban/kick）。
+For server/container deployments, keep cookie files outside the repository or inject them through the hosting platform's secret-management system.
 
+## Open-source maintenance
 
-### 版權 / License
+This repository is actively maintained and is structured for outside contributions:
 
-本專案以 **AGPL-3.0** 授權。
+- **AGPL-3.0** open-source license
+- `CONTRIBUTING.md` with local setup and validation guidance
+- `SECURITY.md` for responsible vulnerability reporting
+- structured bug and feature-request templates
+- pull-request checklist
+- GitHub Actions CI for dependency consistency and Python compilation
+- Dependabot configuration for Python, GitHub Actions, and Docker dependencies
+- CODEOWNERS for maintainer review of sensitive areas
 
-這代表：
-* 任何人可以自由使用、修改、部署本專案的程式碼。
-* 若以本專案為基礎進行修改，並將其部署為公開可連線使用的服務（例如 Discord Bot 伺服器），則必須公開其對應的原始碼。
+Recent maintenance has included production deployment compatibility, Railway/YouTube playback fixes, dependency updates, and continued development of the Werewolf subsystem.
 
+## Contributing
 
-### 額外須知
-請注意，本專案中包含的以下檔案 **不在** 狐狸鬆餅的版權範圍內：
+Contributions are welcome, especially in these areas:
+
+- Werewolf rules, roles, game-flow correctness and tests
+- multilingual UI / localization
+- accessibility and interaction UX
+- music playback reliability across hosting environments
+- deployment documentation
+- automated tests and CI improvements
+- security hardening and dependency maintenance
+
+Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request. For vulnerabilities, follow [`SECURITY.md`](SECURITY.md) instead of posting exploit details publicly.
+
+## Validation
+
+Before submitting changes:
+
 ```bash
-├── sounds/
-    ├── night.mp3
+python -m compileall -q main.py cogs
+python -m pip check
 ```
-該檔案僅供測試或展示用途，**請使用者務必自行更換為合法授權的音效檔案**，以免侵犯第三方權利。
+
+Pull requests run the same baseline checks in GitHub Actions.
+
+## Roadmap
+
+Current directions include:
+
+- Werewolf sheriff/badge mechanics
+- broader multilingual support
+- more automated tests around pure game logic
+- improved deployment and playback resilience
+
+Roadmap items are not release promises; implementation priority depends on maintenance needs and contributor interest.
+
+## License
+
+Source code is licensed under **GNU AGPL-3.0**. See [`LICENSE`](LICENSE).
+
+If you modify this project and operate the modified version as a network service, review the AGPL-3.0 source-availability obligations that may apply to your deployment.
+
+### Third-party media notice
+
+`sounds/night.mp3` is included only for testing/demonstration and is **not claimed as original project-owned media**. Redistributors and deployers should replace it with audio they have the right to use.
+
+## Project independence
+
+This is an independent open-source project and is not affiliated with or endorsed by Discord, Google, YouTube, Railway, or the publishers/operators of third-party Werewolf game variants referenced by the implementation.
