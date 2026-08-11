@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest an improvement or new capability
+title: "[Feature] "
+labels: []
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Music / voice playback
+        - Werewolf game
+        - AI chat
+        - Localization / accessibility
+        - Deployment / operations
+        - Developer experience
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What user or maintainer problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Mention workarounds or alternative designs.
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to help implement or test this feature.
