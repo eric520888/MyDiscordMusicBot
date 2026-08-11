@@ -65,6 +65,9 @@ YDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": False,
+    # YouTube media URLs are bound to the address used during extraction.
+    # Force a single address family so extraction and playback cannot diverge.
+    "source_address": "0.0.0.0",
     "socket_timeout": 20,
     "retries": 3,
     "fragment_retries": 3,
@@ -836,6 +839,7 @@ class YTDLPipeAudio(discord.AudioSource):
                     "-m",
                     "yt_dlp",
                     "--ignore-config",
+                    "--force-ipv4",
                     "--format",
                     "bestaudio/best",
                     "--no-playlist",
