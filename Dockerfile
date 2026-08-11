@@ -1,20 +1,38 @@
-# yt-dlp 需要 JavaScript runtime 解 YouTube challenge；從 Deno 官方
-# binary image 複製執行檔，避免只檢查版本卻沒有實際安裝。
-FROM denoland/deno:bin-2.8.0 AS deno
-
 # 使用一個標準的 Python 官方映像作為基礎
 FROM python:3.11-slim
 
-COPY --from=deno /deno /usr/local/bin/deno
+ARG DENO_VERSION=2.9.4
+ARG TARGETARCH
 ENV DENO_NO_UPDATE_CHECK=1 \
-    DENO_NO_PROMPT=1
+    DENO_NO_PROMPT=1 \
+    PATH="/usr/local/bin:${PATH}"
 
 # 【第一步：安裝系統工具】
-# 增加 ca-certificates 確保 HTTPS 連線正常
+# 直接在最終映像安裝 Deno，避免 Railway 多階段映像中找不到執行檔。
 RUN apt-get update && apt-get install -y \
     libopus0 \
     ffmpeg \
     ca-certificates \
+    curl \
+    unzip \
+    && case "${TARGETARCH:-$(uname -m)}" in \
+        amd64|x86_64) deno_arch=x86_64 ;; \
+        arm64|aarch64) deno_arch=aarch64 ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
+    esac \
+    && deno_asset="deno-${deno_arch}-unknown-linux-gnu.zip" \
+    && curl -fsSL \
+        "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/${deno_asset}" \
+        -o "/tmp/${deno_asset}" \
+    && curl -fsSL \
+        "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/${deno_asset}.sha256sum" \
+        -o "/tmp/${deno_asset}.sha256sum" \
+    && cd /tmp \
+    && sha256sum -c "${deno_asset}.sha256sum" \
+    && unzip -q "${deno_asset}" -d /usr/local/bin \
+    && chmod 0755 /usr/local/bin/deno \
+    && /usr/local/bin/deno --version \
+    && rm -f "/tmp/${deno_asset}" "/tmp/${deno_asset}.sha256sum" \
     && rm -rf /var/lib/apt/lists/*
 
 # 設定工作目錄
