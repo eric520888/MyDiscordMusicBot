@@ -41,8 +41,10 @@ class ActivityContext:
         object.__setattr__(self, "locale", require_string(self.locale, "locale", max_length=32))
 
     @property
-    def binding_key(self) -> tuple[str, str, str | None]:
-        return (self.instance_id, self.channel_id, self.guild_id)
+    def binding_key(self) -> tuple[str, str | None]:
+        """Match players by Discord voice channel, not a client-local Activity instance."""
+
+        return (self.channel_id, self.guild_id)
 
 
 @dataclass(slots=True)

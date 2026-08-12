@@ -42,6 +42,33 @@ class BoardCompositionTests(unittest.TestCase):
 
 
 class ActivityTransportTests(unittest.TestCase):
+    def test_same_voice_channel_matches_across_activity_instances(self) -> None:
+        client = TestClient(app)
+        suffix = uuid.uuid4().hex
+        channel_context = {
+            "channel_id": f"shared-channel-{suffix}",
+            "guild_id": f"guild-{suffix}",
+            "locale": "zh-TW",
+        }
+        first_token = auth.issue_session(DiscordIdentity(f"host-{suffix}", "房主"))
+        second_token = auth.issue_session(DiscordIdentity(f"guest-{suffix}", "玩家"))
+
+        first = client.post(
+            "/api/rooms/connect",
+            json={**channel_context, "instance_id": f"instance-a-{suffix}"},
+            headers={"Authorization": f"Bearer {first_token}"},
+        )
+        second = client.post(
+            "/api/rooms/connect",
+            json={**channel_context, "instance_id": f"instance-b-{suffix}"},
+            headers={"Authorization": f"Bearer {second_token}"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["room"]["room_id"], second.json()["room"]["room_id"])
+        self.assertEqual(len(second.json()["room"]["players"]), 2)
+
     def test_connect_and_websocket_ready_state_never_leak_discord_user_id(self) -> None:
         client = TestClient(app)
         suffix = uuid.uuid4().hex

@@ -75,12 +75,23 @@ class ApplicationServiceTests(unittest.TestCase):
         for context in contexts:
             self.service.set_ready(self.room.room.room_id, context, ready=True)
 
-    def test_room_requires_unique_trusted_activity_binding(self) -> None:
+    def test_room_requires_unique_voice_channel_binding(self) -> None:
         with self.assertRaises(ApplicationError) as duplicate:
             self.service.create_room(self.host, reveal_roles_on_death=True)
         self.assertEqual(duplicate.exception.code, "ROOM_ALREADY_EXISTS")
 
-        wrong_binding = make_context("200", instance="different-instance")
+        same_channel_other_instance = make_context("200", instance="different-instance")
+        joined = self.service.join_room(self.room.room.room_id, same_channel_other_instance)
+        self.assertIsNotNone(joined.player_for_discord_user("200"))
+
+        wrong_binding = ActivityContext(
+            discord_user_id="300",
+            display_name="Other channel player",
+            instance_id="different-instance",
+            channel_id="channel-2",
+            guild_id="guild-1",
+            locale="zh-TW",
+        )
         with self.assertRaises(ApplicationError) as mismatch:
             self.service.join_room(self.room.room.room_id, wrong_binding)
         self.assertEqual(mismatch.exception.code, "ROOM_BINDING_MISMATCH")

@@ -66,7 +66,6 @@ class WerewolfApplicationService:
     @staticmethod
     def _assert_binding(aggregate: RoomAggregate, context: ActivityContext) -> None:
         expected = (
-            aggregate.room.discord_instance_id,
             aggregate.room.discord_channel_id,
             aggregate.room.discord_guild_id,
         )
