@@ -35,7 +35,7 @@ METADATA_RETRY_BUDGET_SECONDS = 45.0
 LOW_RESOURCE_YOUTUBE_ARGS = (
     "--no-js-runtimes",
     "--extractor-args",
-    "youtube:player_client=android_vr",
+    "youtube:player_client=visionos",
 )
 NODE_YOUTUBE_ARGS = (
     ("--no-js-runtimes", "--js-runtimes", "node")
@@ -49,12 +49,10 @@ POT_PROVIDER_HOME = os.getenv(
 COOKIE_POT_YOUTUBE_ARGS = (
     (
         "--extractor-args",
-        "youtube:player_client=mweb",
+        "youtube:player_client=mweb,tv,web_safari",
         "--extractor-args",
         f"youtubepot-bgutilscript:server_home={POT_PROVIDER_HOME}",
-        "--no-js-runtimes",
-        "--js-runtimes",
-        "node",
+        *NODE_YOUTUBE_ARGS,
     )
     if Path(POT_PROVIDER_HOME).is_dir()
     else ()
@@ -77,6 +75,7 @@ YDL_OPTIONS = {
 
 class PlaybackFailure(Enum):
     AUTH_REQUIRED = auto()
+    COOKIE_EXPIRED = auto()
     COOKIE_CONFIG = auto()
     JS_CHALLENGE = auto()
     RATE_LIMIT = auto()
@@ -106,12 +105,21 @@ class CookieConfigurationError(Exception):
     """Raised when a configured cookie source cannot be used safely."""
 
 
-def _auth_required_message(*, cookie_rejected: bool, icon: str) -> str:
+def _auth_required_message(
+    *, cookie_rejected: bool, icon: str, cookie_expired: bool = False
+) -> str:
+    if cookie_expired:
+        return (
+            f"{icon} YouTube 明確回報登入 Cookie 已過期或被輪替。\n"
+            "請重新匯出已登入 YouTube 的 cookies.txt，更新 "
+            "`YTDLP_COOKIES_B64` 後重新部署。"
+        )
     if cookie_rejected:
         return (
-            f"{icon} YouTube 已讀取 Cookie，但登入驗證仍被拒絕。\n"
-            "目前的 Cookie 可能已過期、被 YouTube 輪替或失效；請重新匯出 "
-            "cookies.txt，更新 `YTDLP_COOKIES_B64` 後重新部署。"
+            f"{icon} YouTube 已讀取 Cookie，但仍拒絕這次驗證。\n"
+            "這不代表 Cookie 一定過期，也可能是主機出口 IP 被限制。"
+            "若同一網址在本機可播放、Railway 卻失敗，請更換出口網路"
+            "或設定 `YTDLP_PROXY`；反覆重貼同一份 Cookie 不會解除限制。"
         )
     return (
         f"{icon} YouTube 要求登入驗證，但目前沒有可用的 Cookie。\n"
@@ -168,6 +176,38 @@ class YTDLAuth:
     cli_args: tuple[str, ...]
     cookiefile: str | None = None
     cookiesfrombrowser: tuple[str, str | None, str | None, str | None] | None = None
+
+
+class YouTubeProfile(Enum):
+    DEFAULT = auto()
+    PO_TOKEN = auto()
+    LOW_RESOURCE = auto()
+
+
+def _youtube_profile_args(profile: YouTubeProfile) -> tuple[str, ...]:
+    if profile is YouTubeProfile.PO_TOKEN:
+        return COOKIE_POT_YOUTUBE_ARGS
+    if profile is YouTubeProfile.LOW_RESOURCE:
+        return LOW_RESOURCE_YOUTUBE_ARGS
+    return NODE_YOUTUBE_ARGS
+
+
+def _youtube_profile_options(profile: YouTubeProfile) -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    if profile is YouTubeProfile.LOW_RESOURCE:
+        options["js_runtimes"] = {}
+        options["extractor_args"] = {
+            "youtube": {"player_client": ["visionos"]}
+        }
+    else:
+        if NODE_YOUTUBE_ARGS:
+            options["js_runtimes"] = {"node": {"path": None}}
+        if profile is YouTubeProfile.PO_TOKEN:
+            options["extractor_args"] = {
+                "youtube": {"player_client": ["mweb", "tv", "web_safari"]},
+                "youtubepot-bgutilscript": {"server_home": [POT_PROVIDER_HOME]},
+            }
+    return options
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +306,10 @@ def _prefer_low_resource_youtube() -> bool:
     if setting in {"1", "true", "yes", "on"}:
         return True
     if setting in {"0", "false", "no", "off"}:
+        return False
+    # A supported runtime lets yt-dlp track YouTube's current default clients.
+    # The old Railway-only android_vr preference bypassed newer client fixes.
+    if shutil.which("node") or shutil.which("deno"):
         return False
     return any(
         os.getenv(name)
@@ -373,6 +417,16 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
     if any(
         marker in lowered
         for marker in (
+            "cookies are no longer valid",
+            "cookies have expired",
+            "cookies have been rotated",
+            "account cookies have expired",
+        )
+    ):
+        return PlaybackFailure.COOKIE_EXPIRED
+    if any(
+        marker in lowered
+        for marker in (
             "failed to decrypt",
             "cookie database",
             "cookies database",
@@ -388,6 +442,22 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
     if any(
         marker in lowered
         for marker in (
+            "sign in to confirm",
+            "login required",
+            "please log in",
+            "not a bot",
+            "confirm you’re not a bot",
+            "confirm you're not a bot",
+            "不是機器人",
+            "不是机器人",
+            "請登入以確認",
+            "请登录以确认",
+        )
+    ):
+        return PlaybackFailure.AUTH_REQUIRED
+    if any(
+        marker in lowered
+        for marker in (
             "error running deno process",
             "error running node process",
             "challenge solving failed",
@@ -400,27 +470,6 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
         )
     ):
         return PlaybackFailure.JS_CHALLENGE
-    if any(
-        marker in lowered
-        for marker in (
-            "sign in to confirm",
-            "login required",
-            "please log in",
-            "not a bot",
-            "confirm you’re not a bot",
-            "confirm you're not a bot",
-            "不是機器人",
-            "不是机器人",
-            "請登入以確認",
-            "请登录以确认",
-            "cookies are no longer valid",
-            "cookies have expired",
-            "cookies have been rotated",
-            "account cookies have expired",
-            "--cookies-from-browser",
-        )
-    ):
-        return PlaybackFailure.AUTH_REQUIRED
     if any(
         marker in lowered
         for marker in (
@@ -468,6 +517,9 @@ def _sanitize_ytdlp_message(message: str) -> str:
         r"\1<redacted>",
         message,
     )
+    proxy_url = os.getenv("YTDLP_PROXY", "").strip()
+    if proxy_url:
+        sanitized = sanitized.replace(proxy_url, "<youtube-proxy>")
     cookie_file = os.getenv("YTDLP_COOKIE_FILE", "").strip()
     if cookie_file:
         cookie_paths = {cookie_file, os.path.expandvars(cookie_file)}
@@ -795,7 +847,10 @@ class YTDLPipeAudio(discord.AudioSource):
         ):
             raise ValueError("track URL must be an allowed YouTube URL")
 
-        direct_stream = track.stream_url
+        proxy_url = os.getenv("YTDLP_PROXY", "").strip()
+        # FFmpeg must not fetch a proxy-bound URL through the host's direct IP.
+        # Let yt-dlp own the proxied download and pipe its bytes to FFmpeg.
+        direct_stream = None if proxy_url else track.stream_url
         if (
             direct_stream
             and track.stream_expires_at is not None
@@ -856,6 +911,8 @@ class YTDLPipeAudio(discord.AudioSource):
                     "--output",
                     "-",
                 ]
+                if proxy_url:
+                    command.extend(("--proxy", proxy_url))
                 if track.auth_cookiefile:
                     self._cookie_snapshot = _create_cookie_snapshot(
                         track.auth_cookiefile
@@ -1381,29 +1438,15 @@ class Music(commands.Cog):
 
         last_attempt_log = ""
 
-        def extract(auth: YTDLAuth | None, *, low_resource: bool) -> Any:
+        def extract(auth: YTDLAuth | None, *, profile: YouTubeProfile) -> Any:
             nonlocal last_attempt_log
             options = dict(YDL_OPTIONS)
             attempt_logger = _YTDLLogger(suppress_errors=True)
             options["logger"] = attempt_logger
-            if low_resource:
-                options["js_runtimes"] = {}
-                options["extractor_args"] = {
-                    "youtube": {"player_client": ["android_vr"]}
-                }
-            elif auth is not None and COOKIE_POT_YOUTUBE_ARGS:
-                # Railway/datacenter IPs are frequently challenged even with
-                # valid cookies. mweb plus the local provider supplies the
-                # per-video PO token currently required by YouTube.
-                options["extractor_args"] = {
-                    "youtube": {"player_client": ["mweb"]},
-                    "youtubepot-bgutilscript": {
-                        "server_home": [POT_PROVIDER_HOME]
-                    },
-                }
-                options["js_runtimes"] = {"node": {"path": None}}
-            elif NODE_YOUTUBE_ARGS:
-                options["js_runtimes"] = {"node": {"path": None}}
+            options.update(_youtube_profile_options(profile))
+            proxy_url = os.getenv("YTDLP_PROXY", "").strip()
+            if proxy_url:
+                options["proxy"] = proxy_url
             cookie_snapshot: str | None = None
             operation_auth = auth
             if auth and auth.cookiefile:
@@ -1422,14 +1465,22 @@ class Music(commands.Cog):
                 _remove_cookie_snapshot(cookie_snapshot)
 
         selected_auth: YTDLAuth | None = None
-        used_low_resource = False
-        preferred_low_resource = _prefer_low_resource_youtube()
-        attempts: deque[tuple[YTDLAuth | None, bool, bool]] = deque()
-        queued_attempts: set[tuple[YTDLAuth | None, bool, bool]] = set()
-        attempted: set[tuple[YTDLAuth | None, bool]] = set()
-        retried: set[tuple[YTDLAuth | None, bool]] = set()
+        selected_profile = YouTubeProfile.DEFAULT
+        profiles = [YouTubeProfile.DEFAULT, YouTubeProfile.LOW_RESOURCE]
+        if COOKIE_POT_YOUTUBE_ARGS:
+            # Public videos can use a PO token without account cookies. Try
+            # that first, then the defaults maintained by the current yt-dlp.
+            profiles.insert(0, YouTubeProfile.PO_TOKEN)
+        if _prefer_low_resource_youtube():
+            profiles.remove(YouTubeProfile.LOW_RESOURCE)
+            profiles.insert(0, YouTubeProfile.LOW_RESOURCE)
+        attempts: deque[tuple[YTDLAuth | None, YouTubeProfile, bool]] = deque()
+        queued_attempts: set[tuple[YTDLAuth | None, YouTubeProfile, bool]] = set()
+        attempted: set[tuple[YTDLAuth | None, YouTubeProfile]] = set()
+        retried: set[tuple[YTDLAuth | None, YouTubeProfile]] = set()
         auth_candidates_loaded = False
         auth_candidates: list[YTDLAuth] = []
+        expired_auths: set[YTDLAuth] = set()
         cookie_rejected = False
         best_error: Exception | None = None
         best_failure = PlaybackFailure.OTHER
@@ -1440,6 +1491,7 @@ class Music(commands.Cog):
             PlaybackFailure.JS_CHALLENGE: 30,
             PlaybackFailure.RATE_LIMIT: 40,
             PlaybackFailure.AUTH_REQUIRED: 50,
+            PlaybackFailure.COOKIE_EXPIRED: 55,
             PlaybackFailure.COOKIE_CONFIG: 60,
         }
 
@@ -1454,17 +1506,19 @@ class Music(commands.Cog):
 
         def schedule_attempt(
             auth: YTDLAuth | None,
-            low_resource: bool,
+            profile: YouTubeProfile,
             *,
             retry: bool = False,
             front: bool = False,
         ) -> None:
-            # android_vr is deliberately anonymous; cookie-authenticated
+            # The JS-less client is deliberately anonymous; cookie-authenticated
             # extraction must use a client that supports account cookies.
-            if low_resource:
-                auth = None
-            key = (auth, low_resource)
-            item = (auth, low_resource, retry)
+            if auth is not None and profile is YouTubeProfile.LOW_RESOURCE:
+                return
+            if auth is not None and auth in expired_auths:
+                return
+            key = (auth, profile)
+            item = (auth, profile, retry)
             if item in queued_attempts:
                 return
             if retry:
@@ -1478,7 +1532,7 @@ class Music(commands.Cog):
             else:
                 attempts.append(item)
 
-        schedule_attempt(None, preferred_low_resource)
+        schedule_attempt(None, profiles[0])
         lookup_started = time.monotonic()
 
         while attempts:
@@ -1489,9 +1543,11 @@ class Music(commands.Cog):
             ):
                 attempts.clear()
                 continue
-            auth, low_resource, is_retry = attempts.popleft()
-            attempt_key = (auth, low_resource)
-            queued_attempts.discard((auth, low_resource, is_retry))
+            auth, profile, is_retry = attempts.popleft()
+            attempt_key = (auth, profile)
+            queued_attempts.discard((auth, profile, is_retry))
+            if auth is not None and auth in expired_auths:
+                continue
             if is_retry:
                 if attempt_key in retried:
                     continue
@@ -1504,7 +1560,7 @@ class Music(commands.Cog):
                     continue
                 attempted.add(attempt_key)
             try:
-                data = extract(auth, low_resource=low_resource)
+                data = extract(auth, profile=profile)
             except CookieConfigurationError as error:
                 remember_failure(error, PlaybackFailure.COOKIE_CONFIG)
                 continue
@@ -1513,9 +1569,18 @@ class Music(commands.Cog):
                     part for part in (last_attempt_log, str(error)) if part
                 )
                 failure = _classify_ytdlp_error(diagnostic)
-                if failure is PlaybackFailure.AUTH_REQUIRED and auth is not None:
+                if failure in {
+                    PlaybackFailure.AUTH_REQUIRED,
+                    PlaybackFailure.COOKIE_EXPIRED,
+                } and auth is not None:
                     cookie_rejected = True
-                remember_failure(error, failure)
+                remember_failure(yt_dlp.utils.DownloadError(diagnostic), failure)
+                log.info(
+                    "YouTube lookup attempt: profile=%s, auth=%s, failure=%s",
+                    profile.name,
+                    auth.label if auth else "anonymous",
+                    failure.name,
+                )
 
                 if failure in {
                     PlaybackFailure.JS_CHALLENGE,
@@ -1523,25 +1588,42 @@ class Music(commands.Cog):
                     PlaybackFailure.NETWORK,
                     PlaybackFailure.UNAVAILABLE,
                     PlaybackFailure.OTHER,
+                    PlaybackFailure.AUTH_REQUIRED,
                 }:
-                    # YouTube clients fail independently. Always give the
-                    # alternate profile one bounded chance in either direction.
-                    schedule_attempt(auth, not low_resource, front=True)
-                    if failure is not PlaybackFailure.UNAVAILABLE:
+                    # Keep cookies while changing between the token provider
+                    # and yt-dlp defaults: a mweb rejection is not proof that
+                    # the same session is unusable with every supported client.
+                    for alternate_profile in profiles:
+                        if alternate_profile is not profile:
+                            schedule_attempt(auth, alternate_profile)
+                    if failure in {
+                        PlaybackFailure.NETWORK,
+                        PlaybackFailure.RATE_LIMIT,
+                        PlaybackFailure.JS_CHALLENGE,
+                        PlaybackFailure.OTHER,
+                    }:
                         schedule_attempt(
                             auth,
-                            low_resource,
+                            profile,
                             retry=True,
                             front=failure is PlaybackFailure.NETWORK,
                         )
+                elif failure is PlaybackFailure.COOKIE_EXPIRED:
+                    # Repeating expired credentials only increases account
+                    # requests. Public videos still get the anonymous profiles.
+                    if auth is not None:
+                        expired_auths.add(auth)
+                    for alternate_profile in profiles:
+                        schedule_attempt(None, alternate_profile)
 
                 if (
-                    failure is PlaybackFailure.AUTH_REQUIRED
+                    failure in {
+                        PlaybackFailure.AUTH_REQUIRED,
+                        PlaybackFailure.COOKIE_EXPIRED,
+                    }
                     and allow_cookie_auth
                     and not auth_candidates_loaded
                 ):
-                    if auth is None:
-                        schedule_attempt(None, not low_resource, front=True)
                     try:
                         auth_candidates = _configured_auth_candidates()
                     except CookieConfigurationError as config_error:
@@ -1551,12 +1633,15 @@ class Music(commands.Cog):
                         )
                         auth_candidates = []
                     auth_candidates_loaded = True
-                    for candidate in auth_candidates:
-                        schedule_attempt(candidate, False)
+                    # Attempt configured authentication before exhausting the
+                    # lookup budget on several anonymous bot-check responses.
+                    for candidate in reversed(auth_candidates):
+                        for auth_profile in reversed(profiles):
+                            schedule_attempt(candidate, auth_profile, front=True)
                 continue
             else:
                 selected_auth = auth
-                used_low_resource = low_resource
+                selected_profile = profile
                 break
         else:
             assert best_error is not None
@@ -1635,11 +1720,7 @@ class Music(commands.Cog):
                 selected_auth.cookiefile if selected_auth else None
             ),
             auth_label=selected_auth.label if selected_auth else None,
-            ytdlp_extra_args=(
-                LOW_RESOURCE_YOUTUBE_ARGS
-                if used_low_resource
-                else NODE_YOUTUBE_ARGS
-            ) if selected_auth is None else COOKIE_POT_YOUTUBE_ARGS,
+            ytdlp_extra_args=_youtube_profile_args(selected_profile),
             stream_url=stream_url,
             stream_headers=stream_headers,
             stream_expires_at=stream_expires_at,
@@ -2903,8 +2984,47 @@ class Music(commands.Cog):
                     if (
                         action.reason is EndReason.ERROR
                         and action.failure
+                        is PlaybackFailure.AUTH_REQUIRED
+                        and action.safe_to_retry
+                        and attempt.auth_label
+                    ):
+                        authenticated_args = [NODE_YOUTUBE_ARGS]
+                        if COOKIE_POT_YOUTUBE_ARGS:
+                            authenticated_args.insert(0, COOKIE_POT_YOUTUBE_ARGS)
+                        alternate_args = next(
+                            (
+                                args
+                                for args in authenticated_args
+                                if args != attempt.ytdlp_extra_args
+                                and not playback_attempt_counts.get(
+                                    (
+                                        attempt.auth_args,
+                                        attempt.auth_cookiefile,
+                                        args,
+                                    ),
+                                    0,
+                                )
+                            ),
+                            None,
+                        )
+                        if alternate_args is not None:
+                            attempt = replace(
+                                attempt,
+                                ytdlp_extra_args=alternate_args,
+                                stream_url=None,
+                                stream_headers=(),
+                                stream_expires_at=None,
+                            )
+                            start_paused = retry_paused
+                            seeking = attempt.start_at > 0
+                            continue
+
+                    if (
+                        action.reason is EndReason.ERROR
+                        and action.failure
                         in {
                             PlaybackFailure.AUTH_REQUIRED,
+                            PlaybackFailure.COOKIE_EXPIRED,
                             PlaybackFailure.COOKIE_CONFIG,
                         }
                         and action.safe_to_retry
@@ -3128,9 +3248,15 @@ class Music(commands.Cog):
                             "⚠️ YouTube JS challenge 解題失敗，低資源備援也無法取得音訊。"
                             "請確認主機有足夠記憶體，且 yt-dlp、yt-dlp-ejs 與 Deno 都是最新版。"
                         )
-                    elif action.failure is PlaybackFailure.AUTH_REQUIRED:
+                    elif action.failure in {
+                        PlaybackFailure.AUTH_REQUIRED,
+                        PlaybackFailure.COOKIE_EXPIRED,
+                    }:
                         failure_message = _auth_required_message(
                             cookie_rejected=cookie_auth_attempted,
+                            cookie_expired=(
+                                action.failure is PlaybackFailure.COOKIE_EXPIRED
+                            ),
                             icon="⚠️",
                         )
                     elif action.failure is PlaybackFailure.COOKIE_CONFIG:
@@ -3432,9 +3558,15 @@ class Music(commands.Cog):
                 query,
                 _sanitize_ytdlp_message(str(error)),
             )
-            if error.failure is PlaybackFailure.AUTH_REQUIRED:
+            if error.failure in {
+                PlaybackFailure.AUTH_REQUIRED,
+                PlaybackFailure.COOKIE_EXPIRED,
+            }:
                 result_message = _auth_required_message(
                     cookie_rejected=error.cookie_rejected,
+                    cookie_expired=(
+                        error.failure is PlaybackFailure.COOKIE_EXPIRED
+                    ),
                     icon="❌",
                 )
             elif error.failure is PlaybackFailure.COOKIE_CONFIG:

@@ -2,7 +2,7 @@
 FROM python:3.11-slim
 
 ARG DENO_VERSION=2.9.4
-ARG BGUTIL_VERSION=1.3.1
+ARG BGUTIL_VERSION=2.0.2
 ARG NODE_VERSION=22.23.2
 ARG TARGETARCH
 ENV DENO_NO_UPDATE_CHECK=1 \
@@ -38,8 +38,8 @@ RUN apt-get update && apt-get install -y \
     && rm -f "/tmp/${deno_asset}" "/tmp/${deno_asset}.sha256sum" \
     && rm -rf /var/lib/apt/lists/*
 
-# Node handles YouTube's EJS challenge in less memory than Deno on Railway's
-# 512 MB plan. Deno remains installed for the PO-token provider below.
+# Node handles both YouTube's EJS challenge and the PO-token provider.
+# Deno remains available as a secondary runtime.
 RUN case "${TARGETARCH:-$(uname -m)}" in \
         amd64|x86_64) node_arch=x64 ;; \
         arm64|aarch64) node_arch=arm64 ;; \
@@ -59,6 +59,8 @@ RUN case "${TARGETARCH:-$(uname -m)}" in \
         --strip-components=1 \
         -C /usr/local/lib/nodejs \
     && ln -s /usr/local/lib/nodejs/bin/node /usr/local/bin/node \
+    && ln -s /usr/local/lib/nodejs/bin/npm /usr/local/bin/npm \
+    && ln -s /usr/local/lib/nodejs/bin/npx /usr/local/bin/npx \
     && node --version \
     && rm -f "/tmp/${node_asset}" /tmp/node-SHASUMS256.txt
 
@@ -72,7 +74,9 @@ RUN mkdir -p /opt/bgutil-ytdlp-pot-provider \
         --strip-components=1 \
         -C /opt/bgutil-ytdlp-pot-provider \
     && cd /opt/bgutil-ytdlp-pot-provider/server \
-    && deno install --allow-scripts=npm:canvas --frozen \
+    && npm ci --no-audit --no-fund \
+    && npx --no-install tsc \
+    && node build/generate_once.js --version \
     && rm -f /tmp/bgutil-ytdlp-pot-provider.tar.gz
 
 # 設定工作目錄
@@ -84,7 +88,7 @@ COPY requirements.txt .
 # 【第二步：依 requirements 安裝 Python 函式庫】
 # requirements 會一併安裝 Discord DAVE 與 yt-dlp 的 Deno/EJS 支援。
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -c "import importlib, yt_dlp, yt_dlp_ejs; importlib.import_module('yt_dlp_plugins.extractor.getpot_bgutil_script'); print(yt_dlp.version.__version__)" \
+RUN python -c "import importlib, yt_dlp, yt_dlp_ejs; plugin = importlib.import_module('yt_dlp_plugins.extractor.getpot_bgutil_script'); assert plugin.BgUtilScriptNodePTP.PROVIDER_VERSION == '${BGUTIL_VERSION}'; print(yt_dlp.version.__version__)" \
     && deno --version \
     && node --version
 

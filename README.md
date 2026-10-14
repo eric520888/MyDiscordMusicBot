@@ -102,8 +102,12 @@ YTDLP_COOKIE_FILE=
 # Railway 可把 Netscape cookies.txt 做 Base64 後存為 Secret。
 YTDLP_COOKIES_B64=
 
-# auto 會在 Railway 優先使用低資源 YouTube client，避開 Deno OOM/SIGKILL。
+# auto 使用驗證元件與 yt-dlp 最新預設播放器；無 JS runtime 才用低資源模式。
 YTDLP_LOW_RESOURCE=auto
+
+# 只有出口 IP 被限制時才需要；請使用自己的 HTTP/HTTPS/SOCKS 代理。
+# 解析與音訊下載均走同一代理，含密碼的網址只存入主機 Secret。
+YTDLP_PROXY=
 
 # 選填；Railway 未設定時會自動使用 --max-old-space-size=64。
 YTDLP_DENO_V8_FLAGS=
@@ -116,6 +120,26 @@ YTDLP_NODE_OPTIONS=
 ```bash
 python main.py
 ```
+
+### YouTube 登入驗證與部署
+
+Docker 會安裝固定版本的 yt-dlp、EJS 與 BgUtils 驗證元件，並建置 Node.js 的
+`generate_once.js`。公開影片先嘗試匿名 PO Token；需要登入時再讀取 Cookie，
+並保留同一登入資料切換驗證播放器與 yt-dlp 預設播放器。
+
+只有 YouTube 明確回報 Cookie 已過期或被輪替，機器人才要求更新
+`YTDLP_COOKIES_B64`。若只出現「Sign in to confirm you're not a bot」，
+不能據此斷定 Cookie 已過期；請比較同一影片在本機與部署主機的結果。
+若本機可播放、部署主機失敗，請檢查出口 IP，必要時設定自己的 `YTDLP_PROXY`。
+代理模式由 yt-dlp 下載音訊再交給 FFmpeg，避免解析和播放使用不同 IP。
+
+匯出 Cookie 時，依 [yt-dlp 官方步驟](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)
+使用獨立的無痕登入工作階段，在同一分頁開啟 YouTube `robots.txt` 後匯出，
+再關閉該無痕視窗，避免瀏覽器持續輪替已匯出的登入資料。
+
+可在實際部署主機執行 `python -m cogs.music_tools <YouTube網址>`：
+診斷會測試解析與首批音訊，僅輸出版本、錯誤類型及音訊狀態，
+不輸出 Cookie、代理密碼或簽名音訊網址。
 
 ---
 
