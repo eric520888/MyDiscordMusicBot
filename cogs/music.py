@@ -24,6 +24,8 @@ from urllib.parse import parse_qs, urlparse
 import discord
 import yt_dlp
 from discord.ext import commands
+from yt_dlp.networking import Request
+from yt_dlp.networking.exceptions import HTTPError, RequestError
 
 
 log = logging.getLogger(__name__)
@@ -75,6 +77,7 @@ YDL_OPTIONS = {
 
 class PlaybackFailure(Enum):
     AUTH_REQUIRED = auto()
+    MEDIA_FORBIDDEN = auto()
     COOKIE_EXPIRED = auto()
     COOKIE_CONFIG = auto()
     JS_CHALLENGE = auto()
@@ -404,6 +407,35 @@ def _stream_transport_from_info(
     return raw_url, tuple(headers), expires_at
 
 
+def _validate_audio_stream(ydl: yt_dlp.YoutubeDL, info: dict[str, Any]) -> None:
+    """Check the selected CDN URL before voice connection or queueing.
+
+    Metadata can succeed while the media server rejects the signed URL. Keep
+    this request inside the extraction's cookie, proxy and PO-token session so
+    a 403 can try authenticated profiles instead of becoming silent playback.
+    """
+    stream_url, headers, _ = _stream_transport_from_info(info)
+    if stream_url is None:
+        return
+    request_headers = dict(headers)
+    request_headers["Range"] = "bytes=0-0"
+    try:
+        with ydl.urlopen(Request(stream_url, headers=request_headers)) as response:
+            if not response.read(1):
+                raise yt_dlp.utils.DownloadError(
+                    "Audio validation failed: empty audio response"
+                )
+    except HTTPError as error:
+        error.close()
+        raise yt_dlp.utils.DownloadError(
+            f"Audio validation failed: HTTP Error {error.status}"
+        ) from error
+    except RequestError as error:
+        raise yt_dlp.utils.DownloadError(
+            f"Audio validation failed: network transport error ({type(error).__name__})"
+        ) from error
+
+
 def _classify_ytdlp_error(message: str) -> PlaybackFailure:
     lowered = message.lower()
     if (
@@ -458,6 +490,16 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
     if any(
         marker in lowered
         for marker in (
+            "http error 403",
+            "http error: 403",
+            "server returned 403",
+            "status code 403",
+        )
+    ):
+        return PlaybackFailure.MEDIA_FORBIDDEN
+    if any(
+        marker in lowered
+        for marker in (
             "error running deno process",
             "error running node process",
             "challenge solving failed",
@@ -473,9 +515,9 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
     if any(
         marker in lowered
         for marker in (
-            "http error 403",
             "http error 429",
-            "status code 403",
+            "server returned 429",
+            "status code 429",
             "too many requests",
             "rate limit",
         )
@@ -494,6 +536,8 @@ def _classify_ytdlp_error(message: str) -> PlaybackFailure:
             "network is unreachable",
             "unable to download api page",
             "unable to download webpage",
+            "empty audio response",
+            "network transport error",
             "winerror 10013",
         )
     ):
@@ -1459,7 +1503,12 @@ class Music(commands.Cog):
             try:
                 _apply_auth_options(options, operation_auth)
                 with yt_dlp.YoutubeDL(options) as ydl:
-                    return ydl.extract_info(search_query, download=False)
+                    data = ydl.extract_info(search_query, download=False)
+                    if data and "entries" in data:
+                        data = next((entry for entry in data["entries"] if entry), None)
+                    if data:
+                        _validate_audio_stream(ydl, data)
+                    return data
             finally:
                 last_attempt_log = attempt_logger.summary
                 _remove_cookie_snapshot(cookie_snapshot)
@@ -1490,6 +1539,7 @@ class Music(commands.Cog):
             PlaybackFailure.NETWORK: 20,
             PlaybackFailure.JS_CHALLENGE: 30,
             PlaybackFailure.RATE_LIMIT: 40,
+            PlaybackFailure.MEDIA_FORBIDDEN: 45,
             PlaybackFailure.AUTH_REQUIRED: 50,
             PlaybackFailure.COOKIE_EXPIRED: 55,
             PlaybackFailure.COOKIE_CONFIG: 60,
@@ -1589,6 +1639,7 @@ class Music(commands.Cog):
                     PlaybackFailure.UNAVAILABLE,
                     PlaybackFailure.OTHER,
                     PlaybackFailure.AUTH_REQUIRED,
+                    PlaybackFailure.MEDIA_FORBIDDEN,
                 }:
                     # Keep cookies while changing between the token provider
                     # and yt-dlp defaults: a mweb rejection is not proof that
@@ -1619,6 +1670,7 @@ class Music(commands.Cog):
                 if (
                     failure in {
                         PlaybackFailure.AUTH_REQUIRED,
+                        PlaybackFailure.MEDIA_FORBIDDEN,
                         PlaybackFailure.COOKIE_EXPIRED,
                     }
                     and allow_cookie_auth
@@ -2983,8 +3035,10 @@ class Music(commands.Cog):
 
                     if (
                         action.reason is EndReason.ERROR
-                        and action.failure
-                        is PlaybackFailure.AUTH_REQUIRED
+                        and action.failure in {
+                            PlaybackFailure.AUTH_REQUIRED,
+                            PlaybackFailure.MEDIA_FORBIDDEN,
+                        }
                         and action.safe_to_retry
                         and attempt.auth_label
                     ):
@@ -3024,6 +3078,7 @@ class Music(commands.Cog):
                         and action.failure
                         in {
                             PlaybackFailure.AUTH_REQUIRED,
+                            PlaybackFailure.MEDIA_FORBIDDEN,
                             PlaybackFailure.COOKIE_EXPIRED,
                             PlaybackFailure.COOKIE_CONFIG,
                         }
@@ -3061,6 +3116,7 @@ class Music(commands.Cog):
                         in {
                             PlaybackFailure.JS_CHALLENGE,
                             PlaybackFailure.RATE_LIMIT,
+                            PlaybackFailure.MEDIA_FORBIDDEN,
                             PlaybackFailure.NETWORK,
                             PlaybackFailure.UNAVAILABLE,
                             PlaybackFailure.OTHER,
@@ -3267,6 +3323,11 @@ class Music(commands.Cog):
                         )
                     elif action.failure is PlaybackFailure.RATE_LIMIT:
                         failure_message = "⚠️ YouTube 暫時限制請求，請稍後再點歌。"
+                    elif action.failure is PlaybackFailure.MEDIA_FORBIDDEN:
+                        failure_message = (
+                            "⚠️ YouTube 拒絕提供音訊（403），播放備援也未能恢復。"
+                            "請管理員檢查主機出口或 `YTDLP_PROXY` 設定。"
+                        )
                     else:
                         failure_message = (
                             f"⚠️ **{track.title}** 播放失敗，已嘗試播放下一首。"
@@ -3582,6 +3643,11 @@ class Music(commands.Cog):
                 )
             elif error.failure is PlaybackFailure.RATE_LIMIT:
                 result_message = "❌ YouTube 暫時限制請求，請稍後再試。"
+            elif error.failure is PlaybackFailure.MEDIA_FORBIDDEN:
+                result_message = (
+                    "❌ YouTube 拒絕提供音訊（403）。"
+                    "請管理員檢查主機出口或 `YTDLP_PROXY` 設定。"
+                )
             elif error.failure is PlaybackFailure.NETWORK:
                 result_message = "❌ 連線 YouTube 逾時，請檢查網路後重試。"
             elif error.failure is PlaybackFailure.UNAVAILABLE:

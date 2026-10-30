@@ -126,6 +126,8 @@ python main.py
 Docker 會安裝固定版本的 yt-dlp、EJS 與 BgUtils 驗證元件，並建置 Node.js 的
 `generate_once.js`。公開影片先嘗試匿名 PO Token；需要登入時再讀取 Cookie，
 並保留同一登入資料切換驗證播放器與 yt-dlp 預設播放器。
+解析完成後會先檢查實際音訊連結；若 CDN 回傳 403，會先嘗試登入備援，
+避免歌曲資料正常卻在進入語音頻道後立刻播放失敗。
 
 只有 YouTube 明確回報 Cookie 已過期或被輪替，機器人才要求更新
 `YTDLP_COOKIES_B64`。若只出現「Sign in to confirm you're not a bot」，

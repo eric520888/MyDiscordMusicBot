@@ -2,7 +2,7 @@ import io
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import yt_dlp
 from cogs import music
@@ -54,6 +54,19 @@ class MusicAuthMessageTests(unittest.TestCase):
         )
         self.assertIs(failure, music.PlaybackFailure.AUTH_REQUIRED)
 
+    def test_ffmpeg_forbidden_response_is_not_rate_limiting(self) -> None:
+        for message in (
+            "HTTP Error 403: Forbidden",
+            "HTTP error 403 Forbidden",
+            "Server returned 403 Forbidden (access denied)",
+            "status code 403",
+        ):
+            with self.subTest(message=message):
+                self.assertIs(
+                    music._classify_ytdlp_error(message),
+                    music.PlaybackFailure.MEDIA_FORBIDDEN,
+                )
+
 
 class MusicLookupFallbackTests(unittest.TestCase):
     URL = "https://www.youtube.com/watch?v=tT7ZwzGFsCg"
@@ -81,13 +94,17 @@ class MusicLookupFallbackTests(unittest.TestCase):
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
+        validator = patch.object(music, "_validate_audio_stream")
+        self.validator = validator.start()
+        self.addCleanup(validator.stop)
 
     def extract(self, attempt):
         @contextmanager
         def fake_ydl(options):
             self.calls.append(options)
             yield SimpleNamespace(
-                extract_info=lambda *_args, **_kwargs: attempt(options)
+                extract_info=lambda *_args, **_kwargs: attempt(options),
+                params=options,
             )
 
         with patch.object(music.yt_dlp, "YoutubeDL", side_effect=fake_ydl):
@@ -151,6 +168,83 @@ class MusicLookupFallbackTests(unittest.TestCase):
         with patch.dict("os.environ", {"YTDLP_PROXY": "http://proxy.example:3128"}):
             self.extract(lambda options: dict(self.INFO))
         self.assertEqual(self.calls[0]["proxy"], "http://proxy.example:3128")
+
+    def test_cdn_rejection_uses_cookie_before_voice_connection(self) -> None:
+        def validate(ydl, info):
+            if "cookiefile" not in ydl.params:
+                raise yt_dlp.utils.DownloadError("Audio validation failed: HTTP Error 403")
+
+        self.validator.side_effect = validate
+        track = self.extract(lambda options: dict(self.INFO))
+
+        self.assertEqual(len(self.calls), 2)
+        self.assertNotIn("cookiefile", self.calls[0])
+        self.assertIn("cookiefile", self.calls[1])
+        self.assertEqual(track.auth_label, self.auth.label)
+        self.assertEqual(self.validator.call_count, 2)
+
+    def test_search_generator_is_not_consumed_twice(self) -> None:
+        track = self.extract(lambda options: {"entries": iter([dict(self.INFO)])})
+
+        self.assertEqual(track.title, self.INFO["title"])
+        self.validator.assert_called_once()
+
+
+class AudioStreamValidationTests(unittest.TestCase):
+    INFO = {
+        "url": "https://rr1.example.googlevideo.com/videoplayback?signature=private-signature",
+        "http_headers": {"User-Agent": "test", "Cookie": "private-cookie"},
+    }
+
+    def test_reads_one_byte_without_forwarding_secret_headers(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b"x"
+        ydl = Mock()
+        ydl.urlopen.return_value = response
+
+        music._validate_audio_stream(ydl, self.INFO)
+
+        request = ydl.urlopen.call_args.args[0]
+        self.assertEqual(request.headers["Range"], "bytes=0-0")
+        self.assertNotIn("Cookie", request.headers)
+        response.read.assert_called_once_with(1)
+
+    def test_http_failure_closes_connection_and_preserves_status(self) -> None:
+        for status, expected in (
+            (403, music.PlaybackFailure.MEDIA_FORBIDDEN),
+            (429, music.PlaybackFailure.RATE_LIMIT),
+        ):
+            with self.subTest(status=status):
+                response = SimpleNamespace(status=status, reason="rejected", close=Mock())
+                ydl = Mock()
+                ydl.urlopen.side_effect = music.HTTPError(response)
+
+                with self.assertRaises(yt_dlp.utils.DownloadError) as raised:
+                    music._validate_audio_stream(ydl, self.INFO)
+
+                response.close.assert_called_once()
+                self.assertIs(music._classify_ytdlp_error(str(raised.exception)), expected)
+                self.assertNotIn("private-signature", str(raised.exception))
+
+    def test_empty_response_is_a_retryable_network_failure(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b""
+        ydl = Mock()
+        ydl.urlopen.return_value = response
+
+        with self.assertRaises(yt_dlp.utils.DownloadError) as raised:
+            music._validate_audio_stream(ydl, self.INFO)
+
+        self.assertIs(
+            music._classify_ytdlp_error(str(raised.exception)), music.PlaybackFailure.NETWORK
+        )
+
+    def test_untrusted_media_host_is_never_requested(self) -> None:
+        ydl = Mock()
+        music._validate_audio_stream(ydl, {"url": "https://example.com/private"})
+        ydl.urlopen.assert_not_called()
 
 
 class MusicProxyTransportTests(unittest.TestCase):
