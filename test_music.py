@@ -272,6 +272,7 @@ class MusicProxyTransportTests(unittest.TestCase):
                                  "http://proxy.example:3128")
                 self.assertIs(ffmpeg.call_args.args[0], process.stdout)
                 self.assertTrue(ffmpeg.call_args.kwargs["pipe"])
+                self.assertEqual(command[command.index("--http-chunk-size") + 1], "1M")
             finally:
                 source.cleanup()
 
@@ -281,6 +282,178 @@ class MusicProxyTransportTests(unittest.TestCase):
             sanitized = music._sanitize_ytdlp_message(f"Proxy connection failed: {proxy}")
         self.assertNotIn("password", sanitized)
         self.assertNotIn("username", sanitized)
+
+    def test_signed_media_urls_are_redacted_from_diagnostics(self) -> None:
+        message = music._sanitize_ytdlp_message(
+            "HTTP error 403 https://rr1.example.googlevideo.com/videoplayback"
+            "?signature=private-token Error opening input"
+        )
+        self.assertNotIn("private-token", message)
+        self.assertIn("HTTP error 403", message)
+
+
+class RangeAudioReaderTests(unittest.TestCase):
+    URL = "https://rr1.example.googlevideo.com/videoplayback?signature=private-token"
+
+    @staticmethod
+    def response(data: bytes, content_range: str | None = None) -> io.BytesIO:
+        response = io.BytesIO(data)
+        response.status = 206 if content_range else 200
+        response.headers = {"Content-Range": content_range} if content_range else {}
+        return response
+
+    def test_downloads_contiguous_ranges_and_stops_at_total(self) -> None:
+        responses = [
+            self.response(b"abcd", "bytes 0-3/10"),
+            self.response(b"efgh", "bytes 4-7/10"),
+            self.response(b"ij", "bytes 8-9/10"),
+        ]
+        ydl = Mock()
+        ydl.urlopen.side_effect = responses
+        with (
+            patch.object(music.yt_dlp, "YoutubeDL", return_value=ydl) as factory,
+            patch.object(music._RangeAudioReader, "CHUNK_SIZE", 4),
+        ):
+            reader = music._RangeAudioReader(self.URL, (("Cookie", "private"),))
+            self.assertEqual(b"".join(reader.read(2) for _ in range(5)), b"abcdefghij")
+            self.assertEqual(reader.read(2), b"")
+            reader.close()
+            reader.close()
+            self.assertEqual(reader.read(2), b"")
+
+        requests = [call.args[0] for call in ydl.urlopen.call_args_list]
+        self.assertEqual([r.headers["Range"] for r in requests],
+                         ["bytes=0-3", "bytes=4-7", "bytes=8-9"])
+        self.assertTrue(all("Cookie" not in r.headers for r in requests))
+        self.assertTrue(all(r.headers["Accept-Encoding"] == "identity" for r in requests))
+        self.assertEqual(factory.call_args.args[0]["source_address"], "0.0.0.0")
+        self.assertTrue(all(response.closed for response in responses))
+        ydl.close.assert_called_once()
+
+    def test_full_response_is_not_downloaded_again_after_eof(self) -> None:
+        response = self.response(b"abc")
+        ydl = Mock()
+        ydl.urlopen.return_value = response
+        with patch.object(music.yt_dlp, "YoutubeDL", return_value=ydl):
+            reader = music._RangeAudioReader(self.URL, ())
+            try:
+                self.assertEqual(reader.read(10), b"abc")
+                self.assertEqual(reader.read(10), b"")
+                self.assertEqual(reader.read(10), b"")
+                ydl.urlopen.assert_called_once()
+            finally:
+                reader.close()
+
+    def test_invalid_initial_range_closes_transport(self) -> None:
+        response = self.response(b"abcd", "bytes 1-4/10")
+        ydl = Mock()
+        ydl.urlopen.return_value = response
+        with patch.object(music.yt_dlp, "YoutubeDL", return_value=ydl):
+            with self.assertRaises(yt_dlp.utils.DownloadError) as raised:
+                music._RangeAudioReader(self.URL, ())
+        self.assertNotIn("private-token", str(raised.exception))
+        self.assertTrue(response.closed)
+        ydl.close.assert_called_once()
+
+    def test_forbidden_next_range_is_reported_without_repeating(self) -> None:
+        response = self.response(b"abcd", "bytes 0-3/10")
+        denied = SimpleNamespace(status=403, reason="rejected", close=Mock())
+        ydl = Mock()
+        ydl.urlopen.side_effect = [response, music.HTTPError(denied)]
+        with (
+            patch.object(music.yt_dlp, "YoutubeDL", return_value=ydl),
+            patch.object(music._RangeAudioReader, "CHUNK_SIZE", 4),
+        ):
+            reader = music._RangeAudioReader(self.URL, ())
+            try:
+                self.assertEqual(reader.read(4), b"abcd")
+                self.assertEqual(reader.read(4), b"")
+                self.assertEqual(reader.read(4), b"")
+                self.assertIs(music._classify_ytdlp_error(reader.error_summary),
+                              music.PlaybackFailure.MEDIA_FORBIDDEN)
+                self.assertEqual(ydl.urlopen.call_count, 2)
+                denied.close.assert_called_once()
+            finally:
+                reader.close()
+
+    def test_empty_range_does_not_loop_forever(self) -> None:
+        ydl = Mock()
+        ydl.urlopen.return_value = self.response(b"", "bytes 0-3/10")
+        with patch.object(music.yt_dlp, "YoutubeDL", return_value=ydl):
+            reader = music._RangeAudioReader(self.URL, ())
+            try:
+                self.assertEqual(reader.read(4), b"")
+                self.assertIs(music._classify_ytdlp_error(reader.error_summary),
+                              music.PlaybackFailure.NETWORK)
+                ydl.urlopen.assert_called_once()
+            finally:
+                reader.close()
+
+    def test_stop_during_read_does_not_become_a_network_failure(self) -> None:
+        response = Mock(status=200, headers={})
+        ydl = Mock()
+        ydl.urlopen.return_value = response
+        with patch.object(music.yt_dlp, "YoutubeDL", return_value=ydl):
+            reader = music._RangeAudioReader(self.URL, ())
+            def stop_during_read(size):
+                reader.close()
+                raise OSError("closed by stop")
+            response.read.side_effect = stop_during_read
+            self.assertEqual(reader.read(8), b"")
+            self.assertEqual(reader.error_summary, "")
+            ydl.close.assert_called_once()
+
+
+class RangedAudioPipelineTests(unittest.TestCase):
+    def test_reuses_media_url_and_seeks_after_pipe_input(self) -> None:
+        track = music.Track(
+            title="test", webpage_url=MusicLookupFallbackTests.URL,
+            duration=23, text_channel_id=1, requester_id=2, start_at=5,
+            stream_url=RangeAudioReaderTests.URL,
+        )
+        reader = Mock(error_summary="")
+        process = Mock()
+        process.poll.return_value = 0
+        audio = SimpleNamespace(_process=process, _current_error=None, cleanup=Mock())
+        with (
+            patch.dict("os.environ", {"YTDLP_PROXY": ""}),
+            patch.object(music, "_RangeAudioReader", return_value=reader) as factory,
+            patch.object(music.subprocess, "Popen") as spawn,
+            patch.object(music.discord, "FFmpegOpusAudio", return_value=audio) as ffmpeg,
+        ):
+            source = music.YTDLPipeAudio(track)
+            source.cleanup()
+            source.cleanup()
+        factory.assert_called_once_with(track.stream_url, ())
+        spawn.assert_not_called()
+        self.assertIs(ffmpeg.call_args.args[0], reader)
+        self.assertTrue(ffmpeg.call_args.kwargs["pipe"])
+        self.assertIn("-ss 5.000", ffmpeg.call_args.kwargs["options"])
+        self.assertNotIn("before_options", ffmpeg.call_args.kwargs)
+        reader.close.assert_called_once()
+        self.assertFalse(source.failed)
+
+    def test_range_failure_marks_audio_pipeline_failed(self) -> None:
+        track = music.Track(
+            title="test", webpage_url=MusicLookupFallbackTests.URL,
+            duration=23, text_channel_id=1, requester_id=2,
+            stream_url=RangeAudioReaderTests.URL,
+        )
+        reader = Mock(error_summary="Audio download failed: HTTP Error 403")
+        process = Mock()
+        process.poll.return_value = 0
+        audio = SimpleNamespace(_process=process, _current_error=None, cleanup=Mock())
+        with (
+            patch.dict("os.environ", {"YTDLP_PROXY": ""}),
+            patch.object(music, "_RangeAudioReader", return_value=reader),
+            patch.object(music.discord, "FFmpegOpusAudio", return_value=audio),
+        ):
+            source = music.YTDLPipeAudio(track)
+            with self.assertLogs("cogs.music", level="WARNING"):
+                source.cleanup()
+        self.assertTrue(source.failed)
+        self.assertIs(music._classify_ytdlp_error(source.error_summary),
+                      music.PlaybackFailure.MEDIA_FORBIDDEN)
 
 
 class StreamTransportTests(unittest.TestCase):

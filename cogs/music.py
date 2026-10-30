@@ -561,6 +561,12 @@ def _sanitize_ytdlp_message(message: str) -> str:
         r"\1<redacted>",
         message,
     )
+    sanitized = re.sub(
+        r"https?://[^\s/]*\.(?:googlevideo|googleusercontent)\.com[^\s'\"<>]*",
+        "<youtube-media>",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
     proxy_url = os.getenv("YTDLP_PROXY", "").strip()
     if proxy_url:
         sanitized = sanitized.replace(proxy_url, "<youtube-proxy>")
@@ -854,12 +860,140 @@ class _YTDLLogger:
             log.error("yt-dlp: %s", sanitized)
 
 
+class _RangeAudioReader:
+    """Stream a signed media URL in bounded HTTP ranges, never a whole-file GET.
+
+    Some YouTube CDN sessions accept byte ranges but reject open-ended requests
+    with 403. Keep yt-dlp's IPv4 transport and feed bytes to FFmpeg without a
+    second player extraction or buffering the whole song in memory.
+    """
+
+    CHUNK_SIZE = 1 << 20
+
+    def __init__(self, url: str, headers: tuple[tuple[str, str], ...]):
+        self.error_summary = ""
+        safe_url, safe_headers, _ = _stream_transport_from_info(
+            {"url": url, "http_headers": dict(headers)}
+        )
+        if safe_url is None:
+            raise ValueError("invalid audio stream host")
+        self._url = safe_url
+        self._headers = dict(safe_headers)
+        self._headers["Accept-Encoding"] = "identity"
+        self._position = 0
+        self._total: int | None = None
+        self._response: Any = None
+        self._response_bytes = 0
+        self._full_response = False
+        self._eof = False
+        self._closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._ydl = yt_dlp.YoutubeDL({
+            "quiet": True,
+            "source_address": "0.0.0.0",
+            "socket_timeout": 20,
+            "logger": _YTDLLogger(suppress_errors=True),
+        })
+        try:
+            self._open_range()
+        except (RequestError, OSError, ValueError) as error:
+            self.close()
+            raise yt_dlp.utils.DownloadError(self._safe_error(error)) from error
+
+    @staticmethod
+    def _safe_error(error: Exception) -> str:
+        if isinstance(error, HTTPError):
+            error.close()
+            return f"Audio download failed: HTTP Error {error.status}"
+        return f"Audio network transport error ({type(error).__name__})"
+
+    def _open_range(self) -> None:
+        end = self._position + self.CHUNK_SIZE - 1
+        if self._total is not None:
+            end = min(end, self._total - 1)
+        headers = dict(self._headers)
+        headers["Range"] = f"bytes={self._position}-{end}"
+        response = self._ydl.urlopen(Request(self._url, headers=headers))
+        with self._close_lock:
+            if self._closed.is_set():
+                response.close()
+                return
+            self._response = response
+        self._response_bytes = 0
+        if response.status == 206:
+            match = re.fullmatch(
+                r"bytes (\d+)-(\d+)/(\d+)",
+                response.headers.get("Content-Range", ""),
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                raise ValueError("missing audio content range")
+            start, actual_end, total = map(int, match.groups())
+            if start != self._position or not start <= actual_end <= end:
+                raise ValueError("mismatched audio content range")
+            if actual_end >= total or (self._total is not None and total != self._total):
+                raise ValueError("inconsistent audio content length")
+            self._total = total
+        elif response.status == 200 and self._position == 0:
+            # Servers that ignore Range may still safely stream from byte zero.
+            self._full_response = True
+        else:
+            raise ValueError("unexpected audio response status")
+
+    def _close_response(self) -> None:
+        response, self._response = self._response, None
+        if response is not None:
+            response.close()
+
+    def read(self, size: int) -> bytes:
+        if size == 0 or self._eof or self.error_summary:
+            return b""
+        size = min(size, self.CHUNK_SIZE) if size > 0 else self.CHUNK_SIZE
+        while not self._closed.is_set():
+            if self._total is not None and self._position >= self._total:
+                return b""
+            try:
+                if self._response is None:
+                    self._open_range()
+                response = self._response
+                if self._closed.is_set() or response is None:
+                    return b""
+                data = response.read(size)
+                if self._closed.is_set():
+                    return b""
+                if data:
+                    self._position += len(data)
+                    self._response_bytes += len(data)
+                    return data
+                self._close_response()
+                if self._full_response:
+                    self._eof = True
+                    return b""
+                if not self._response_bytes:
+                    raise OSError("empty audio range response")
+            except (RequestError, OSError, ValueError) as error:
+                if not self._closed.is_set():
+                    self.error_summary = self._safe_error(error)
+                return b""
+        return b""
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            try:
+                self._close_response()
+            finally:
+                self._ydl.close()
+
+
 class YTDLPipeAudio(discord.AudioSource):
     """Transcode a validated yt-dlp media URL to Opus with FFmpeg.
 
     Reusing the URL from metadata extraction keeps its cookie/PO-token session
-    intact and avoids a second YouTube player request. The older yt-dlp pipe is
-    retained as a bounded fallback for expired or unavailable direct URLs.
+    intact. Regular media uses bounded HTTP ranges; FFmpeg only transcodes its
+    bytes. The older yt-dlp pipe remains for unavailable or proxy-bound URLs.
     """
 
     def __init__(self, track: Track):
@@ -874,6 +1008,7 @@ class YTDLPipeAudio(discord.AudioSource):
         self._current_error: Exception | None = None
         self.cleanup_done = threading.Event()
         self._audio: discord.FFmpegOpusAudio | None = None
+        self._http_reader: _RangeAudioReader | None = None
         self._ytdl_process: subprocess.Popen[bytes] | None = None
         self._cookie_snapshot: str | None = None
         self._ytdl_stderr = tempfile.TemporaryFile()
@@ -910,7 +1045,23 @@ class YTDLPipeAudio(discord.AudioSource):
 
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            if direct_stream:
+            if direct_stream and urlparse(direct_stream).path == "/videoplayback":
+                self._http_reader = _RangeAudioReader(
+                    direct_stream, track.stream_headers
+                )
+                options = "-vn"
+                if track.start_at > 0:
+                    # Seek after input: a pipe cannot seek its HTTP socket.
+                    options += f" -ss {track.start_at:.3f}"
+                self._audio = discord.FFmpegOpusAudio(
+                    self._http_reader,
+                    pipe=True,
+                    codec=None,
+                    bitrate=128,
+                    stderr=self._ffmpeg_stderr,
+                    options=options,
+                )
+            elif direct_stream:
                 before_options = (
                     "-reconnect 1 -reconnect_streamed 1 "
                     "-reconnect_delay_max 5"
@@ -948,6 +1099,8 @@ class YTDLPipeAudio(discord.AudioSource):
                     "3",
                     "--fragment-retries",
                     "3",
+                    "--http-chunk-size",
+                    "1M",
                     "--extractor-retries",
                     "3",
                     "--socket-timeout",
@@ -990,6 +1143,8 @@ class YTDLPipeAudio(discord.AudioSource):
                     options="-vn",
                 )
         except Exception:
+            if self._http_reader is not None:
+                self._http_reader.close()
             self._terminate_ytdl()
             _remove_cookie_snapshot(self._cookie_snapshot)
             self._cookie_snapshot = None
@@ -1076,6 +1231,8 @@ class YTDLPipeAudio(discord.AudioSource):
             self._cleaned = True
 
         try:
+            if self._http_reader is not None:
+                self._http_reader.close()
             ytdl_rc = self._terminate_ytdl()
             ffmpeg_rc = None
             cleanup_failed = False
@@ -1101,6 +1258,7 @@ class YTDLPipeAudio(discord.AudioSource):
 
             ytdl_log = self._read_log(self._ytdl_stderr)
             ffmpeg_log = self._read_log(self._ffmpeg_stderr)
+            transport_log = self._http_reader.error_summary if self._http_reader else ""
             logged_failure = (
                 "ERROR:" in ytdl_log
                 or "Error opening" in ffmpeg_log
@@ -1109,6 +1267,7 @@ class YTDLPipeAudio(discord.AudioSource):
 
             self.failed = (
                 cleanup_failed
+                or bool(transport_log)
                 or self._current_error is not None
                 or logged_failure
                 or (
@@ -1121,7 +1280,7 @@ class YTDLPipeAudio(discord.AudioSource):
             )
             if self.failed:
                 self.error_summary = _sanitize_ytdlp_message("\n".join(
-                    part for part in (ytdl_log, ffmpeg_log) if part
+                    part for part in (transport_log, ytdl_log, ffmpeg_log) if part
                 )[-4000:])
                 log.warning(
                     "Audio pipeline failed for %r (yt-dlp=%s, ffmpeg=%s): %s",
@@ -2863,6 +3022,19 @@ class Music(commands.Cog):
                 except asyncio.CancelledError:
                     pass
             raise
+        except yt_dlp.utils.DownloadError as error:
+            log.warning(
+                "Could not open YouTube audio in guild %s: %s",
+                guild.id,
+                _sanitize_ytdlp_message(str(error)),
+            )
+            if source:
+                await asyncio.to_thread(source.cleanup)
+            return PlaybackControl(
+                EndReason.ERROR,
+                failure=_classify_ytdlp_error(str(error)),
+                safe_to_retry=True,
+            )
         except CookieConfigurationError as error:
             log.warning(
                 "Could not prepare YouTube cookies in guild %s: %s",

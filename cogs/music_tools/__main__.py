@@ -15,13 +15,20 @@ from cogs.music import (
     TrackLookupError,
     YTDLPipeAudio,
     _classify_ytdlp_error,
+    parse_time_value,
 )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="Public YouTube video to check")
+    parser.add_argument("--start", type=parse_time_value, default=0.0,
+                        help="Start position, e.g. 5 or 1:30")
+    parser.add_argument("--packets", type=int, default=10,
+                        help="Opus packets to read (1-3000)")
     args = parser.parse_args()
+    if not 1 <= args.packets <= 3000:
+        parser.error("--packets must be between 1 and 3000")
     # Only structured, non-secret diagnostics leave this process. In
     # particular, do not print signed URLs, cookies or proxy credentials.
     logging.disable(logging.CRITICAL)
@@ -40,7 +47,7 @@ def main() -> int:
     started = time.monotonic()
     exit_code = 0
     try:
-        track = Music._extract_track_sync(args.url, 0, 0)
+        track = Music._extract_track_sync(args.url, 0, 0, args.start)
         result["metadata_seconds"] = round(time.monotonic() - started, 2)
         result["used_cookie"] = bool(track.auth_label)
         result["profile"] = (
@@ -50,8 +57,10 @@ def main() -> int:
             "default"
         )
         source = YTDLPipeAudio(track)
-        packets = [source.read() for _ in range(10)]
+        packets = [source.read() for _ in range(args.packets)]
         result["audio_bytes"] = sum(map(len, packets))
+        result["audio_packets"] = sum(bool(packet) for packet in packets)
+        result["start_at"] = track.start_at
         result["audio_started"] = source.produced_audio
         source.cleanup()
         if source.failed or not source.produced_audio:
