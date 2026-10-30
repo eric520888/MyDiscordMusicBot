@@ -1,6 +1,6 @@
 # 🤖 Discord 多功能機器人 (Music + Werewolf + AI)
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python&logoColor=white)
 ![Discord.py](https://img.shields.io/badge/Discord.py-2.7.1-5865F2?logo=discord&logoColor=white)
 ![Gemini AI](https://img.shields.io/badge/AI-Gemini%201.5%20Flash-4285F4?logo=google&logoColor=white)
 
@@ -58,7 +58,7 @@
 ## 🛠️ 安裝與執行
 
 ### 1. 環境需求
-* [Python 3.10](https://www.python.org/) 或以上
+* [Python 3.11](https://www.python.org/) 或以上
 * **FFmpeg** (由系統環境變數呼叫，用於音樂播放)
 
 ### 2. 安裝依賴套件

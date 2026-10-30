@@ -11,7 +11,7 @@ propcache==0.4.1
 pycparser==2.23
 typing_extensions==4.15.0
 yarl==1.22.0
-yt-dlp[default]==2026.10.10.233141.dev0
+yt-dlp[default]==2026.10.29.232701.dev0
 bgutil-ytdlp-pot-provider==2.0.2
 python-dotenv
 google-generativeai
